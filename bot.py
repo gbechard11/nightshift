@@ -55,7 +55,9 @@ async def _call_claude(update: Update, ctx: ContextTypes.DEFAULT_TYPE, prompt: s
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            CLAUDE_BIN, "-p", prompt,
+            CLAUDE_BIN,
+            "--permission-mode", "bypassPermissions",
+            "-p", prompt,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=CLAUDE_WORKDIR,
