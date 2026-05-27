@@ -2,8 +2,10 @@ import asyncio
 import logging
 import os
 import platform
+import re
 import shutil
 import subprocess
+import uuid
 from datetime import datetime
 
 import httpx
@@ -26,6 +28,11 @@ CLAUDE_WORKDIR = os.environ.get("CLAUDE_WORKDIR", "/data/greg")
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT_SECONDS", "300"))
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_TRANSCRIBE_MODEL = os.environ.get("GROQ_TRANSCRIBE_MODEL", "whisper-large-v3-turbo")
+INBOX_DIR = os.environ.get("PEDRO_INBOX", "/data/greg/inbox")
+SESSION_FILE = os.environ.get("PEDRO_SESSION_FILE", "/data/greg/.pedro_session_id")
+SAFE_DISALLOWED_TOOLS = os.environ.get(
+    "PEDRO_SAFE_DISALLOWED_TOOLS", "Bash Edit Write NotebookEdit"
+)
 TELEGRAM_MAX_MSG = 4000
 
 logging.basicConfig(
@@ -41,26 +48,60 @@ def authorized(update: Update) -> bool:
     return bool(update.effective_user and update.effective_user.id in ALLOWED_USERS)
 
 
+def _get_session_id() -> str:
+    try:
+        with open(SESSION_FILE) as f:
+            sid = f.read().strip()
+        if sid:
+            return sid
+    except FileNotFoundError:
+        pass
+    sid = str(uuid.uuid4())
+    os.makedirs(os.path.dirname(SESSION_FILE) or ".", exist_ok=True)
+    with open(SESSION_FILE, "w") as f:
+        f.write(sid)
+    return sid
+
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorized(update):
         return
     await update.message.reply_text(
         "Hi, I'm agentpedro — your nightshift assistant.\n\n"
-        "/ask <prompt>  - hand a prompt to Claude on the VPS\n"
+        "Just talk to me normally, or use:\n"
+        "/ask <prompt>  - same as plain text\n"
+        "/safe <prompt> - read-only, no memory, no shell/file writes\n"
+        "/new           - clear conversation memory, start fresh\n"
         "/status        - VPS health\n"
-        "/whoami        - your Telegram user ID"
+        "/whoami        - your Telegram user ID\n\n"
+        "Voice notes work. PDFs/photos/documents also work — attach with caption."
     )
 
 
-async def _call_claude(update: Update, ctx: ContextTypes.DEFAULT_TYPE, prompt: str) -> None:
+async def _call_claude(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    prompt: str,
+    restricted: bool = False,
+) -> None:
     await ctx.bot.send_chat_action(update.message.chat_id, ChatAction.TYPING)
-    log.info("claude from %s: %s", update.effective_user.id, prompt[:200])
+    log.info(
+        "claude%s from %s: %s",
+        " [safe]" if restricted else "",
+        update.effective_user.id,
+        prompt[:200],
+    )
+
+    args = [CLAUDE_BIN, "--permission-mode", "bypassPermissions"]
+    if restricted:
+        args += ["--disallowed-tools", SAFE_DISALLOWED_TOOLS]
+    else:
+        args += ["--session-id", _get_session_id()]
+    args += ["-p", prompt]
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            CLAUDE_BIN,
-            "--permission-mode", "bypassPermissions",
-            "-p", prompt,
+            *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=CLAUDE_WORKDIR,
@@ -111,6 +152,68 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not text:
         return
     await _call_claude(update, ctx, text)
+
+
+async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not authorized(update):
+        return
+    try:
+        os.remove(SESSION_FILE)
+        await update.message.reply_text("🧹 Fresh conversation. Previous context cleared.")
+    except FileNotFoundError:
+        await update.message.reply_text("Already a fresh conversation.")
+
+
+async def cmd_safe(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ALLOWED_USERS:
+        await update.message.reply_text(
+            "/safe is disabled until ALLOWED_USERS is configured on the server."
+        )
+        return
+    if not authorized(update):
+        return
+    prompt = " ".join(ctx.args).strip() if ctx.args else ""
+    if not prompt:
+        await update.message.reply_text(
+            "Usage: /safe <prompt>\n"
+            "Runs claude with Bash/Edit/Write/NotebookEdit blocked. One-shot, no memory."
+        )
+        return
+    await _call_claude(update, ctx, prompt, restricted=True)
+
+
+async def on_attachment(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ALLOWED_USERS or not authorized(update):
+        return
+    msg = update.message
+    file_id = None
+    filename = None
+    if msg.document:
+        file_id = msg.document.file_id
+        filename = msg.document.file_name or f"{file_id}.bin"
+    elif msg.photo:
+        largest = msg.photo[-1]
+        file_id = largest.file_id
+        filename = f"photo-{file_id}.jpg"
+    if not file_id:
+        return
+
+    await ctx.bot.send_chat_action(msg.chat_id, ChatAction.TYPING)
+    os.makedirs(INBOX_DIR, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    safe_name = re.sub(r"[^\w.\-]", "_", filename)
+    path = os.path.join(INBOX_DIR, f"{stamp}-{safe_name}")
+
+    tg_file = await ctx.bot.get_file(file_id)
+    await tg_file.download_to_drive(path)
+    log.info("attachment from %s saved to %s", update.effective_user.id, path)
+
+    caption = (msg.caption or "").strip()
+    prompt = f"I just sent you a file. It is on disk at `{path}`. "
+    if caption:
+        prompt += f'My caption: "{caption}". '
+    prompt += "Please open it (Read tool handles PDFs and images natively) and respond."
+    await _call_claude(update, ctx, prompt)
 
 
 async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -198,10 +301,13 @@ def main() -> None:
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("ask", cmd_ask))
+    app.add_handler(CommandHandler("safe", cmd_safe))
+    app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
+    app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, on_attachment))
     log.info("Starting agentpedro bot")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
