@@ -1,0 +1,27 @@
+[Unit]
+Description=agentpedro Telegram bot (nightshift)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gregnightshift
+WorkingDirectory=/home/gregnightshift/nightshift
+EnvironmentFile=/home/gregnightshift/nightshift/.env
+ExecStart=/home/gregnightshift/nightshift/.venv/bin/python /home/gregnightshift/nightshift/bot.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/gregnightshift/nightshift
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target
