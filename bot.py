@@ -6,6 +6,7 @@ import shutil
 import subprocess
 from datetime import datetime
 
+import httpx
 from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -23,6 +24,8 @@ ALLOWED_USERS = {
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "/usr/bin/claude")
 CLAUDE_WORKDIR = os.environ.get("CLAUDE_WORKDIR", "/data/greg")
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT_SECONDS", "300"))
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_TRANSCRIBE_MODEL = os.environ.get("GROQ_TRANSCRIBE_MODEL", "whisper-large-v3-turbo")
 TELEGRAM_MAX_MSG = 4000
 
 logging.basicConfig(
@@ -110,6 +113,53 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _call_claude(update, ctx, text)
 
 
+async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ALLOWED_USERS or not authorized(update):
+        return
+    if not GROQ_API_KEY:
+        await update.message.reply_text(
+            "Voice transcription disabled — GROQ_API_KEY not set in .env."
+        )
+        return
+
+    voice = update.message.voice or update.message.audio
+    if not voice:
+        return
+
+    await ctx.bot.send_chat_action(update.message.chat_id, ChatAction.TYPING)
+    tg_file = await ctx.bot.get_file(voice.file_id)
+    audio_bytes = bytes(await tg_file.download_as_bytearray())
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                files={"file": ("voice.ogg", audio_bytes, "audio/ogg")},
+                data={"model": GROQ_TRANSCRIBE_MODEL},
+            )
+            resp.raise_for_status()
+            text = (resp.json().get("text") or "").strip()
+    except httpx.HTTPStatusError as e:
+        await update.message.reply_text(
+            f"Groq transcription failed ({e.response.status_code}): "
+            f"{e.response.text[:300]}"
+        )
+        return
+    except Exception as e:
+        log.exception("voice transcription failed")
+        await update.message.reply_text(f"Transcription error: {e}")
+        return
+
+    if not text:
+        await update.message.reply_text("(empty transcription)")
+        return
+
+    log.info("voice from %s: %s", update.effective_user.id, text[:200])
+    await update.message.reply_text(f"🎙 Heard: {text}")
+    await _call_claude(update, ctx, text)
+
+
 async def cmd_whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     u = update.effective_user
     await update.message.reply_text(
@@ -151,6 +201,7 @@ def main() -> None:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     log.info("Starting agentpedro bot")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
