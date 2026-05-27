@@ -132,7 +132,9 @@ def main() -> int:
         # Junk + not allowlisted: tag AutoTrash + archive from Inbox
         try:
             m.store(msg_id, "+X-GM-LABELS", AUTOTRASH_LABEL)
-            m.store(msg_id, "-X-GM-LABELS", "\\Inbox")
+            # IMAP needs system label wrapped in parens; plain "\\Inbox" gets
+            # quoted as a literal and the unlabel silently no-ops.
+            m.store(msg_id, "-X-GM-LABELS", "(\\Inbox)")
             moved += 1
             if len(examples) < 25:
                 examples.append({"from": addr, "subject": subject[:80]})
