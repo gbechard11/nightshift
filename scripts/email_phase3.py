@@ -66,10 +66,12 @@ def main() -> int:
             chunk = uids[i:i + BATCH]
             seq = b",".join(chunk).decode()
             try:
+                # Add the AutoTrash label
                 m.uid("STORE", seq, "+X-GM-LABELS", AUTOTRASH_LABEL)
-                # IMAP requires the system label wrapped in parens for the STORE list form;
-                # passing just "\\Inbox" gets quoted as a literal string and silently no-ops.
-                m.uid("STORE", seq, "-X-GM-LABELS", "(\\Inbox)")
+                # Archive from INBOX: mark deleted in this folder + expunge later.
+                # In Gmail's IMAP model, "deleted in INBOX" = "remove the \Inbox label",
+                # the message stays in [Gmail]/All Mail.
+                m.uid("STORE", seq, "+FLAGS", "(\\Deleted)")
                 total += len(chunk)
             except Exception as e:
                 emit(event="store_error", category=category, chunk_start=i, error=str(e))
@@ -82,6 +84,8 @@ def main() -> int:
                 running_total=total,
             )
 
+        emit(event="expunging", category=category)
+        m.expunge()
         emit(event="category_done", category=category, archived=len(uids))
 
     m.close()

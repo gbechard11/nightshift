@@ -132,15 +132,19 @@ def main() -> int:
         # Junk + not allowlisted: tag AutoTrash + archive from Inbox
         try:
             m.store(msg_id, "+X-GM-LABELS", AUTOTRASH_LABEL)
-            # IMAP needs system label wrapped in parens; plain "\\Inbox" gets
-            # quoted as a literal and the unlabel silently no-ops.
-            m.store(msg_id, "-X-GM-LABELS", "(\\Inbox)")
+            # In Gmail IMAP, "+FLAGS (\Deleted)" in the INBOX context means
+            # "remove the \Inbox label". The message stays in All Mail.
+            # (Trying to unlabel via X-GM-LABELS -\Inbox silently no-ops due
+            # to quoting bug in imaplib.)
+            m.store(msg_id, "+FLAGS", "(\\Deleted)")
             moved += 1
             if len(examples) < 25:
                 examples.append({"from": addr, "subject": subject[:80]})
         except Exception as e:
             emit(event="store_error", error=str(e), addr=addr)
 
+    if moved > 0:
+        m.expunge()  # commits the \Deleted marks = removes from INBOX
     m.close()
     m.logout()
 
