@@ -2,6 +2,8 @@
 Description=agentpedro Telegram bot (nightshift)
 After=network-online.target tailscaled.service
 Wants=network-online.target
+# Never give up restarting — a personal assistant going dark is worse than a restart loop.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -9,8 +11,9 @@ User=gregnightshift
 WorkingDirectory=/home/gregnightshift/nightshift
 EnvironmentFile=/home/gregnightshift/nightshift/.env
 ExecStart=/home/gregnightshift/nightshift/.venv/bin/python /home/gregnightshift/nightshift/bot.py
-Restart=on-failure
-RestartSec=5
+# Restart on ANY exit (clean or crash), not just failures — fixes the 2026-05-28 silent stop.
+Restart=always
+RestartSec=10
 StandardOutput=journal
 StandardError=journal
 
