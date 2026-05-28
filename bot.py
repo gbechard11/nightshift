@@ -3,21 +3,25 @@ import logging
 import os
 import platform
 import re
+import secrets
 import shutil
 import subprocess
 import uuid
 from datetime import datetime
 
 import httpx
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
 )
+
+import vapi_call
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED_USERS = {
@@ -33,6 +37,8 @@ SESSION_FILE = os.environ.get("PEDRO_SESSION_FILE", "/data/greg/.pedro_session_i
 SAFE_DISALLOWED_TOOLS = os.environ.get(
     "PEDRO_SAFE_DISALLOWED_TOOLS", "Bash Edit Write NotebookEdit"
 )
+VAPI_API_KEY = os.environ.get("VAPI_API_KEY", "")
+VAPI_PHONE_NUMBER_ID = os.environ.get("VAPI_PHONE_NUMBER_ID", "")
 TELEGRAM_MAX_MSG = 4000
 
 logging.basicConfig(
@@ -40,6 +46,9 @@ logging.basicConfig(
     level=logging.INFO,
 )
 log = logging.getLogger("nightshift")
+
+# Confirm-first calling: drafts awaiting a button tap, keyed by a short token.
+PENDING_CALLS: dict[str, dict] = {}
 
 
 def authorized(update: Update) -> bool:
@@ -99,6 +108,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "Just talk to me normally, or use:\n"
         "/ask <prompt>  - same as plain text\n"
         "/safe <prompt> - read-only, no memory, no shell/file writes\n"
+        "/call <number> <objective> - I call someone on your behalf (you approve first)\n"
         "/new           - clear conversation memory, start fresh\n"
         "/status        - VPS health\n"
         "/whoami        - your Telegram user ID\n\n"
@@ -226,6 +236,113 @@ async def cmd_safe(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _call_claude(update, ctx, prompt, restricted=True)
 
 
+async def cmd_call(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not authorized(update):
+        return
+    if not (VAPI_API_KEY and VAPI_PHONE_NUMBER_ID):
+        await update.message.reply_text(
+            "📞 Calling isn't configured. Set VAPI_API_KEY and VAPI_PHONE_NUMBER_ID in .env."
+        )
+        return
+    args = ctx.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Usage: /call <number> <objective>\n"
+            "Example: /call +17805551234 Ask if they can deliver the PA system Saturday "
+            "and get a quote."
+        )
+        return
+    number = args[0]
+    objective = " ".join(args[1:]).strip()
+    if not vapi_call.E164.match(number):
+        await update.message.reply_text(
+            f"That number isn't E.164 format. Use e.g. +17805551234 (got: {number})."
+        )
+        return
+
+    token = secrets.token_urlsafe(8)
+    PENDING_CALLS[token] = {"to": number, "objective": objective}
+    keyboard = InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("📞 Call now", callback_data=f"call:go:{token}"),
+            InlineKeyboardButton("✏️ Edit", callback_data=f"call:edit:{token}"),
+            InlineKeyboardButton("✖️ Cancel", callback_data=f"call:cancel:{token}"),
+        ]]
+    )
+    await update.message.reply_text(
+        "📋 Ready to call:\n\n"
+        f"To: {number}\n"
+        f"Objective: {objective}\n\n"
+        "Pedro will open with:\n"
+        f"“{vapi_call.first_message()}”\n\n"
+        "Place the call?",
+        reply_markup=keyboard,
+    )
+
+
+async def on_call_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not authorized(update):
+        return
+    try:
+        _, action, token = query.data.split(":", 2)
+    except ValueError:
+        return
+
+    draft = PENDING_CALLS.get(token)
+    if not draft:
+        await query.edit_message_text("This call request expired. Send /call again.")
+        return
+
+    if action == "cancel":
+        PENDING_CALLS.pop(token, None)
+        await query.edit_message_text("✖️ Call cancelled.")
+        return
+
+    if action == "edit":
+        PENDING_CALLS.pop(token, None)
+        await query.edit_message_text(
+            "✏️ Re-send with your changes:\n"
+            f"/call {draft['to']} {draft['objective']}"
+        )
+        return
+
+    if action != "go":
+        return
+
+    PENDING_CALLS.pop(token, None)
+    await query.edit_message_text(f"📞 Dialing {draft['to']}…")
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            call = await vapi_call.place_call(
+                draft["to"], draft["objective"], client=client
+            )
+            call_id = call.get("id")
+            if not call_id:
+                await query.message.reply_text(f"Vapi returned no call id:\n{call}")
+                return
+
+            last = {"status": None}
+
+            async def tick(status):
+                if status != last["status"]:
+                    last["status"] = status
+                    await ctx.bot.send_chat_action(
+                        query.message.chat_id, ChatAction.TYPING
+                    )
+
+            result = await vapi_call.wait_for_call(call_id, on_tick=tick, client=client)
+        await query.message.reply_text("📞 " + vapi_call.format_result(result))
+    except httpx.HTTPStatusError as e:
+        await query.message.reply_text(
+            f"Call failed ({e.response.status_code}): {e.response.text[:500]}"
+        )
+    except Exception as e:  # noqa: BLE001 - surface any failure to the user
+        log.exception("call failed")
+        await query.message.reply_text(f"Call error: {e}")
+
+
 async def on_attachment(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not ALLOWED_USERS or not authorized(update):
         return
@@ -346,9 +463,11 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("ask", cmd_ask))
     app.add_handler(CommandHandler("safe", cmd_safe))
+    app.add_handler(CommandHandler("call", cmd_call))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
+    app.add_handler(CallbackQueryHandler(on_call_button, pattern=r"^call:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, on_attachment))
