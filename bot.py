@@ -48,24 +48,47 @@ def authorized(update: Update) -> bool:
     return bool(update.effective_user and update.effective_user.id in ALLOWED_USERS)
 
 
-def _get_session_id() -> str:
+def _get_session_id() -> tuple[str, bool]:
+    """Return (session_id, is_new). is_new=True means we just created it and the
+    first claude call should use --session-id; otherwise use --resume."""
     try:
         with open(SESSION_FILE) as f:
             sid = f.read().strip()
         if sid:
-            return sid
+            return sid, False
     except FileNotFoundError:
         pass
     sid = str(uuid.uuid4())
     os.makedirs(os.path.dirname(SESSION_FILE) or ".", exist_ok=True)
     with open(SESSION_FILE, "w") as f:
         f.write(sid)
-    return sid
+    return sid, True
 
 
-# Serialize claude invocations — claude --session-id refuses concurrent use of the
-# same session UUID. Restricted mode (one-shot, no session) is exempt.
+# Serialize claude invocations — only one session-using claude can run at a time.
+# Restricted mode (one-shot, no session) is exempt.
 _claude_lock = asyncio.Lock()
+
+
+async def _run_claude(args: list[str]):
+    """Run claude; return (returncode, stdout_str, stderr_str).
+    returncode is None on timeout or missing binary (message is in stderr_str)."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=CLAUDE_WORKDIR,
+        )
+    except FileNotFoundError:
+        return None, "", f"claude binary not found at {CLAUDE_BIN}"
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=CLAUDE_TIMEOUT)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return None, "", f"claude timed out after {CLAUDE_TIMEOUT}s"
+    return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -107,70 +130,46 @@ async def _call_claude(
             prompt[:200],
         )
 
-        args = [CLAUDE_BIN, "--permission-mode", "bypassPermissions"]
+        base = [CLAUDE_BIN, "--permission-mode", "bypassPermissions"]
         if restricted:
-            args += ["--disallowed-tools", SAFE_DISALLOWED_TOOLS]
+            # One-shot, no memory, no dangerous tools.
+            args = base + ["--disallowed-tools", SAFE_DISALLOWED_TOOLS, "-p", prompt]
         else:
-            args += ["--session-id", _get_session_id()]
-        args += ["-p", prompt]
+            sid, is_new = _get_session_id()
+            # First message of a conversation creates the session (--session-id);
+            # every later message RESUMES it (--resume) so context carries over.
+            session_flag = "--session-id" if is_new else "--resume"
+            args = base + [session_flag, sid, "-p", prompt]
 
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=CLAUDE_WORKDIR,
+        rc, out, err = await _run_claude(args)
+
+        # Recover from a broken/locked/missing session: wipe the pointer, start a
+        # genuinely fresh session, retry once. (Loses memory only when the session
+        # was unusable anyway.)
+        if (
+            rc not in (0, None)
+            and not restricted
+            and any(s in err.lower() for s in ("already in use", "no conversation", "not found", "no such session"))
+        ):
+            log.warning("session unusable, starting fresh: %s", err[:200])
+            try:
+                os.remove(SESSION_FILE)
+            except FileNotFoundError:
+                pass
+            sid, _ = _get_session_id()  # creates a new one
+            args = base + ["--session-id", sid, "-p", prompt]
+            rc, out, err = await _run_claude(args)
+
+        if rc is None:
+            await update.message.reply_text(err)  # timeout / missing-binary message
+            return
+        if rc != 0:
+            await update.message.reply_text(
+                f"claude exited {rc}:\n{(err.strip() or '(no stderr)')[:1500]}"
             )
-        except FileNotFoundError:
-            await update.message.reply_text(f"claude binary not found at {CLAUDE_BIN}")
             return
 
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=CLAUDE_TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            await update.message.reply_text(f"claude timed out after {CLAUDE_TIMEOUT}s")
-            return
-
-        if proc.returncode != 0:
-            err_full = (stderr.decode(errors="replace") or "(no stderr)").strip()
-            # Auto-recover from stuck session-id: rotate and retry once
-            if not restricted and "already in use" in err_full.lower():
-                log.warning("session stuck, rotating: %s", err_full[:200])
-                try:
-                    os.remove(SESSION_FILE)
-                except FileNotFoundError:
-                    pass
-                new_args = [
-                    CLAUDE_BIN, "--permission-mode", "bypassPermissions",
-                    "--session-id", _get_session_id(),
-                    "-p", prompt,
-                ]
-                try:
-                    proc2 = await asyncio.create_subprocess_exec(
-                        *new_args,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                        cwd=CLAUDE_WORKDIR,
-                    )
-                    stdout, stderr2 = await asyncio.wait_for(
-                        proc2.communicate(), timeout=CLAUDE_TIMEOUT
-                    )
-                    if proc2.returncode == 0:
-                        out = stdout.decode(errors="replace").strip() or "(empty response)"
-                        for i in range(0, len(out), TELEGRAM_MAX_MSG):
-                            await update.message.reply_text(out[i:i + TELEGRAM_MAX_MSG])
-                        return
-                    err_full = (stderr2.decode(errors="replace") or "(no stderr)").strip()
-                except Exception as e:
-                    err_full = f"retry failed: {e}"
-            await update.message.reply_text(f"claude exited {proc.returncode}:\n{err_full[:1500]}")
-            return
-
-        out = stdout.decode(errors="replace").strip() or "(empty response)"
+        out = out.strip() or "(empty response)"
         for i in range(0, len(out), TELEGRAM_MAX_MSG):
             await update.message.reply_text(out[i:i + TELEGRAM_MAX_MSG])
 
