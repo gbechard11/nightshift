@@ -5,11 +5,14 @@ This is a deliberately restricted front-end to the same claude brain
 
 - Its OWN bot token (EMPLOYEE_BOT_TOKEN) and OWN allowlist (EMPLOYEE_USERS), so
   employees never see or touch the owner bot, its session, or its context.
-- Every run is RESTRICTED: --disallowed-tools blocks Bash/Read/Glob/Grep/Edit/
-  Write/NotebookEdit, so an employee prompt can never read .env, tokens, or any
-  file on the VPS. Web tools (WebSearch/WebFetch) stay enabled for research.
-  Because Pedro runs in bypassPermissions, this disallowed set IS the security
-  boundary — it is enforced by the harness, not by instructions to the model.
+- Every run is locked to an ALLOWLIST of tools (--tools), plus --strict-mcp-config.
+  Only WebSearch/WebFetch exist for the run; there is no Bash/Read/Agent/Monitor/
+  Cron/MCP, so an employee prompt cannot read .env, run commands, spawn an
+  unrestricted sub-agent, or otherwise reach the VPS. An allowlist is essential
+  here: a denylist is unsafe because the CLI ships many command-capable tools
+  (Monitor, CronCreate, Agent sub-agents that ignore the denylist, MCP servers)
+  that a blocked prompt can pivot through. Enforced by the harness, not by
+  instructions to the model.
 - Each employee gets their OWN persistent session keyed by Telegram id, so
   context carries across their messages but is isolated from other employees
   and from Greg. Runs in a neutral workdir (EMPLOYEE_WORKDIR), not /data/greg.
@@ -46,12 +49,11 @@ EMPLOYEE_USERS = {
 # employee sessions live in their own namespace away from the owner's.
 WORKDIR = os.environ.get("EMPLOYEE_WORKDIR", "/data/employees")
 SESSION_DIR = os.environ.get("EMPLOYEE_SESSION_DIR", "/data/employees/sessions")
-# The security boundary: no shell, no file access (so .env/tokens are
-# unreachable), but web research stays on. Mirrors the WhatsApp guest set.
-DISALLOWED_TOOLS = os.environ.get(
-    "EMPLOYEE_DISALLOWED_TOOLS",
-    "Bash Edit Write NotebookEdit Read Glob Grep",
-)
+# The security boundary: an ALLOWLIST of the only tools that exist for the run.
+# Web research only — no shell/file/sub-agent/cron/MCP, so .env and tokens are
+# unreachable. (A denylist is unsafe here; see module docstring.) Paired with
+# strict_mcp=True below to drop ambient MCP servers.
+ALLOWED_TOOLS = os.environ.get("EMPLOYEE_ALLOWED_TOOLS", "WebSearch WebFetch")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_TRANSCRIBE_MODEL = os.environ.get("GROQ_TRANSCRIBE_MODEL", "whisper-large-v3-turbo")
 TELEGRAM_MAX_MSG = 4000
@@ -99,7 +101,8 @@ async def _ask(update: Update, ctx: ContextTypes.DEFAULT_TYPE, prompt: str) -> N
             prompt,
             workdir=WORKDIR,
             session_file=_session_file(uid),
-            disallowed_tools=DISALLOWED_TOOLS,
+            allowed_tools=ALLOWED_TOOLS,
+            strict_mcp=True,
             lock=lock,
         )
     except PedroError as e:

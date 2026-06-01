@@ -5,17 +5,25 @@ locked-down Nightshift-employee bot) both call `run_claude` here, so the
 subprocess plumbing, session management and broken-session retry live in ONE
 place. Neither this module nor its callers import each other's transports.
 
-`run_claude` covers every access tier through three knobs:
+`run_claude` covers every access tier through these knobs:
   - session_file: None → one-shot/stateless; a path → stateful (memory carries
     across messages via that session's UUID).
-  - disallowed_tools: space-separated tools blocked with --disallowed-tools
-    (e.g. the restricted set that denies Bash/Read so secrets stay unreachable).
+  - allowed_tools: space/comma-separated ALLOWLIST passed as --tools. This is the
+    only safe boundary for an UNTRUSTED caller: it sets the tools that exist at
+    all, so escalation tools (Bash, Read, Agent, Monitor, CronCreate, MCP, …)
+    are simply absent. Prefer this over disallowed_tools for untrusted callers.
+  - disallowed_tools: space-separated DENYLIST passed as --disallowed-tools.
+    Convenient for a TRUSTED caller (e.g. the owner's /safe mode) but NOT a real
+    security boundary — the CLI has many command-capable tools (Monitor, Cron*,
+    Agent sub-agents that don't inherit the denylist, MCP servers), so a denylist
+    can be walked around. Never rely on it to contain an untrusted user.
+  - strict_mcp: pass --strict-mcp-config to ignore all ambient MCP servers (drops
+    e.g. the claude-mem MCP). Use together with allowed_tools for untrusted lanes.
   - lock: an asyncio.Lock serializing runs that share one session; None for
     independent runs.
 
-Every run uses --permission-mode bypassPermissions, so access is constrained by
-disallowed_tools, NOT by the permission prompt. That makes the disallowed set
-the real security boundary for any untrusted caller.
+Every run uses --permission-mode bypassPermissions, so allowed/disallowed tools
+(NOT the permission prompt) constrain access.
 """
 import asyncio
 import logging
@@ -78,7 +86,9 @@ async def run_claude(
     *,
     workdir: str,
     session_file: str | None = None,
+    allowed_tools: str | None = None,
     disallowed_tools: str | None = None,
+    strict_mcp: bool = False,
     lock: asyncio.Lock | None = None,
     timeout: int = CLAUDE_TIMEOUT,
 ) -> str:
@@ -89,7 +99,11 @@ async def run_claude(
     - session_file: path holding a session UUID. If set, the run is stateful:
       created with --session-id on first use, resumed with --resume after. If
       None, the run is one-shot with no memory.
-    - disallowed_tools: space-separated tools to block via --disallowed-tools.
+    - allowed_tools: space/comma-separated ALLOWLIST via --tools (the only tools
+      that exist for the run). The safe boundary for untrusted callers.
+    - disallowed_tools: space-separated DENYLIST via --disallowed-tools. Trusted
+      callers only — not a real boundary (see module docstring).
+    - strict_mcp: pass --strict-mcp-config to ignore ambient MCP servers.
     - lock: serialize runs sharing one session. Pass None for stateless or
       otherwise-independent runs (a throwaway lock is used → no serialization).
 
@@ -99,6 +113,11 @@ async def run_claude(
     lock = lock or asyncio.Lock()  # throwaway → effectively no serialization
     async with lock:
         base = [CLAUDE_BIN, "--permission-mode", "bypassPermissions"]
+        if strict_mcp:
+            base.append("--strict-mcp-config")
+        if allowed_tools:
+            # --tools is variadic; the following arg (-p or a session flag) ends it.
+            base += ["--tools", *allowed_tools.replace(",", " ").split()]
         if disallowed_tools:
             base += ["--disallowed-tools", disallowed_tools]
 
