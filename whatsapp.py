@@ -33,18 +33,19 @@ ALLOWED_WHATSAPP = {
 }
 # Owner number(s) get the full Pedro: shell/file tools and the shared, persistent
 # conversation memory. Every OTHER allowlisted sender is a "guest" and runs in a
-# restricted lane (see GUEST_DISALLOWED_TOOLS): one-shot, no memory, no shell, no
+# restricted lane (see GUEST_ALLOWED_TOOLS): one-shot, no memory, no shell, no
 # file access. If OWNER_WHATSAPP is empty, all allowed senders are treated as the
 # owner (backwards-compatible) — so if you allowlist guests, SET THIS.
 OWNER_WHATSAPP = {
     x.strip() for x in os.environ.get("OWNER_WHATSAPP", "").split(",") if x.strip()
 }
-# Tools blocked for guests. Tighter than the owner's /safe set: also blocks
-# Read/Glob/Grep so a guest can't pull files or secrets off the VPS. Guests still
-# get conversational answers (and web tools, unless you add them here).
-GUEST_DISALLOWED_TOOLS = os.environ.get(
-    "PEDRO_GUEST_DISALLOWED_TOOLS",
-    "Bash Edit Write NotebookEdit Read Glob Grep",
+# Tools ALLOWED for guests — an allowlist is the real boundary. A denylist does
+# NOT contain an untrusted guest: sub-agents (Agent) ignore --disallowed-tools,
+# and the CLI also has Monitor/CronCreate/MCP tools that run commands. Guests get
+# only these tools (web research); nothing else exists for the run.
+GUEST_ALLOWED_TOOLS = os.environ.get(
+    "PEDRO_GUEST_ALLOWED_TOOLS",
+    "WebSearch WebFetch",
 )
 WEBHOOK_PORT = int(os.environ.get("WHATSAPP_WEBHOOK_PORT", "8770"))
 WEBHOOK_PATH = os.environ.get("WHATSAPP_WEBHOOK_PATH", "/whatsapp")
@@ -150,7 +151,7 @@ async def transcribe_media(media_url: str, content_type: str) -> str | None:
 def build_webhook_app(run_pedro) -> web.Application:
     """Build the aiohttp app. `run_pedro(prompt, restricted=, disallowed_tools=)
     -> str` is the shared brain. Owners get the full call; guests get the
-    restricted lane with GUEST_DISALLOWED_TOOLS."""
+    restricted lane with GUEST_ALLOWED_TOOLS."""
 
     async def _process_and_reply(
         to: str, body: str, media_url: str, media_type: str, is_guest: bool
@@ -174,7 +175,8 @@ def build_webhook_app(run_pedro) -> web.Application:
                 return
             if is_guest:
                 out = await run_pedro(
-                    prompt, restricted=True, disallowed_tools=GUEST_DISALLOWED_TOOLS
+                    prompt, restricted=True,
+                    allowed_tools=GUEST_ALLOWED_TOOLS, strict_mcp=True,
                 )
             else:
                 out = await run_pedro(prompt)

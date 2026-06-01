@@ -75,7 +75,11 @@ _claude_lock = asyncio.Lock()
 
 
 async def run_pedro(
-    prompt: str, restricted: bool = False, disallowed_tools: str | None = None
+    prompt: str,
+    restricted: bool = False,
+    disallowed_tools: str | None = None,
+    allowed_tools: str | None = None,
+    strict_mcp: bool = False,
 ) -> str:
     """Owner brain shared by Telegram and WhatsApp, over pedro_brain.run_claude.
 
@@ -87,6 +91,14 @@ async def run_pedro(
     timeout / nonzero exit / missing binary.
     """
     if restricted:
+        # Untrusted restricted callers (WhatsApp guests) pass an allowlist —
+        # the real boundary. The trusted owner /safe convenience may use the
+        # denylist (not a boundary, but fine for the owner).
+        if allowed_tools is not None:
+            return await run_claude(
+                prompt, workdir=CLAUDE_WORKDIR,
+                allowed_tools=allowed_tools, strict_mcp=strict_mcp,
+            )
         blocked = disallowed_tools if disallowed_tools is not None else SAFE_DISALLOWED_TOOLS
         return await run_claude(
             prompt, workdir=CLAUDE_WORKDIR, disallowed_tools=blocked
