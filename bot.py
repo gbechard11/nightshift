@@ -6,7 +6,6 @@ import re
 import secrets
 import shutil
 import subprocess
-import uuid
 from datetime import datetime
 
 import httpx
@@ -26,14 +25,13 @@ import mailer
 import meta_ads
 import vapi_call
 import whatsapp
+from pedro_brain import PedroError, run_claude
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED_USERS = {
     int(x) for x in os.environ.get("ALLOWED_USERS", "").split(",") if x.strip()
 }
-CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "/usr/bin/claude")
 CLAUDE_WORKDIR = os.environ.get("CLAUDE_WORKDIR", "/data/greg")
-CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT_SECONDS", "300"))
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_TRANSCRIBE_MODEL = os.environ.get("GROQ_TRANSCRIBE_MODEL", "whisper-large-v3-turbo")
 INBOX_DIR = os.environ.get("PEDRO_INBOX", "/data/greg/inbox")
@@ -70,108 +68,32 @@ def authorized(update: Update) -> bool:
     return bool(update.effective_user and update.effective_user.id in ALLOWED_USERS)
 
 
-def _get_session_id() -> tuple[str, bool]:
-    """Return (session_id, is_new). is_new=True means we just created it and the
-    first claude call should use --session-id; otherwise use --resume."""
-    try:
-        with open(SESSION_FILE) as f:
-            sid = f.read().strip()
-        if sid:
-            return sid, False
-    except FileNotFoundError:
-        pass
-    sid = str(uuid.uuid4())
-    os.makedirs(os.path.dirname(SESSION_FILE) or ".", exist_ok=True)
-    with open(SESSION_FILE, "w") as f:
-        f.write(sid)
-    return sid, True
-
-
-# Serialize claude invocations — only one session-using claude can run at a time.
-# Restricted mode (one-shot, no session) is exempt.
+# Serialize the owner's claude runs — there is one shared, persistent session,
+# so only one stateful run may proceed at a time. Restricted runs are one-shot
+# and stateless, so they stay concurrent (no lock passed).
 _claude_lock = asyncio.Lock()
-
-
-async def _run_claude(args: list[str]):
-    """Run claude; return (returncode, stdout_str, stderr_str).
-    returncode is None on timeout or missing binary (message is in stderr_str)."""
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=CLAUDE_WORKDIR,
-        )
-    except FileNotFoundError:
-        return None, "", f"claude binary not found at {CLAUDE_BIN}"
-    try:
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=CLAUDE_TIMEOUT)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        return None, "", f"claude timed out after {CLAUDE_TIMEOUT}s"
-    return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
-
-
-class PedroError(Exception):
-    """User-facing failure from a claude run (timeout, nonzero exit, etc.)."""
 
 
 async def run_pedro(
     prompt: str, restricted: bool = False, disallowed_tools: str | None = None
 ) -> str:
-    """Transport-agnostic brain shared by Telegram and WhatsApp.
+    """Owner brain shared by Telegram and WhatsApp, over pedro_brain.run_claude.
 
-    Runs claude for `prompt` and returns the reply text. Serializes stateful
-    runs via _claude_lock (restricted runs are stateless and concurrent), and
-    retries once on an unusable session. Raises PedroError with a user-facing
-    message on timeout / nonzero exit / missing binary.
-
-    `restricted=True` is one-shot, no memory, no dangerous tools. By default the
-    blocked set is SAFE_DISALLOWED_TOOLS; pass `disallowed_tools` to override it
-    (e.g. the tighter guest set that also blocks Read/Glob/Grep). Ignored unless
-    restricted.
+    Full Pedro runs against one shared, persistent session (serialized by
+    _claude_lock) with every tool available. `restricted=True` is the one-shot,
+    no-memory lane used by /safe and WhatsApp guests: no session, dangerous tools
+    blocked (SAFE_DISALLOWED_TOOLS unless `disallowed_tools` overrides it, e.g.
+    the tighter guest set that also blocks Read/Glob/Grep). Raises PedroError on
+    timeout / nonzero exit / missing binary.
     """
-    lock = _claude_lock if not restricted else asyncio.Lock()  # dummy lock for restricted
-    async with lock:
-        base = [CLAUDE_BIN, "--permission-mode", "bypassPermissions"]
-        if restricted:
-            # One-shot, no memory, no dangerous tools.
-            blocked = disallowed_tools if disallowed_tools is not None else SAFE_DISALLOWED_TOOLS
-            args = base + ["--disallowed-tools", blocked, "-p", prompt]
-        else:
-            sid, is_new = _get_session_id()
-            # First message of a conversation creates the session (--session-id);
-            # every later message RESUMES it (--resume) so context carries over.
-            session_flag = "--session-id" if is_new else "--resume"
-            args = base + [session_flag, sid, "-p", prompt]
-
-        rc, out, err = await _run_claude(args)
-
-        # Recover from a broken/locked/missing session: wipe the pointer, start a
-        # genuinely fresh session, retry once. (Loses memory only when the session
-        # was unusable anyway.)
-        if (
-            rc not in (0, None)
-            and not restricted
-            and any(s in err.lower() for s in ("already in use", "no conversation", "not found", "no such session"))
-        ):
-            log.warning("session unusable, starting fresh: %s", err[:200])
-            try:
-                os.remove(SESSION_FILE)
-            except FileNotFoundError:
-                pass
-            sid, _ = _get_session_id()  # creates a new one
-            args = base + ["--session-id", sid, "-p", prompt]
-            rc, out, err = await _run_claude(args)
-
-        if rc is None:
-            raise PedroError(err)  # timeout / missing-binary message
-        if rc != 0:
-            raise PedroError(
-                f"claude exited {rc}:\n{(err.strip() or '(no stderr)')[:1500]}"
-            )
-        return out.strip() or "(empty response)"
+    if restricted:
+        blocked = disallowed_tools if disallowed_tools is not None else SAFE_DISALLOWED_TOOLS
+        return await run_claude(
+            prompt, workdir=CLAUDE_WORKDIR, disallowed_tools=blocked
+        )
+    return await run_claude(
+        prompt, workdir=CLAUDE_WORKDIR, session_file=SESSION_FILE, lock=_claude_lock
+    )
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:

@@ -28,6 +28,13 @@ if echo "$CHANGED" | grep -q '^nightshift.service$'; then
     sudo systemctl daemon-reload
 fi
 
+# If employee unit file changed, reinstall + daemon-reload
+if echo "$CHANGED" | grep -q '^nightshift-employees.service$'; then
+    sudo cp nightshift-employees.service /etc/systemd/system/nightshift-employees.service
+    sudo systemctl daemon-reload
+fi
+
 sudo systemctl restart nightshift
+sudo systemctl restart nightshift-employees 2>/dev/null || true
 
 logger -t nightshift-update "Deployed $LOCAL -> $REMOTE. Changed: $(echo "$CHANGED" | tr '\n' ' ')"

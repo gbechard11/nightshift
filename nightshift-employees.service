@@ -1,0 +1,34 @@
+[Unit]
+Description=Nightshift employee assistant bot (restricted Pedro, separate token)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+# Never give up restarting — same policy as the owner bot.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=gregnightshift
+WorkingDirectory=/home/gregnightshift/nightshift
+EnvironmentFile=/home/gregnightshift/nightshift/.env
+# Don't write .pyc into the (read-only) repo dir; keeps the sandbox quiet.
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/home/gregnightshift/nightshift/.venv/bin/python /home/gregnightshift/nightshift/employee_bot.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Sandbox — mirrors nightshift.service, but the only writable paths are the
+# employee work/session dir and claude's own store. The repo and /data/greg are
+# NOT writable here, so this process can't touch the owner's data even in code.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/data/employees /home/gregnightshift/.claude
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target
