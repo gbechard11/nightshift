@@ -2,10 +2,11 @@
 """Read recent messages from Gmail via IMAP.
 
 Usage:
-    email_read.py                          # last 10 unread in INBOX
-    email_read.py --count 25 --all         # last 25 messages (read + unread)
-    email_read.py --search 'FROM "venue"'  # raw IMAP search
+    email_read.py                                   # last 10 unread in INBOX
+    email_read.py --count 25 --all                  # last 25 messages (read + unread)
+    email_read.py --search 'FROM "venue"'           # raw IMAP search
     email_read.py --mailbox "[Gmail]/All Mail" --count 5
+    email_read.py --save-attachments /tmp/att       # save attachments to dir, report paths in JSON
 
 Prints one JSON object per message to stdout, one per line — easy for Claude
 to parse without overflowing context (we cap the body preview).
@@ -19,6 +20,7 @@ import imaplib
 import json
 import os
 import sys
+from pathlib import Path
 from email.header import decode_header, make_header
 
 
@@ -41,6 +43,28 @@ def _decode(s):
         return str(make_header(decode_header(s)))
     except Exception:
         return s
+
+
+def _attachments(msg: email.message.EmailMessage, save_dir: str | None = None) -> list[dict]:
+    results = []
+    for part in msg.walk():
+        disp = part.get("Content-Disposition", "") or ""
+        filename = part.get_filename()
+        if not filename and not disp.startswith("attachment"):
+            continue
+        if not filename:
+            filename = f"attachment.{part.get_content_subtype() or 'bin'}"
+        filename = str(make_header(decode_header(filename)))
+        entry: dict = {"filename": filename, "content_type": part.get_content_type()}
+        if save_dir:
+            save_path = Path(save_dir) / filename
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = part.get_payload(decode=True)
+            if payload:
+                save_path.write_bytes(payload)
+                entry["saved_path"] = str(save_path)
+        results.append(entry)
+    return results
 
 
 def _body_preview(msg: email.message.EmailMessage, limit: int = 1500) -> str:
@@ -72,6 +96,7 @@ def main() -> None:
     p.add_argument("--search", default=None, help="raw IMAP search criteria (overrides --all)")
     p.add_argument("--mailbox", default="INBOX")
     p.add_argument("--body-limit", type=int, default=1500, help="max chars of body preview")
+    p.add_argument("--save-attachments", metavar="DIR", default=None, help="save attachments to this directory")
     args = p.parse_args()
 
     _load_env(os.path.expanduser("~/nightshift/.env"))
@@ -98,13 +123,18 @@ def main() -> None:
                 continue
             raw = msg_data[0][1]
             parsed = email.message_from_bytes(raw, policy=email.policy.default)
+            atts = _attachments(parsed, args.save_attachments)
             entry = {
                 "id": msg_id.decode(),
+                "message_id": parsed.get("Message-ID", ""),
                 "from": _decode(parsed.get("From")),
                 "to": _decode(parsed.get("To")),
+                "cc": _decode(parsed.get("Cc")) if parsed.get("Cc") else "",
+                "reply_to": _decode(parsed.get("Reply-To")) if parsed.get("Reply-To") else "",
                 "subject": _decode(parsed.get("Subject")),
                 "date": parsed.get("Date"),
                 "body": _body_preview(parsed, args.body_limit),
+                "attachments": atts,
             }
             print(json.dumps(entry, ensure_ascii=False))
         m.close()
