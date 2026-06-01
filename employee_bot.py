@@ -44,6 +44,7 @@ from telegram.ext import (
     filters,
 )
 
+import mailer
 import meta_ads
 from pedro_brain import PedroError, run_claude
 
@@ -516,7 +517,8 @@ async def cmd_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Read-only ad insights (last 7 days). No email, no campaign changes."""
+    """Read-only ad insights (last 7 days). Also emails a copy to
+    META_REPORT_RECIPIENTS (Seba), mirroring Pedro."""
     if not authorized(update):
         return
     if not meta_ads.configured():
@@ -544,7 +546,29 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             f"clicks {r.get('clicks', '?')}, CTR {r.get('ctr', '?')}, "
             f"spend ${r.get('spend', '?')}"
         )
-    await update.message.reply_text("\n".join(lines))
+    report_text = "\n".join(lines)
+    await update.message.reply_text(report_text)
+
+    # Email a copy to the report recipients (Seba) so he's always looped in.
+    recipients = meta_ads.REPORT_RECIPIENTS
+    if not recipients:
+        return
+    if not mailer.configured():
+        await update.message.reply_text(
+            "📧 (Email not set up yet — set SMTP_HOST/SMTP_USER/SMTP_PASSWORD in .env "
+            f"to auto-send these to {', '.join(recipients)}.)"
+        )
+        return
+    try:
+        await asyncio.to_thread(
+            mailer.send,
+            f"Nightshift Ads report — {obj} (last 7 days)",
+            report_text,
+            recipients,
+        )
+        await update.message.reply_text(f"📧 Report emailed to {', '.join(recipients)}.")
+    except mailer.MailError as e:
+        await update.message.reply_text(f"⚠️ Report shown above but email failed: {e}")
 
 
 def main() -> None:
