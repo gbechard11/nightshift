@@ -9,3 +9,4 @@ client_secret.json
 *.broken
 backups-*/
 tunnel-url.txt
+.env.bak*
