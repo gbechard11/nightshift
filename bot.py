@@ -26,12 +26,16 @@ import meta_ads
 import prism
 import vapi_call
 import whatsapp
+import wire
 from pedro_brain import PedroError, run_claude
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED_USERS = {
     int(x) for x in os.environ.get("ALLOWED_USERS", "").split(",") if x.strip()
 }
+# Owner-only commands (e.g. /wire, which displays banking details) gate on this,
+# NOT on ALLOWED_USERS. Defaults to Greg's Telegram id; override via env.
+OWNER_ID = int(os.environ.get("OWNER_TELEGRAM_ID", "6575459992"))
 CLAUDE_WORKDIR = os.environ.get("CLAUDE_WORKDIR", "/data/greg")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_TRANSCRIBE_MODEL = os.environ.get("GROQ_TRANSCRIBE_MODEL", "whisper-large-v3-turbo")
@@ -56,6 +60,7 @@ PENDING_CALLS: dict[str, dict] = {}
 # Confirm-first ad launches: PAUSED campaigns awaiting a Launch tap, keyed by token.
 # The campaign already exists (PAUSED, no spend); the button only flips it ACTIVE.
 PENDING_CAMPAIGNS: dict[str, dict] = {}
+PENDING_WIRES: dict[str, dict] = {}
 
 META_NOT_CONFIGURED = (
     "📣 Meta Ads isn't configured yet. Set META_ACCESS_TOKEN (a System User token "
@@ -73,6 +78,10 @@ def authorized(update: Update) -> bool:
     if not ALLOWED_USERS:
         return True
     return bool(update.effective_user and update.effective_user.id in ALLOWED_USERS)
+
+
+def _is_owner(update: Update) -> bool:
+    return bool(update.effective_user and update.effective_user.id == OWNER_ID)
 
 
 # Serialize the owner's claude runs — there is one shared, persistent session,
@@ -137,6 +146,13 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/whoami        - your Telegram user ID\n\n"
         "Voice notes work. PDFs/photos/documents also work — attach with caption."
     )
+    if _is_owner(update):
+        await update.message.reply_text(
+            "Owner tools:\n"
+            "/wire <recipient> <amount_usd> - prep an Agility Forex wire "
+            "(info only, never sends money)\n"
+            "/wire list - known wire recipients"
+        )
 
 
 async def _call_claude(
@@ -780,6 +796,115 @@ async def cmd_settlement(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(text[i:i + TELEGRAM_MAX_MSG])
 
 
+WIRE_NOT_CONFIGURED = (
+    "💸 No wire recipients are set up yet. "
+    "Add them to wire_recipients.json on the VPS."
+)
+
+
+async def cmd_wire(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    # Owner-only: this surfaces banking details. Never moves money.
+    if not _is_owner(update):
+        return
+    args = ctx.args or []
+    if not args or args[0].lower() == "list":
+        names = wire.list_recipients()
+        if not names:
+            await update.message.reply_text(WIRE_NOT_CONFIGURED)
+            return
+        await update.message.reply_text(
+            "💸 Known wire recipients:\n  "
+            + "\n  ".join(names)
+            + "\n\nUsage: /wire <recipient> <amount_usd>"
+        )
+        return
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Usage: /wire <recipient> <amount_usd>\n"
+            "Example: /wire dgi 5000\n"
+            "Or: /wire list"
+        )
+        return
+    raw_amount = args[-1].replace("$", "").replace(",", "")
+    recipient_query = " ".join(args[:-1]).strip()
+    try:
+        amount_usd = float(raw_amount)
+        if amount_usd <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text(
+            f"Couldn't read an amount from \u201c{args[-1]}\u201d. "
+            "Put the USD amount last, e.g. /wire dgi 5000."
+        )
+        return
+    rec = wire.find_recipient(recipient_query)
+    if not rec:
+        known = ", ".join(wire.list_recipients()) or "(none)"
+        await update.message.reply_text(
+            f"No recipient matches \u201c{recipient_query}\u201d.\nKnown: {known}"
+        )
+        return
+    token = secrets.token_urlsafe(8)
+    PENDING_WIRES[token] = {"recipient": recipient_query, "amount_usd": amount_usd}
+    keyboard = InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton(
+                "✅ Show banking details", callback_data=f"wire:show:{token}"
+            ),
+            InlineKeyboardButton(
+                "✖️ Cancel", callback_data=f"wire:cancel:{token}"
+            ),
+        ]]
+    )
+    await update.message.reply_text(
+        "💸 Prepare wire \u2014 reveal banking details?\n\n"
+        f"Recipient: {rec['name']}\n"
+        f"Amount: ${amount_usd:,.2f} USD\n\n"
+        "This will display full bank / account / SWIFT details so you can enter "
+        "the wire in Agility Forex. Pedro never moves money \u2014 you book it "
+        "yourself.",
+        reply_markup=keyboard,
+    )
+
+
+async def on_wire_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not _is_owner(update):
+        return
+    try:
+        _, action, token = query.data.split(":", 2)
+    except ValueError:
+        return
+    pending = PENDING_WIRES.get(token)
+    if not pending:
+        await query.edit_message_text("This wire prep expired. Send /wire again.")
+        return
+    if action == "cancel":
+        PENDING_WIRES.pop(token, None)
+        await query.edit_message_text("✖️ Wire prep cancelled.")
+        return
+    if action != "show":
+        return
+    PENDING_WIRES.pop(token, None)
+    await query.edit_message_text("💸 Preparing wire details\u2026")
+    try:
+        result = await asyncio.to_thread(
+            wire.prep_wire, pending["recipient"], pending["amount_usd"]
+        )
+    except Exception as e:  # noqa: BLE001 - surface any prep failure to the owner
+        log.exception("wire prep failed")
+        await query.message.reply_text(f"Wire prep failed: {e}")
+        return
+    summary = result["summary"]
+    for i in range(0, len(summary), TELEGRAM_MAX_MSG):
+        chunk = summary[i:i + TELEGRAM_MAX_MSG]
+        try:
+            await query.message.reply_text(chunk, parse_mode="Markdown")
+        except Exception:  # noqa: BLE001 - fall back to plain text on markdown errors
+            await query.message.reply_text(chunk)
+
+
 async def on_attachment(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not ALLOWED_USERS or not authorized(update):
         return
@@ -941,11 +1066,13 @@ def main() -> None:
     app.add_handler(CommandHandler("shows", cmd_shows))
     app.add_handler(CommandHandler("show", cmd_show))
     app.add_handler(CommandHandler("settlement", cmd_settlement))
+    app.add_handler(CommandHandler("wire", cmd_wire))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CallbackQueryHandler(on_call_button, pattern=r"^call:"))
     app.add_handler(CallbackQueryHandler(on_campaign_button, pattern=r"^camp:"))
+    app.add_handler(CallbackQueryHandler(on_wire_button, pattern=r"^wire:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, on_attachment))

@@ -10,3 +10,4 @@ client_secret.json
 backups-*/
 tunnel-url.txt
 .env.bak*
+wire_recipients.json
