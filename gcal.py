@@ -29,7 +29,10 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 
-SCOPES = ["https://www.googleapis.com/auth/calendar"]
+SCOPES = [
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/drive",
+]
 TOKEN_PATH = Path(os.environ.get("GCAL_TOKEN", "token.json"))
 DEFAULT_TZ = os.environ.get("GCAL_TZ", "America/Edmonton")
 

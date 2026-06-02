@@ -1,12 +1,12 @@
-"""Pedro's Google Drive CLI (read-only).
+"""Pedro's Google Drive CLI (read + write).
 
-Pulls media files from the shared "Meta ad campaign" Drive folder so Pedro/the
-VPS can use them in Meta ad campaigns. Read-only: list, search, download only.
-No upload/modify/delete by design (scope: drive.readonly).
+Pulls and pushes files for the shared Drive folders Pedro works with (Meta-ad
+media, Summer Rap marketing assets, etc.). Read: list, search, download. Write:
+create folders, upload files. No delete by design.
 
 Reads OAuth creds from token.json (self-contained: includes client
 id/secret/refresh token). Same token as gcal.py once the consent flow has been
-re-run with both scopes.
+re-run with the calendar + drive scopes.
 
 Env:
     GCAL_TOKEN   path to token.json (default: ./token.json)
@@ -16,10 +16,13 @@ Examples:
     python gdrive.py list --folder <FOLDER_ID>
     python gdrive.py find --name banner --folder <FOLDER_ID>
     python gdrive.py download --file-id <FILE_ID> --out ./creative.mp4
+    python gdrive.py mkdir --name "WEBSITE REVISED" --parent <FOLDER_ID>
+    python gdrive.py upload --file ./revised.png --parent <FOLDER_ID>
 """
 
 import argparse
 import io
+import mimetypes
 import os
 import sys
 from pathlib import Path
@@ -27,14 +30,18 @@ from pathlib import Path
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 
-SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+SCOPES = [
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/drive",
+]
 TOKEN_PATH = Path(os.environ.get("GCAL_TOKEN", "token.json"))
 DEFAULT_FOLDER = os.environ.get("GDRIVE_FOLDER", "")
 
 # Shared-folder/Shared-Drive support flags, applied to every call.
 SHARED = {"supportsAllDrives": True, "includeItemsFromAllDrives": True}
+FOLDER_MIME = "application/vnd.google-apps.folder"
 
 
 def get_service():
@@ -115,8 +122,59 @@ def cmd_download(args):
     print(f"saved {out} ({out.stat().st_size} bytes)")
 
 
+def cmd_mkdir(args):
+    """Create a folder. If --parent is given, create it inside that folder."""
+    service = get_service()
+    parent = args.parent or DEFAULT_FOLDER
+    body = {"name": args.name, "mimeType": FOLDER_MIME}
+    if parent:
+        body["parents"] = [parent]
+    folder = (
+        service.files()
+        .create(body=body, fields="id, name, parents", **{"supportsAllDrives": True})
+        .execute()
+    )
+    print(f'created folder {folder["id"]}  {folder["name"]}'
+          + (f'  (in {parent})' if parent else ""))
+
+
+def cmd_upload(args):
+    """Upload a local file into a folder (or update an existing file by id)."""
+    service = get_service()
+    src = Path(args.file)
+    if not src.is_file():
+        sys.exit(f"file not found: {src}")
+    name = args.name or src.name
+    mime = mimetypes.guess_type(src.name)[0] or "application/octet-stream"
+    media = MediaFileUpload(str(src), mimetype=mime, resumable=True)
+
+    if args.file_id:
+        # Update the contents of an existing Drive file (keeps its id/links).
+        meta = (
+            service.files()
+            .update(fileId=args.file_id, media_body=media, fields="id, name",
+                    **{"supportsAllDrives": True})
+            .execute()
+        )
+        print(f'updated {meta["id"]}  {meta["name"]}')
+        return
+
+    parent = args.parent or DEFAULT_FOLDER
+    body = {"name": name}
+    if parent:
+        body["parents"] = [parent]
+    meta = (
+        service.files()
+        .create(body=body, media_body=media, fields="id, name, parents",
+                **{"supportsAllDrives": True})
+        .execute()
+    )
+    print(f'uploaded {meta["id"]}  {meta["name"]}'
+          + (f'  (in {parent})' if parent else ""))
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Pedro's Google Drive CLI (read-only)")
+    parser = argparse.ArgumentParser(description="Pedro's Google Drive CLI (read + write)")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_list = sub.add_parser("list", help="list files in a folder")
@@ -134,6 +192,18 @@ def main():
     p_dl.add_argument("--file-id", required=True)
     p_dl.add_argument("--out", required=True, help="local output path")
     p_dl.set_defaults(func=cmd_download)
+
+    p_mk = sub.add_parser("mkdir", help="create a folder")
+    p_mk.add_argument("--name", required=True, help="new folder name")
+    p_mk.add_argument("--parent", default="", help="parent folder id (or GDRIVE_FOLDER)")
+    p_mk.set_defaults(func=cmd_mkdir)
+
+    p_up = sub.add_parser("upload", help="upload a local file into a folder")
+    p_up.add_argument("--file", required=True, help="local file to upload")
+    p_up.add_argument("--parent", default="", help="destination folder id (or GDRIVE_FOLDER)")
+    p_up.add_argument("--name", default="", help="name in Drive (default: local filename)")
+    p_up.add_argument("--file-id", default="", help="update this existing file instead of creating new")
+    p_up.set_defaults(func=cmd_upload)
 
     args = parser.parse_args()
     args.func(args)
