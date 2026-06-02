@@ -26,6 +26,7 @@ Every run uses --permission-mode bypassPermissions, so allowed/disallowed tools
 (NOT the permission prompt) constrain access.
 """
 import asyncio
+import json
 import logging
 import os
 import uuid
@@ -35,8 +36,20 @@ log = logging.getLogger("nightshift.brain")
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "/usr/bin/claude")
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT_SECONDS", "300"))
 
+# Proactively rotate the persistent session before it grows past the standard
+# 200k context window (which would otherwise escalate into the paid 1M-context
+# tier and make every later message fail). Measured from real token usage the
+# CLI reports. A fresh session already costs ~30k tokens (system prompt +
+# CLAUDE.md + BRAIN.md), so the default leaves room for the handoff turn itself.
+ROTATE_AT_TOKENS = int(os.environ.get("PEDRO_ROTATE_TOKENS", "170000"))
+
 # stderr fragments that mean "this session can't be used" — wipe and retry once.
 _SESSION_BROKEN = ("already in use", "no conversation", "not found", "no such session")
+
+# Session grew past the standard context window and would need 1M-context
+# usage credits to resume — wipe and start fresh instead of erroring on every
+# subsequent message.
+_SESSION_TOO_BIG = ("usage credits required",)
 
 
 class PedroError(Exception):
@@ -81,6 +94,56 @@ def _get_session_id(session_file: str) -> tuple[str, bool]:
     return sid, True
 
 
+
+def _parse_result(out: str):
+    """Extract (text, context_tokens) from an --output-format json reply.
+    Falls back to (raw_text, None) if the output is not the expected JSON."""
+    try:
+        o = json.loads(out)
+    except Exception:
+        return out, None
+    if not isinstance(o, dict):
+        return out, None
+    text = o.get("result")
+    if not isinstance(text, str):
+        text = out
+    u = o.get("usage") or {}
+    try:
+        ctx = (
+            int(u.get("input_tokens", 0))
+            + int(u.get("cache_creation_input_tokens", 0))
+            + int(u.get("cache_read_input_tokens", 0))
+        )
+    except Exception:
+        ctx = None
+    return text, ctx
+
+
+_HANDOFF_PROMPT = (
+    "SYSTEM: your conversation memory is being rotated now to stay within context "
+    "limits. Before it resets, prepend a dated entry to /data/greg/brain/BRAIN.md in "
+    "the format '## YYYY-MM-DD [handoff] headline' capturing every open item, "
+    "in-progress task, pending reply, and key decision from this conversation so a "
+    "fresh session can continue seamlessly. Be specific: names, amounts, dates, and "
+    "the exact next action for each. Save it with the Edit/Write tools, then reply 'saved'."
+)
+
+
+async def _rotate_session(base, sid, session_file, workdir, timeout):
+    """Write a handoff to BRAIN.md on the OLD session, then drop the session pointer
+    so the next run starts fresh (and reloads BRAIN.md). Best-effort: never raises."""
+    try:
+        args = base + ["--resume", sid, "-p", _HANDOFF_PROMPT]
+        await _run_claude(args, workdir, min(timeout, 180))
+    except Exception as e:  # noqa: BLE001
+        log.warning("handoff before rotation failed (resetting anyway): %s", e)
+    try:
+        os.remove(session_file)
+    except FileNotFoundError:
+        pass
+    log.info("rotated persistent session %s.. -> fresh on next message", sid[:8])
+
+
 async def run_claude(
     prompt: str,
     *,
@@ -112,7 +175,8 @@ async def run_claude(
     """
     lock = lock or asyncio.Lock()  # throwaway → effectively no serialization
     async with lock:
-        base = [CLAUDE_BIN, "--permission-mode", "bypassPermissions"]
+        base = [CLAUDE_BIN, "--permission-mode", "bypassPermissions",
+                "--output-format", "json"]
         if strict_mcp:
             base.append("--strict-mcp-config")
         if allowed_tools:
@@ -135,12 +199,12 @@ async def run_claude(
         # Recover from a broken/locked/missing session: wipe the pointer, start a
         # genuinely fresh session, retry once. (Stateless runs have no session to
         # recover, so this only applies when session_file is set.)
-        if (
-            rc not in (0, None)
-            and session_file is not None
-            and any(s in err.lower() for s in _SESSION_BROKEN)
+        _combined = (out + " " + err).lower()
+        if session_file is not None and (
+            (rc not in (0, None) and any(s in _combined for s in _SESSION_BROKEN))
+            or any(s in _combined for s in _SESSION_TOO_BIG)
         ):
-            log.warning("session unusable, starting fresh: %s", err[:200])
+            log.warning("session unusable, starting fresh: %s", (err or out)[:200])
             try:
                 os.remove(session_file)
             except FileNotFoundError:
@@ -155,4 +219,18 @@ async def run_claude(
             raise PedroError(
                 f"claude exited {rc}:\n{(err.strip() or '(no stderr)')[:1500]}"
             )
-        return out.strip() or "(empty response)"
+        text, ctx_tokens = _parse_result(out)
+
+        # Proactive rotation: if the persistent session has grown close to the
+        # standard context window, hand off to BRAIN.md and reset BEFORE the next
+        # message would tip us into the paid 1M-context tier.
+        if (
+            session_file is not None
+            and ctx_tokens is not None
+            and ctx_tokens >= ROTATE_AT_TOKENS
+        ):
+            log.info("session at %d ctx tokens (>= %d) — rotating",
+                     ctx_tokens, ROTATE_AT_TOKENS)
+            await _rotate_session(base, sid, session_file, workdir, timeout)
+
+        return (text or "").strip() or "(empty response)"
