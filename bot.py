@@ -6,7 +6,7 @@ import re
 import secrets
 import shutil
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import httpx
 from aiohttp import web
@@ -23,6 +23,7 @@ from telegram.ext import (
 
 import mailer
 import meta_ads
+import prism
 import vapi_call
 import whatsapp
 from pedro_brain import PedroError, run_claude
@@ -59,6 +60,12 @@ PENDING_CAMPAIGNS: dict[str, dict] = {}
 META_NOT_CONFIGURED = (
     "📣 Meta Ads isn't configured yet. Set META_ACCESS_TOKEN (a System User token "
     "with ads_management) and META_AD_ACCOUNT_ID in .env on the VPS, then restart."
+)
+
+PRISM_NOT_CONFIGURED = (
+    "🎫 Prism isn't connected yet. From a logged-in app.prism.fm browser, copy the "
+    "localStorage 'refreshToken', set PRISM_REFRESH_TOKEN in .env on the VPS, then "
+    "restart."
 )
 
 
@@ -122,6 +129,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/media - list images available for ads (drop files in /data/greg/ads/)\n"
         "/pause <campaign_id> - stop a campaign's spend\n"
         "/report [id]   - last-7-day ad insights (defaults to the account)\n"
+        "/shows [days|all] - upcoming Prism shows (default: next 60 days)\n"
+        "/show <event_id>  - details for one Prism show\n"
         "/new           - clear conversation memory, start fresh\n"
         "/status        - VPS health\n"
         "/whoami        - your Telegram user ID\n\n"
@@ -670,6 +679,81 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"⚠️ Report shown above but email failed: {e}")
 
 
+async def cmd_shows(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Read-only: list upcoming Prism shows. /shows [days|all]."""
+    if not authorized(update):
+        return
+    if not prism.configured():
+        await update.message.reply_text(PRISM_NOT_CONFIGURED)
+        return
+    arg = (ctx.args[0].lower() if ctx.args else "").strip()
+    today = datetime.now().date()
+    if arg == "all":
+        start, end = today, today + timedelta(days=365 * 2)
+    else:
+        try:
+            days = int(arg) if arg else 60
+        except ValueError:
+            await update.message.reply_text("Usage: /shows [days|all]  e.g. /shows 30")
+            return
+        start, end = today, today + timedelta(days=max(1, days))
+
+    await ctx.bot.send_chat_action(update.message.chat_id, ChatAction.TYPING)
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            shows = await prism.list_shows(client, start.isoformat(), end.isoformat())
+    except prism.PrismError as e:
+        await update.message.reply_text(f"Prism lookup failed: {e}")
+        return
+
+    header = f"🎫 Shows {start.isoformat()} → {end.isoformat()} ({len(shows)} found):\n\n"
+    body = prism.format_shows(shows)
+    text = header + body
+    for i in range(0, len(text), TELEGRAM_MAX_MSG):
+        await update.message.reply_text(text[i:i + TELEGRAM_MAX_MSG])
+
+
+async def cmd_show(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Read-only: details for a single Prism show by event id."""
+    if not authorized(update):
+        return
+    if not prism.configured():
+        await update.message.reply_text(PRISM_NOT_CONFIGURED)
+        return
+    eid = (ctx.args[0] if ctx.args else "").strip()
+    if not eid:
+        await update.message.reply_text("Usage: /show <event_id>  (get ids from /shows)")
+        return
+    await ctx.bot.send_chat_action(update.message.chat_id, ChatAction.TYPING)
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            s = await prism.get_show(client, eid)
+    except prism.PrismError as e:
+        await update.message.reply_text(f"Prism lookup failed: {e}")
+        return
+    if not s:
+        await update.message.reply_text(f"No Prism show found with id {eid}.")
+        return
+
+    when = s["start"] or "?"
+    if s.get("end") and s["end"] != s["start"]:
+        when += f" → {s['end']}"
+    times = ""
+    if s.get("start_time") and not s.get("all_day"):
+        times = f"\nTime: {s['start_time']}" + (f"–{s['end_time']}" if s.get("end_time") else "")
+    genres = ", ".join(s["genres"]) if s.get("genres") else "—"
+    await update.message.reply_text(
+        f"🎫 {s['title']}  (#{s['event_id']})\n"
+        f"Status: {s['status_label']}\n"
+        f"Date: {when}{times}\n"
+        f"Venue: {s.get('venue') or '—'}\n"
+        f"Stage: {s.get('stage') or '—'}\n"
+        f"Genres: {genres}\n"
+        f"{'Matinee' if s.get('is_matinee') else ''}\n"
+        f"\nOpen in Prism: https://app.prism.fm/event/{s['event_id']}/dashboard"
+    )
+
+
 async def on_attachment(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not ALLOWED_USERS or not authorized(update):
         return
@@ -828,6 +912,8 @@ def main() -> None:
     app.add_handler(CommandHandler("media", cmd_media))
     app.add_handler(CommandHandler("pause", cmd_pause))
     app.add_handler(CommandHandler("report", cmd_report))
+    app.add_handler(CommandHandler("shows", cmd_shows))
+    app.add_handler(CommandHandler("show", cmd_show))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
