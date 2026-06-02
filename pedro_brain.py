@@ -200,8 +200,12 @@ async def run_claude(
         # genuinely fresh session, retry once. (Stateless runs have no session to
         # recover, so this only applies when session_file is set.)
         _combined = (out + " " + err).lower()
-        if session_file is not None and (
-            (rc not in (0, None) and any(s in _combined for s in _SESSION_BROKEN))
+        # Only ever wipe+retry on a FAILED run (rc != 0). On a successful
+        # reply (rc == 0) the output text could legitimately contain these
+        # phrases (e.g. explaining a 'usage credits required' error) and must
+        # not trigger a spurious session reset.
+        if session_file is not None and rc not in (0, None) and (
+            any(s in _combined for s in _SESSION_BROKEN)
             or any(s in _combined for s in _SESSION_TOO_BIG)
         ):
             log.warning("session unusable, starting fresh: %s", (err or out)[:200])
