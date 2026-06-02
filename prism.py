@@ -141,6 +141,18 @@ async def _refresh_access_token(client: httpx.AsyncClient) -> str:
             body = {}
         kind = body.get("__type", "")
         msg = body.get("message", resp.text[:300])
+        # Prism's Cognito app client is CONFIDENTIAL (has a client secret), so a
+        # browser/headless REFRESH_TOKEN_AUTH call is rejected for missing
+        # SECRET_HASH. We don't hold the secret, so automatic refresh isn't
+        # possible — fall back to a pasted short-lived access token.
+        if "SECRET_HASH" in msg or "secret" in msg.lower():
+            raise PrismError(
+                "Prism's Cognito client requires a secret we don't have, so Pedro "
+                "can't auto-refresh. Paste a fresh access token instead: in a "
+                "logged-in app.prism.fm browser console run "
+                "localStorage.getItem('token'), set PRISM_ACCESS_TOKEN in .env, and "
+                "restart. (It lasts ~24h; the durable fix is official Prism API access.)"
+            )
         if "NotAuthorized" in kind:
             raise PrismError(
                 "Prism refresh token was rejected (expired or revoked — a Prism "
@@ -276,6 +288,144 @@ async def get_show(client: httpx.AsyncClient, event_id: int | str) -> dict | Non
         if str(s.get("event_id")) == eid:
             return s
     return None
+
+
+# --- Settlement / financials -----------------------------------------------
+# The single endpoint /api/events/{id}/build returns the COMPLETE event record at
+# its top level (not the small `data` sub-object): tickets[], cost_groups[].costs[],
+# promoter_data, tax_rate/tax_type, facility_fee, attendance, currency, etc. The
+# app's settlement screens are computed client-side from exactly this payload.
+def _num(x) -> float:
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+async def get_event_full(client: httpx.AsyncClient, event_id: int | str) -> dict:
+    """Fetch the full event record (the whole financial model in one call)."""
+    data = await _get(client, f"events/{event_id}/build")
+    if not isinstance(data, dict):
+        raise PrismError(f"Unexpected event payload for {event_id}.")
+    return data
+
+
+def compute_settlement(event: dict) -> dict:
+    """Derive a settlement summary from a full event record (get_event_full).
+
+    VALIDATED to the penny against Prism's rendered figures:
+      Gross Ticket Revenue = Σ(sold × ticket_price)   [or actual_gross if set]
+      taxes (tax_type 'divisor') = gross − gross/(1 + rate/100)
+      Net Gross = gross − taxes
+    Expenses are surfaced as raw line items (budget → reported_cost). The FINAL
+    settled expense total / Net Profit run through Prism's settlement engine
+    (co-pro splits, per-line reported-vs-budget, cost taxes) and are deliberately
+    NOT recomputed here — we link to Prism for the official bottom line rather
+    than risk a wrong number.
+    """
+    tiers: list[dict] = []
+    gross = 0.0
+    sold_total = 0
+    for tk in event.get("tickets") or []:
+        sold = _num(tk.get("sold"))
+        price = _num(tk.get("ticket_price"))
+        actual = tk.get("actual_gross")
+        tier_gross = _num(actual) if actual not in (None, "") else sold * price
+        gross += tier_gross
+        sold_total += int(sold)
+        tiers.append(
+            {"name": tk.get("name"), "sold": int(sold), "price": price, "gross": tier_gross}
+        )
+
+    rate = _num(event.get("tax_rate"))
+    tax_type = (event.get("tax_type") or "").lower()
+    if rate and tax_type == "divisor":
+        taxes = gross - gross / (1 + rate / 100.0)
+    elif rate:
+        taxes = gross * rate / 100.0
+    else:
+        taxes = 0.0
+
+    budget_exp = 0.0
+    reported_exp = 0.0
+    expense_lines: list[dict] = []
+    for cg in event.get("cost_groups") or []:
+        for c in cg.get("costs") or []:
+            b = _num(c.get("budget"))
+            rep = _num(c.get("reported_cost"))
+            budget_exp += b
+            reported_exp += rep
+            expense_lines.append({"name": c.get("name"), "budget": b, "reported": rep})
+
+    pd = event.get("promoter_data") or {}
+    return {
+        "title": event.get("name"),
+        "currency": event.get("currency") or "",
+        "status_label": status_label(event.get("confirmed")),
+        "gross_ticket_revenue": round(gross, 2),
+        "taxes": round(taxes, 2),
+        "tax_rate": rate,
+        "tax_type": tax_type,
+        "net_gross": round(gross - taxes, 2),
+        "tickets_sold": sold_total,
+        "tiers": tiers,
+        "budgeted_expenses": round(budget_exp, 2),
+        "reported_expenses": round(reported_exp, 2),
+        "expense_lines": expense_lines,
+        "actual_attendance": event.get("actual_attendance"),
+        "estimated_attendance": event.get("estimated_attendance"),
+        "room_fee": pd.get("room_fee"),
+        "promoter_percentage": pd.get("promoter_percentage"),
+        "facility_fee": event.get("facility_fee"),
+    }
+
+
+async def get_settlement(client: httpx.AsyncClient, event_id: int | str) -> dict:
+    """Convenience: fetch + compute the settlement summary for an event."""
+    return compute_settlement(await get_event_full(client, event_id))
+
+
+def format_settlement(s: dict, event_id: int | str) -> str:
+    """Human-readable settlement summary for Telegram."""
+    cur = s.get("currency") or "CA$"
+
+    def m(v) -> str:
+        return f"{cur}{_num(v):,.2f}"
+
+    lines = [
+        f"💰 {s.get('title') or 'Event'}  (#{event_id})  [{s['status_label']}]",
+        "",
+        f"Tickets sold: {s['tickets_sold']:,}",
+        f"Gross Ticket Revenue: {m(s['gross_ticket_revenue'])}",
+        f"Taxes & Fees ({s['tax_rate']:g}% {s['tax_type'] or 'tax'}): -{m(s['taxes'])}",
+        f"Net Gross: {m(s['net_gross'])}",
+    ]
+    if s["tiers"]:
+        lines.append("\nTicket tiers:")
+        for t in s["tiers"][:12]:
+            lines.append(
+                f"  • {t['name']}: {t['sold']:,} × {cur}{_num(t['price']):,.2f} = {m(t['gross'])}"
+            )
+    if s["expense_lines"]:
+        lines.append(f"\nExpenses (budget → reported), {len(s['expense_lines'])} lines:")
+        for c in s["expense_lines"][:12]:
+            lines.append(
+                f"  • {c['name']}: {cur}{_num(c['budget']):,.2f} → {cur}{_num(c['reported']):,.2f}"
+            )
+        lines.append(
+            f"  Budgeted total: {m(s['budgeted_expenses'])} | "
+            f"Reported total: {m(s['reported_expenses'])}"
+        )
+    if _num(s.get("room_fee")):
+        lines.append(f"\nRoom fee: {m(s['room_fee'])}")
+    if s.get("actual_attendance"):
+        lines.append(f"Attendance (actual): {int(s['actual_attendance']):,}")
+    lines.append(
+        "\n⚠️ Net Profit / final settled expenses are computed by Prism's "
+        "settlement engine (co-pro splits, per-line logic). Official figure:"
+    )
+    lines.append(f"https://app.prism.fm/event/{event_id}/internal-settlement")
+    return "\n".join(lines)
 
 
 # --- GraphQL (experimental) -------------------------------------------------

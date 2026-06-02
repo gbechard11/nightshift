@@ -131,6 +131,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/report [id]   - last-7-day ad insights (defaults to the account)\n"
         "/shows [days|all] - upcoming Prism shows (default: next 60 days)\n"
         "/show <event_id>  - details for one Prism show\n"
+        "/settlement <event_id> - ticket revenue, taxes, expenses for a show\n"
         "/new           - clear conversation memory, start fresh\n"
         "/status        - VPS health\n"
         "/whoami        - your Telegram user ID\n\n"
@@ -754,6 +755,31 @@ async def cmd_show(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def cmd_settlement(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Read-only: ticket revenue, taxes, net gross and expense lines for a show."""
+    if not authorized(update):
+        return
+    if not prism.configured():
+        await update.message.reply_text(PRISM_NOT_CONFIGURED)
+        return
+    eid = (ctx.args[0] if ctx.args else "").strip()
+    if not eid:
+        await update.message.reply_text(
+            "Usage: /settlement <event_id>  (get ids from /shows)"
+        )
+        return
+    await ctx.bot.send_chat_action(update.message.chat_id, ChatAction.TYPING)
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            s = await prism.get_settlement(client, eid)
+    except prism.PrismError as e:
+        await update.message.reply_text(f"Settlement lookup failed: {e}")
+        return
+    text = prism.format_settlement(s, eid)
+    for i in range(0, len(text), TELEGRAM_MAX_MSG):
+        await update.message.reply_text(text[i:i + TELEGRAM_MAX_MSG])
+
+
 async def on_attachment(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not ALLOWED_USERS or not authorized(update):
         return
@@ -914,6 +940,7 @@ def main() -> None:
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("shows", cmd_shows))
     app.add_handler(CommandHandler("show", cmd_show))
+    app.add_handler(CommandHandler("settlement", cmd_settlement))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
