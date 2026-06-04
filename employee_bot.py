@@ -49,6 +49,7 @@ from telegram.ext import (
 import mailer
 import meta_ads
 import employee_notify
+import employee_requests
 import employee_drive
 import employee_email
 from pedro_brain import PedroError, run_claude
@@ -139,6 +140,28 @@ async def _ask(update: Update, ctx: ContextTypes.DEFAULT_TYPE, prompt: str) -> N
         return
     for i in range(0, len(out), TELEGRAM_MAX_MSG):
         await update.message.reply_text(out[i:i + TELEGRAM_MAX_MSG])
+
+
+async def cmd_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Submit a feature request to Greg for approval."""
+    if not authorized(update):
+        await update.message.reply_text(
+            "Not authorized. Ask Greg to add your Telegram ID (use /whoami)."
+        )
+        return
+    text = " ".join(ctx.args).strip() if ctx.args else ""
+    if not text:
+        await update.message.reply_text(
+            "Tell me what you'd like Pedro to be able to do, e.g.\n"
+            "/request a morning briefing of my email inbox"
+        )
+        return
+    name = employee_notify.who(update.effective_user.id)
+    rec = employee_requests.submit(update.effective_user.id, name, text)
+    employee_notify.notify_owner_request(rec)
+    await update.message.reply_text(
+        "✅ Sent to Greg for approval. You'll hear back here when he decides."
+    )
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -834,6 +857,7 @@ def main() -> None:
     app.add_handler(CommandHandler("find", employee_drive.cmd_find))
     app.add_handler(CommandHandler("get", employee_drive.cmd_get))
     app.add_handler(CommandHandler("mkdir", employee_drive.cmd_mkdir))
+    app.add_handler(CommandHandler("request", cmd_request))
     app.add_handler(CallbackQueryHandler(on_campaign_button, pattern=r"^camp:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))

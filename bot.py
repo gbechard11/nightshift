@@ -29,6 +29,7 @@ import whatsapp
 import wire
 from pedro_brain import PedroError, run_claude
 from imap_email import get_unread_emails
+import employee_requests
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED_USERS = {
@@ -1063,6 +1064,51 @@ async def cmd_sebamail(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(text[i:i + TELEGRAM_MAX_MSG])
 
 
+async def on_request_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner taps Approve/Reject on an employee feature request."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:  # noqa: BLE001 - stale query ("too old"); ignore
+        pass
+    if not authorized(update):
+        return
+    try:
+        _, action, req_id = query.data.split(":", 2)
+    except ValueError:
+        return
+    rec = employee_requests.load(req_id)
+    if not rec:
+        try:
+            await query.edit_message_text("This request expired or was already handled.")
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    if rec.get("status") != "pending":
+        try:
+            await query.edit_message_text(
+                f"Already {rec['status']}: {rec.get('text', '')[:200]}"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    status = "approved" if action == "approve" else "rejected"
+    employee_requests.set_status(req_id, status)
+    name = rec.get("requester_name", "employee")
+    text = rec.get("text", "")
+    if status == "approved":
+        owner_msg = f"✅ Approved {name}'s request. They've been notified."
+        emp_msg = f"✅ Greg approved your request:\n\n{text}\n\nHe'll get it built."
+    else:
+        owner_msg = f"❌ Rejected {name}'s request. They've been notified."
+        emp_msg = f"❌ Greg declined your request:\n\n{text}"
+    try:
+        await query.edit_message_text(owner_msg)
+    except Exception:  # noqa: BLE001
+        pass
+    employee_requests.notify_employee(rec["requester_id"], emp_msg)
+
+
 async def _post_shutdown(application: Application) -> None:
     runner = application.bot_data.get("_wh_runner")
     if runner is not None:
@@ -1097,6 +1143,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_call_button, pattern=r"^call:"))
     app.add_handler(CallbackQueryHandler(on_campaign_button, pattern=r"^camp:"))
     app.add_handler(CallbackQueryHandler(on_wire_button, pattern=r"^wire:"))
+    app.add_handler(CallbackQueryHandler(on_request_button, pattern=r"^req:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, on_attachment))
