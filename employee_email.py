@@ -49,9 +49,10 @@ def infer_smtp(email: str) -> tuple[str | None, int | None]:
     """Best-guess SMTP host/port from the address domain. Returns (None, None)
     when unknown so the caller asks the user for the server."""
     domain = email.rsplit("@", 1)[-1].lower()
-    # nightshiftent.ca is Google Workspace (seba@ already sends via Gmail SMTP).
-    if domain in ("gmail.com", "googlemail.com", "nightshiftent.ca"):
+    if domain in ("gmail.com", "googlemail.com"):
         return "smtp.gmail.com", 587
+    if domain == "nightshiftent.ca":
+        return "mail.nightshiftent.ca", 465  # GreenGeeks cPanel mail (SSL)
     if domain in ("outlook.com", "hotmail.com", "live.com", "office365.com"):
         return "smtp.office365.com", 587
     return None, None
