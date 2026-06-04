@@ -46,6 +46,35 @@ from starlette.responses import HTMLResponse, RedirectResponse
 import asyncio
 
 # --------------------------------------------------------------------------- #
+# Advertise PUBLIC-client auth ("none") in the OAuth authorization-server
+# metadata. The MCP SDK (pinned 1.27.2) hardcodes
+# token_endpoint_auth_methods_supported to only ["client_secret_post",
+# "client_secret_basic"] in build_metadata(). Claude's custom-connector client
+# registers as a PUBLIC PKCE client (token_endpoint_auth_method="none"); when it
+# reads our metadata and doesn't find "none", it ABORTS before ever calling
+# /register and surfaces a generic "Couldn't reach the MCP server" error. Our
+# /register handler already accepts "none" -- only the advertisement was missing.
+# Wrap build_metadata so the served metadata lists "none" too. create_auth_routes
+# calls build_metadata as a module global at app-build time, so patching the
+# module attribute here (import time) takes effect.
+# --------------------------------------------------------------------------- #
+import mcp.server.auth.routes as _auth_routes
+
+_orig_build_metadata = _auth_routes.build_metadata
+
+
+def _build_metadata_with_none(*args, **kwargs):
+    md = _orig_build_metadata(*args, **kwargs)
+    methods = list(md.token_endpoint_auth_methods_supported or [])
+    if "none" not in methods:
+        methods.append("none")
+    md.token_endpoint_auth_methods_supported = methods
+    return md
+
+
+_auth_routes.build_metadata = _build_metadata_with_none
+
+# --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
 # Public base URL Claude reaches us at. For LOCAL testing this is the loopback
