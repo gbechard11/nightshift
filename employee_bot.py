@@ -789,10 +789,6 @@ async def _email_setup_step(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text
             f"\u2705 Done! Check {st['email']} for the test email. "
             "Your reports will now send from your own address.",
         )
-        asyncio.create_task(asyncio.to_thread(
-            employee_notify.notify_owner,
-            f"\U0001F4E7 {employee_notify.who(uid)} set up a sending email: {st['email']}",
-        ))
         return
 
 

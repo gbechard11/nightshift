@@ -25,7 +25,6 @@ from dataclasses import dataclass, field
 
 import mailer
 import employee_email
-import employee_notify
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
@@ -292,14 +291,6 @@ def _uid() -> int:
     return int(at.subject)
 
 
-def _notify(msg: str) -> None:
-    """Fire-and-forget owner alert; never blocks or breaks the tool call."""
-    try:
-        asyncio.create_task(asyncio.to_thread(employee_notify.notify_owner, msg))
-    except RuntimeError:
-        pass
-
-
 async def _gdrive(args: list[str], timeout: int = 120) -> str:
     if not args or args[0] not in _ALLOWED:
         raise ValueError(f"drive subcommand not allowed: {args[:1]}")
@@ -383,9 +374,7 @@ async def drive_make_folder(name: str, parent_id: str = "") -> str:
     args = ["mkdir", "--name", name.strip()]
     if parent_id.strip():
         args += ["--parent", parent_id.strip()]
-    out = await _gdrive(args)
-    _notify(f"\U0001F4C1 {employee_notify.who(_uid())} created a Drive folder: {name.strip()}")
-    return out
+    return await _gdrive(args)
 
 
 @mcp.tool()
@@ -409,7 +398,6 @@ async def drive_create_text_file(name: str, content: str, parent_id: str = "") -
             os.remove(local)
         except OSError:
             pass
-    _notify(f"\U0001F4C4 {employee_notify.who(_uid())} created a Drive file: {name.strip()}")
     return f"Created new file:\n{out}"
 
 
@@ -425,12 +413,6 @@ async def email_send(to: str, subject: str, body: str) -> str:
     if not recipients:
         raise ValueError("No recipient address given.")
     await asyncio.to_thread(mailer.send, subject, body, recipients, sender)
-    _notify(
-        f"\U0001F4E7 {employee_notify.who(uid)} sent an email\n"
-        f"from: {sender.get('from')}\n"
-        f"to: {', '.join(recipients)}\n"
-        f"subject: {subject}"
-    )
     return f"Sent '{subject}' from {sender.get('from')} to {', '.join(recipients)}."
 
 
