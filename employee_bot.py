@@ -52,6 +52,7 @@ import employee_notify
 import employee_requests
 import employee_drive
 import employee_email
+import imap_email
 from pedro_brain import PedroError, run_claude
 
 TOKEN = os.environ["EMPLOYEE_BOT_TOKEN"]
@@ -105,6 +106,8 @@ _locks: dict[int, asyncio.Lock] = {}
 
 # Per-user in-progress email setup (uid -> {step, email, host, port}).
 EMAIL_SETUP: dict[int, dict] = {}
+# Per-user in-progress inbox (IMAP) setup (uid -> {step, email, imap_host, ...}).
+INBOX_SETUP: dict[int, dict] = {}
 
 # Confirm-first ad launches (mirrors Pedro): PAUSED campaigns awaiting a Launch
 # tap, keyed by a short token. The campaign already exists PAUSED (no spend); the
@@ -202,6 +205,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/pause <campaign_id> - stop a campaign's spend\n"
         "/report [id]   - last-7-day ad insights\n"
         "/setupemail    - set up YOUR email so reports send from you\n"
+        "/setupinbox    - connect YOUR inbox so Greg can see your unread mail\n"
         "/connect       - link this bot to your Claude app\n"
         "/new           - clear my memory of our conversation\n"
         "/whoami        - your Telegram user ID\n\n"
@@ -235,6 +239,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if update.effective_user.id in EMAIL_SETUP:
         await _email_setup_step(update, ctx, text)
+        return
+    if update.effective_user.id in INBOX_SETUP:
+        await _inbox_setup_step(update, ctx, text)
         return
     await _ask(update, ctx, text)
 
@@ -688,6 +695,108 @@ async def cmd_cancelemail(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text("Email setup cancelled.")
 
 
+async def cmd_setupinbox(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Start the guided self-service INBOX (IMAP read) setup."""
+    if not authorized(update):
+        return
+    INBOX_SETUP[update.effective_user.id] = {"step": "email"}
+    await update.message.reply_text(
+        "Let's connect YOUR inbox so Greg can see your unread mail at a glance.\n\n"
+        "What's your email address? (e.g. you@pawnshop-live.ca)\n\n"
+        "Type /cancelinbox anytime to stop.",
+    )
+
+
+async def cmd_cancelinbox(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not authorized(update):
+        return
+    INBOX_SETUP.pop(update.effective_user.id, None)
+    await update.message.reply_text("Inbox setup cancelled.")
+
+
+async def _inbox_setup_step(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    uid = update.effective_user.id
+    st = INBOX_SETUP.get(uid)
+    if not st:
+        return
+
+    if st["step"] == "email":
+        em = text.strip()
+        if "@" not in em or " " in em:
+            await update.message.reply_text("That doesn't look like an email - try again, or /cancelinbox.")
+            return
+        st["email"] = em
+        host, port = employee_email.infer_imap(em)
+        if host:
+            st["imap_host"], st["imap_port"], st["step"] = host, port, "pass"
+            await update.message.reply_text(
+                f"Got it - {em}. I'll read via {host}:{port}.\n\n"
+                "Now paste your email password (or app password).\n"
+                "(I'll delete the message with your password right after.)"
+            )
+        else:
+            st["step"] = "host"
+            await update.message.reply_text(
+                f"Got it - {em}. I don't know your mail server.\n"
+                "Send your incoming (IMAP) host and port, like:\n"
+                "  mail.example.com 993"
+            )
+        return
+
+    if st["step"] == "host":
+        parts = text.split()
+        if len(parts) < 2 or not parts[1].isdigit():
+            await update.message.reply_text("Send it as:  mail.example.com 993")
+            return
+        st["imap_host"], st["imap_port"], st["step"] = parts[0], int(parts[1]), "pass"
+        await update.message.reply_text(
+            f"Using {st['imap_host']}:{st['imap_port']}.\n"
+            "Now paste your email password (or app password).\n"
+            "(I'll delete the message with your password right after.)"
+        )
+        return
+
+    if st["step"] == "pass":
+        password = text.strip()
+        chat_id = update.message.chat_id
+        try:
+            await update.message.delete()
+        except Exception:  # noqa: BLE001
+            pass
+        inbox = {
+            "email": st["email"],
+            "password": password,
+            "imap_host": st["imap_host"],
+            "imap_port": st["imap_port"],
+            "smtp_host": st["imap_host"],
+            "smtp_port": 465,
+        }
+        await ctx.bot.send_chat_action(chat_id, ChatAction.TYPING)
+        await ctx.bot.send_message(chat_id, "Testing those details by logging into your inbox...")
+        try:
+            await asyncio.to_thread(imap_email.check_imap, inbox)
+        except Exception as e:  # noqa: BLE001
+            await ctx.bot.send_message(
+                chat_id,
+                f"\u274c Couldn't log in with those details: {e}\n\n"
+                "Paste the password again, or /cancelinbox to stop.",
+            )
+            return  # stay on the 'pass' step
+        try:
+            employee_email.save_inbox(uid, inbox)
+        except Exception as e:  # noqa: BLE001
+            INBOX_SETUP.pop(uid, None)
+            await ctx.bot.send_message(chat_id, f"Login worked but saving failed: {e}. Tell Greg.")
+            return
+        INBOX_SETUP.pop(uid, None)
+        await ctx.bot.send_message(
+            chat_id,
+            "\u2705 Done! Your inbox is connected. Greg can now see your unread mail.",
+        )
+        return
+
+
+
 def _mint_connect_code(uid: int) -> str:
     """Write a short-lived one-time code the MCP server trades for this uid.
 
@@ -841,7 +950,7 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Bot can't OCR images; guide the user to send the value as text."""
     if not authorized(update):
         return
-    if update.effective_user.id in EMAIL_SETUP:
+    if update.effective_user.id in EMAIL_SETUP or update.effective_user.id in INBOX_SETUP:
         await update.message.reply_text(
             "I can't read screenshots - please *type* the value as text "
             "(the mail server, login username, or password).",
@@ -869,6 +978,8 @@ def main() -> None:
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("setupemail", cmd_setupemail))
     app.add_handler(CommandHandler("cancelemail", cmd_cancelemail))
+    app.add_handler(CommandHandler("setupinbox", cmd_setupinbox))
+    app.add_handler(CommandHandler("cancelinbox", cmd_cancelinbox))
     app.add_handler(CommandHandler("connect", cmd_connect))
     app.add_handler(CommandHandler("research", cmd_research))
     app.add_handler(CommandHandler("draft", cmd_draft))

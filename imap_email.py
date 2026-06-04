@@ -7,12 +7,24 @@ from email.header import decode_header
 from datetime import datetime, timedelta
 import os
 
-IMAP_HOST = os.getenv("SEBA_IMAP_HOST")
-IMAP_PORT = int(os.getenv("SEBA_IMAP_PORT", 993))
-SMTP_HOST = os.getenv("SEBA_SMTP_HOST")
-SMTP_PORT = int(os.getenv("SEBA_SMTP_PORT", 465))
-EMAIL = os.getenv("SEBA_EMAIL")
-PASSWORD = os.getenv("SEBA_EMAIL_PASSWORD")
+# Generalized mailbox helpers: every function takes an explicit `creds` dict so
+# the SAME code serves any employee's mailbox. creds keys: imap_host, imap_port,
+# smtp_host, smtp_port, email, password (smtp_* only needed by send_reply).
+# Seba's mailbox comes from the SEBA_* env block via seba_creds(); other
+# employees self-enroll their IMAP creds through the Team Bot (/setupinbox),
+# stored per-uid by employee_email.
+
+
+def seba_creds():
+    """Seba's mailbox creds from the SEBA_* env block (GreenGeeks cPanel mail)."""
+    return {
+        "imap_host": os.getenv("SEBA_IMAP_HOST"),
+        "imap_port": int(os.getenv("SEBA_IMAP_PORT", 993)),
+        "smtp_host": os.getenv("SEBA_SMTP_HOST"),
+        "smtp_port": int(os.getenv("SEBA_SMTP_PORT", 465)),
+        "email": os.getenv("SEBA_EMAIL"),
+        "password": os.getenv("SEBA_EMAIL_PASSWORD"),
+    }
 
 
 def _decode(value):
@@ -26,15 +38,28 @@ def _decode(value):
     return " ".join(result)
 
 
-def get_unread_emails(since_hours=12):
-    conn = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
-    conn.login(EMAIL, PASSWORD)
+def check_imap(creds):
+    """Log in and select INBOX to validate creds. Raises on failure."""
+    conn = imaplib.IMAP4_SSL(creds["imap_host"], int(creds.get("imap_port", 993)))
+    try:
+        conn.login(creds["email"], creds["password"])
+        conn.select("INBOX")
+    finally:
+        try:
+            conn.logout()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def get_unread_emails(creds, since_hours=12):
+    conn = imaplib.IMAP4_SSL(creds["imap_host"], int(creds.get("imap_port", 993)))
+    conn.login(creds["email"], creds["password"])
     conn.select("INBOX")
     since = (datetime.now() - timedelta(hours=since_hours)).strftime("%d-%b-%Y")
     _, ids = conn.search(None, f'(UNSEEN SINCE "{since}")')
     emails = []
     for mid in ids[0].split():
-        # BODY.PEEK[] so reading the briefing does NOT mark Seba's mail as read.
+        # BODY.PEEK[] so reading does NOT mark the mail as read.
         _, data = conn.fetch(mid, "(BODY.PEEK[])")
         msg = email.message_from_bytes(data[0][1])
         body = ""
@@ -56,15 +81,15 @@ def get_unread_emails(since_hours=12):
     return emails
 
 
-def send_reply(to, subject, body, reply_to_msg_id=None):
+def send_reply(creds, to, subject, body, reply_to_msg_id=None):
     msg = MIMEMultipart()
-    msg["From"] = EMAIL
+    msg["From"] = creds["email"]
     msg["To"] = to
     msg["Subject"] = subject
     if reply_to_msg_id:
         msg["In-Reply-To"] = reply_to_msg_id
         msg["References"] = reply_to_msg_id
     msg.attach(MIMEText(body, "plain"))
-    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as server:
-        server.login(EMAIL, PASSWORD)
-        server.sendmail(EMAIL, to, msg.as_string())
+    with smtplib.SMTP_SSL(creds["smtp_host"], int(creds.get("smtp_port", 465))) as server:
+        server.login(creds["email"], creds["password"])
+        server.sendmail(creds["email"], to, msg.as_string())
