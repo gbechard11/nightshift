@@ -19,6 +19,7 @@ shared with meta_ads so there's one source of truth.
 smtplib is blocking, so callers should invoke send() via asyncio.to_thread().
 """
 import logging
+import mimetypes
 import os
 import smtplib
 import ssl
@@ -57,7 +58,8 @@ def _resolve(sender: dict | None):
     return host, port, user, password, from_addr
 
 
-def send(subject: str, body: str, recipients: list[str], sender: dict | None = None) -> None:
+def send(subject: str, body: str, recipients: list[str], sender: dict | None = None,
+         attachments: list[str] | None = None) -> None:
     """Send a plain-text email. Blocking - call via asyncio.to_thread() from async code.
 
     If `sender` is given (an employee's own SMTP identity) it overrides the shared env
@@ -78,6 +80,13 @@ def send(subject: str, body: str, recipients: list[str], sender: dict | None = N
     msg["From"] = from_addr
     msg["To"] = ", ".join(recipients)
     msg.set_content(body)
+    for _path in (attachments or []):
+        with open(_path, "rb") as _fh:
+            _data = _fh.read()
+        _ctype = mimetypes.guess_type(_path)[0] or "application/octet-stream"
+        _main, _, _sub = _ctype.partition("/")
+        msg.add_attachment(_data, maintype=_main, subtype=_sub or "octet-stream",
+                           filename=os.path.basename(_path))
 
     ctx = ssl.create_default_context()
     try:

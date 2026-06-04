@@ -294,7 +294,7 @@ def _uid() -> int:
 async def _gdrive(args: list[str], timeout: int = 120) -> str:
     if not args or args[0] not in _ALLOWED:
         raise ValueError(f"drive subcommand not allowed: {args[:1]}")
-    if "--file-id" in args:  # overwrite path — never from MCP
+    if args[0] == "upload" and "--file-id" in args:  # the only overwrite path
         raise ValueError("overwriting existing Drive files is not allowed here")
     env = {**os.environ, "GCAL_TOKEN": DRIVE_TOKEN}
     proc = await asyncio.create_subprocess_exec(

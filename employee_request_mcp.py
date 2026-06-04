@@ -5,20 +5,25 @@ Launched by claude (via --mcp-config employee_requests.mcp.json) for each
 employee turn. Gives the locked-down chat agent (file/shell tools denied) a few
 SAFE capabilities so it doesn't have to punt everything to Greg:
 
-  - submit_request : forward a request/idea to Greg for approval
-  - email_send     : send mail FROM the employee's own configured address
-  - remember       : save a short note to the employee's persistent memory
-  - recall         : read back what's been remembered
+  - submit_request         : forward a request/idea to Greg for approval
+  - email_send             : send mail (with optional Drive attachments) FROM
+                             the employee's own configured address
+  - remember / recall      : persistent per-employee memory notes
+  - drive_list / drive_find / drive_read_text : browse + read Greg's Drive
+  - drive_make_folder / drive_create_text_file : create NEW Drive items
 
-Requester identity arrives via env (NS_REQUESTER_ID / NS_REQUESTER_NAME), set
-per-turn by employee_bot._ask.
+Drive access mirrors the remote connector's tiers: read everything, create-only
+(never overwrite or delete). Requester identity arrives via env
+(NS_REQUESTER_ID / NS_REQUESTER_NAME), set per-turn by employee_bot._ask.
 """
-import asyncio
 import os
+import re
+import secrets
+import shutil
+import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# Load .env so the helpers have their tokens even if env wasn't propagated.
 try:
     with open(os.path.join(HERE, ".env")) as f:
         for line in f:
@@ -40,19 +45,41 @@ from mcp.server.fastmcp import FastMCP  # noqa: E402
 
 mcp = FastMCP("nsrequests")
 
+GDRIVE_BIN = os.path.join(HERE, "gdrive.py")
+DRIVE_TOKEN = os.environ.get("EMPLOYEE_GDRIVE_TOKEN", "/data/employees/token.json")
+DL_DIR = os.environ.get("EMPLOYEE_DL_DIR", "/data/employees/dl")
+_ALLOWED = {"list", "find", "download", "mkdir", "upload"}
+
 
 def _uid() -> str:
     return os.environ.get("NS_REQUESTER_ID", "").strip()
+
+
+def _gdrive(args, timeout=120):
+    """Run gdrive.py with the sandbox token. Create-only: never overwrite."""
+    if not args or args[0] not in _ALLOWED:
+        raise ValueError("drive subcommand not allowed: %s" % args[:1])
+    if args[0] == "upload" and "--file-id" in args:  # the only overwrite path
+        raise ValueError("overwriting existing Drive files is not allowed here")
+    env = {**os.environ, "GCAL_TOKEN": DRIVE_TOKEN}
+    try:
+        r = subprocess.run(
+            [sys.executable, GDRIVE_BIN, *args], cwd=HERE, env=env,
+            capture_output=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return "Drive command timed out."
+    out = (r.stdout + r.stderr).decode("utf-8", errors="replace").strip()
+    return out or "(no output)"
 
 
 @mcp.tool()
 def submit_request(text: str) -> str:
     """Forward a feature request, idea, or task to Greg (the owner) for approval.
 
-    Use this only for things you genuinely CAN'T do yourself with your other
-    tools -- e.g. a brand-new capability, money/wire actions, or anything that
-    needs Greg's sign-off. `text` is the full request in the employee's words.
-    Greg gets an Approve/Reject prompt; the employee is told the outcome.
+    Use this only for things you genuinely CANNOT do yourself with your other
+    tools -- a brand-new capability, money/wire actions, or anything that needs
+    Greg's sign-off. `text` is the full request in the employee's words.
     """
     rid = _uid()
     if not rid:
@@ -61,19 +88,20 @@ def submit_request(text: str) -> str:
     rec = employee_requests.submit(int(rid), name, text)
     employee_notify.notify_owner_request(rec)
     return (
-        f"Done -- sent to Greg for approval (request {rec['id']}). "
-        "You'll hear back here when he decides."
+        "Done -- sent to Greg for approval (request %s). "
+        "You'll hear back here when he decides." % rec["id"]
     )
 
 
 @mcp.tool()
-def email_send(to: str, subject: str, body: str) -> str:
+def email_send(to: str, subject: str, body: str, attach_file_ids: str = "") -> str:
     """Send a plain-text email FROM the employee's own Nightshift address.
 
-    Use this whenever the employee asks you to send/email something (including a
-    test email to themselves). `to` is one or more comma-separated addresses.
-    Do NOT file a request to Greg for this -- just send it. If the employee has
-    no sending address configured yet, this returns guidance to run /setupemail.
+    `to` is one or more comma-separated addresses. `attach_file_ids` is an
+    OPTIONAL comma-separated list of Google Drive file ids (from drive_find /
+    drive_list) to download and attach -- use this to email graphics/PDFs etc.
+    Just send it; do NOT file a request to Greg. If the employee has no sending
+    address yet, this returns guidance to run /setupemail.
     """
     rid = _uid()
     if not rid:
@@ -87,11 +115,32 @@ def email_send(to: str, subject: str, body: str) -> str:
     recipients = [r.strip() for r in to.replace(";", ",").split(",") if r.strip()]
     if not recipients:
         return "I need at least one recipient email address."
+
+    ids = [f.strip() for f in attach_file_ids.replace(";", ",").split(",") if f.strip()]
+    workdirs = []
+    paths = []
     try:
-        asyncio.run(asyncio.to_thread(mailer.send, subject, body, recipients, sender))
-    except Exception as e:  # surface SMTP errors to the agent, don't crash
-        return f"Couldn't send the email: {e}"
-    return f"Sent '{subject}' from {sender.get('from')} to {', '.join(recipients)}."
+        for fid in ids:
+            work = os.path.join(DL_DIR, "att_" + secrets.token_hex(6))
+            os.makedirs(work, exist_ok=True)
+            workdirs.append(work)
+            raw = os.path.join(work, "raw")
+            msg = _gdrive(["download", "--file-id", fid, "--out", raw])
+            if not os.path.exists(raw):
+                return "Couldn't download attachment %s: %s" % (fid, msg)
+            m = re.search(r"name=(.+)$", msg)
+            real = (m.group(1).strip() if m else "") or "attachment"
+            final = os.path.join(work, os.path.basename(real))
+            os.rename(raw, final)
+            paths.append(final)
+        mailer.send(subject, body, recipients, sender, attachments=paths)
+    except Exception as e:
+        return "Couldn't send the email: %s" % e
+    finally:
+        for w in workdirs:
+            shutil.rmtree(w, ignore_errors=True)
+    extra = (" with %d attachment(s)" % len(paths)) if paths else ""
+    return "Sent '%s'%s from %s to %s." % (subject, extra, sender.get("from"), ", ".join(recipients))
 
 
 @mcp.tool()
@@ -106,7 +155,7 @@ def remember(note: str) -> str:
     saved = employee_notes.append(int(rid), note)
     if not saved:
         return "Nothing to save."
-    return f"Saved to memory: {saved}"
+    return "Saved to memory: %s" % saved
 
 
 @mcp.tool()
@@ -117,6 +166,86 @@ def recall() -> str:
         return ""
     notes = employee_notes.read(int(rid))
     return notes or "(no notes saved yet)"
+
+
+@mcp.tool()
+def drive_list(folder_id: str = "") -> str:
+    """List Google Drive items. No folder_id (or 'root') lists the top level
+    (My Drive root, which includes folders shared in); otherwise pass a folder id
+    from a previous listing to look inside it."""
+    arg = folder_id.strip()
+    folder = "root" if (not arg or arg.lower() in ("root", "shared")) else arg
+    return _gdrive(["list", "--folder", folder, "--max", "50"])
+
+
+@mcp.tool()
+def drive_find(query: str) -> str:
+    """Search across all of Greg's Drive for files/folders whose name matches."""
+    if not query.strip():
+        raise ValueError("Provide a name to search for.")
+    return _gdrive(["find", "--name", query.strip(), "--max", "50"])
+
+
+@mcp.tool()
+def drive_read_text(file_id: str) -> str:
+    """Download a Drive file by id and return its TEXT contents. Binary files
+    (images, PDFs) are reported, not returned -- attach them with email_send's
+    attach_file_ids instead, or use the Telegram /get command."""
+    fid = file_id.strip()
+    if not fid:
+        raise ValueError("Provide a file id (from drive_list / drive_find).")
+    os.makedirs(DL_DIR, exist_ok=True)
+    out_path = os.path.join(DL_DIR, "rd_" + secrets.token_hex(8))
+    msg = _gdrive(["download", "--file-id", fid, "--out", out_path])
+    if not os.path.exists(out_path):
+        return msg or "Download failed."
+    try:
+        data = open(out_path, "rb").read()
+    finally:
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
+    try:
+        return data.decode("utf-8")[:100_000]
+    except UnicodeDecodeError:
+        return ("That file is binary (%d bytes) -- attach it with "
+                "email_send(attach_file_ids=...) or use /get %s in Telegram."
+                % (len(data), fid))
+
+
+@mcp.tool()
+def drive_make_folder(name: str, parent_id: str = "") -> str:
+    """Create a NEW folder in Drive. parent_id optional (omit for My Drive root)."""
+    if not name.strip():
+        raise ValueError("Give the new folder a name.")
+    args = ["mkdir", "--name", name.strip()]
+    if parent_id.strip():
+        args += ["--parent", parent_id.strip()]
+    return _gdrive(args)
+
+
+@mcp.tool()
+def drive_create_text_file(name: str, content: str, parent_id: str = "") -> str:
+    """Create a NEW text file in Drive with the given contents (create-only,
+    never overwrites)."""
+    if not name.strip():
+        raise ValueError("Give the file a name.")
+    os.makedirs(DL_DIR, exist_ok=True)
+    local = os.path.join(DL_DIR, "mk_" + secrets.token_hex(8))
+    with open(local, "w", encoding="utf-8") as fh:
+        fh.write(content)
+    try:
+        args = ["upload", "--file", local, "--name", name.strip()]
+        if parent_id.strip():
+            args += ["--parent", parent_id.strip()]
+        out = _gdrive(args)
+    finally:
+        try:
+            os.remove(local)
+        except OSError:
+            pass
+    return "Created new file:\n%s" % out
 
 
 if __name__ == "__main__":

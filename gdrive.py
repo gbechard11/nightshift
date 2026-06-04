@@ -110,6 +110,12 @@ def cmd_find(args):
 def cmd_download(args):
     service = get_service()
     out = Path(args.out)
+    try:
+        _meta = service.files().get(fileId=args.file_id, fields="name",
+                                    supportsAllDrives=True).execute()
+        _real_name = _meta.get("name", "")
+    except Exception:
+        _real_name = ""
     request = service.files().get_media(fileId=args.file_id, **{"supportsAllDrives": True})
     buf = io.FileIO(str(out), "wb")
     downloader = MediaIoBaseDownload(buf, request)
@@ -119,7 +125,7 @@ def cmd_download(args):
         if status:
             print(f"  {int(status.progress() * 100)}%", end="\r")
     buf.close()
-    print(f"saved {out} ({out.stat().st_size} bytes)")
+    print(f"saved {out} ({out.stat().st_size} bytes) name={_real_name}")
 
 
 def cmd_mkdir(args):
