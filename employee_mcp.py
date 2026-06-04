@@ -268,17 +268,16 @@ async def whoami() -> str:
 
 @mcp.tool()
 async def drive_list(folder_id: str = "") -> str:
-    """List Google Drive items. No folder_id = folders shared with you;
-    'root' = Greg's My Drive root; otherwise pass a folder id."""
+    """List Google Drive items. No folder_id (or 'root') lists the top level
+    (My Drive root, which includes the folders shared into it); otherwise pass
+    a folder id from a previous listing to look inside it."""
     _uid()
     arg = folder_id.strip()
-    if not arg or arg.lower() == "shared":
-        args = ["list", "--shared", "--max", "50"]
-    elif arg.lower() == "root":
-        args = ["list", "--folder", "root", "--max", "50"]
+    if not arg or arg.lower() in ("root", "shared"):
+        folder = "root"
     else:
-        args = ["list", "--folder", arg, "--max", "50"]
-    return await _gdrive(args)
+        folder = arg
+    return await _gdrive(["list", "--folder", folder, "--max", "50"])
 
 
 @mcp.tool()

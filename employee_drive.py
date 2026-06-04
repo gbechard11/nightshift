@@ -90,17 +90,14 @@ async def _save_attachment(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> tu
 
 
 async def cmd_files(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """List Drive. No arg -> shared-with-me; 'root' -> My Drive; else a folder id."""
+    """List Drive. No arg (or 'root') -> top level (My Drive root, which
+    includes folders shared into it); else a folder id from a prior listing."""
     if not _ok(update):
         return
     arg = ctx.args[0].strip() if ctx.args else ""
     await ctx.bot.send_chat_action(update.message.chat_id, ChatAction.TYPING)
-    if not arg or arg.lower() == "shared":
-        args = ["list", "--shared", "--max", "50"]
-    elif arg.lower() == "root":
-        args = ["list", "--folder", "root", "--max", "50"]
-    else:
-        args = ["list", "--folder", arg, "--max", "50"]
+    folder = "root" if (not arg or arg.lower() in ("root", "shared")) else arg
+    args = ["list", "--folder", folder, "--max", "50"]
     try:
         out = await _gdrive(args)
     except ValueError as e:
