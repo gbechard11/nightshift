@@ -52,6 +52,7 @@ import employee_notify
 import employee_requests
 import employee_drive
 import employee_email
+import employee_notes
 import imap_email
 from pedro_brain import PedroError, run_claude
 
@@ -135,6 +136,17 @@ def _session_file(uid: int) -> str:
     return os.path.join(SESSION_DIR, f"employee-{uid}")
 
 
+def _with_notes(uid: int, prompt: str) -> str:
+    """Prepend the employee's saved notes so preferences survive session
+    resets. Notes come from the agent's `remember` MCP tool."""
+    notes = employee_notes.read(uid)
+    if not notes:
+        return prompt
+    header = ("[Saved notes about this person -- apply them, and use the "
+              "remember tool to add more; do not say you cannot keep memory]")
+    return header + chr(10) + notes + chr(10) + chr(10) + prompt
+
+
 async def _ask(update: Update, ctx: ContextTypes.DEFAULT_TYPE, prompt: str) -> None:
     """Run a restricted, per-employee, memory-keeping claude turn and reply."""
     uid = update.effective_user.id
@@ -148,7 +160,7 @@ async def _ask(update: Update, ctx: ContextTypes.DEFAULT_TYPE, prompt: str) -> N
     log.info("claude from %s: %s", uid, prompt[:200])
     try:
         out = await run_claude(
-            prompt,
+            _with_notes(uid, prompt),
             workdir=WORKDIR,
             session_file=_session_file(uid),
             disallowed_tools=EMPLOYEE_DENY_TOOLS,
