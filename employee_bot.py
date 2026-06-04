@@ -138,11 +138,14 @@ def _session_file(uid: int) -> str:
 
 EMPLOYEE_HANDOFF = (
     "SYSTEM: your conversation memory is about to be rotated to stay within "
-    "context limits. You CANNOT write files here -- instead, call the `remember` "
-    "tool ONCE for EACH open item, in-progress task, pending request, and key "
-    "fact from this conversation that a fresh session would need to continue "
-    "seamlessly (names, addresses, amounts, dates, the exact next action). Then "
-    "reply 'saved'."
+    "context limits. A fresh session will only know what you save now. You "
+    "CANNOT write files here -- your ONLY way to carry anything forward is the "
+    "`remember` tool. Before you reply, you MUST call `remember` at least once. "
+    "Call it ONCE for EACH open item, in-progress task, pending request, and key "
+    "fact a fresh session would need to continue seamlessly (names, addresses, "
+    "amounts, dates, the exact next action). If genuinely nothing is pending, "
+    "still call `remember` once with a one-line summary of what was discussed. "
+    "Only after you have called `remember`, reply 'saved'."
 )
 
 
