@@ -46,6 +46,8 @@ from telegram.ext import (
 
 import mailer
 import meta_ads
+import employee_drive
+import employee_email
 from pedro_brain import PedroError, run_claude
 
 TOKEN = os.environ["EMPLOYEE_BOT_TOKEN"]
@@ -75,6 +77,9 @@ log = logging.getLogger("nightshift.employees")
 # can't --resume the same session concurrently), but different employees run in
 # parallel. Distinct from the owner bot's single global lock.
 _locks: dict[int, asyncio.Lock] = {}
+
+# Per-user in-progress email setup (uid -> {step, email, host, port}).
+EMAIL_SETUP: dict[int, dict] = {}
 
 # Confirm-first ad launches (mirrors Pedro): PAUSED campaigns awaiting a Launch
 # tap, keyed by a short token. The campaign already exists PAUSED (no spend); the
@@ -144,9 +149,10 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/media         - list images available for ad creative\n"
         "/pause <campaign_id> - stop a campaign's spend\n"
         "/report [id]   - last-7-day ad insights\n"
+        "/setupemail    - set up YOUR email so reports send from you\n"
         "/new           - clear my memory of our conversation\n"
         "/whoami        - your Telegram user ID\n\n"
-        "Voice notes work too. Campaigns are always drafted PAUSED; only the "
+        "Drive (read everything, create new only - cannot edit or delete existing):\n  /files [folderId]  (no arg = shared folders)\n  /find <name>\n  /get <fileId>\n  /mkdir <name> | <parentId>\n  attach a file captioned: /upload <folderId>\n  /replace <fileId> overwrites it (write access required)\n\nVoice notes work too. Campaigns are always drafted PAUSED; only the "
         "Launch button starts real spend."
     )
 
@@ -173,6 +179,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     text = (update.message.text or "").strip()
     if not text:
+        return
+    if update.effective_user.id in EMAIL_SETUP:
+        await _email_setup_step(update, ctx, text)
         return
     await _ask(update, ctx, text)
 
@@ -476,6 +485,23 @@ async def on_campaign_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Route an uploaded file to Drive: caption /upload (create) or /replace (overwrite)."""
+    if not authorized(update):
+        return
+    caption = (update.message.caption or "").strip()
+    if caption.lower().startswith("/upload"):
+        await employee_drive.handle_upload(update, ctx)
+        return
+    if caption.lower().startswith("/replace"):
+        await employee_drive.handle_replace(update, ctx)
+        return
+    await update.message.reply_text(
+        "To save a file to Drive, attach it with a caption:\n"
+        "/upload <folderId>   - add it as a NEW file\n"
+        "/replace <fileId>    - overwrite an existing file (write access required)"
+    )
+
 async def cmd_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """List media files available in the local ads folder for use in /draft."""
     if not authorized(update):
@@ -553,10 +579,11 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     recipients = meta_ads.REPORT_RECIPIENTS
     if not recipients:
         return
-    if not mailer.configured():
+    sender = employee_email.sender_for(update.effective_user.id)
+    if sender is None:
         await update.message.reply_text(
-            "📧 (Email not set up yet — set SMTP_HOST/SMTP_USER/SMTP_PASSWORD in .env "
-            f"to auto-send these to {', '.join(recipients)}.)"
+            "📧 (Not emailed — you don't have your own email setup yet. "
+            "Ask Greg to add your sending address so reports go out from you.)"
         )
         return
     try:
@@ -565,10 +592,161 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             f"Nightshift Ads report — {obj} (last 7 days)",
             report_text,
             recipients,
+            sender,
         )
-        await update.message.reply_text(f"📧 Report emailed to {', '.join(recipients)}.")
+        sent_from = sender.get('from') or sender.get('smtp_user')
+        await update.message.reply_text(
+            f"📧 Report emailed to {', '.join(recipients)} from {sent_from}."
+        )
     except mailer.MailError as e:
         await update.message.reply_text(f"⚠️ Report shown above but email failed: {e}")
+
+
+_APP_PW_HELP = (
+    "For Gmail / Workspace you need a Google *App Password* (not your normal password):\n"
+    "1. Turn on 2-Step Verification at myaccount.google.com/security\n"
+    "2. Create one at myaccount.google.com/apppasswords (name it \"Nightshift bot\")\n"
+    "3. Paste the 16-character code here."
+)
+
+
+async def cmd_setupemail(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Start the guided self-service email setup."""
+    if not authorized(update):
+        return
+    EMAIL_SETUP[update.effective_user.id] = {"step": "email"}
+    await update.message.reply_text(
+        "Let's set up your email so reports send from *you*, not a shared address.\n\n"
+        "What email address will you send from? (e.g. you@nightshiftent.ca)\n\n"
+        "You can type /cancelemail anytime to stop.",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_cancelemail(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not authorized(update):
+        return
+    EMAIL_SETUP.pop(update.effective_user.id, None)
+    await update.message.reply_text("Email setup cancelled.")
+
+
+async def _email_setup_step(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    uid = update.effective_user.id
+    st = EMAIL_SETUP.get(uid)
+    if not st:
+        return
+
+    if st["step"] == "email":
+        email = text.strip()
+        if "@" not in email or " " in email:
+            await update.message.reply_text("That doesn't look like an email — try again, or /cancelemail.")
+            return
+        st["email"] = email
+        host, port = employee_email.infer_smtp(email)
+        if host:
+            st["host"], st["port"], st["user"], st["step"] = host, port, email, "pass"
+            await update.message.reply_text(
+                f"Got it - {email}. I'll send via {host}:{port}.\n\n" + _APP_PW_HELP,
+                parse_mode="Markdown",
+            )
+        else:
+            st["step"] = "host"
+            await update.message.reply_text(
+                f"Got it - {email}. I don't know your mail server.\n"
+                "Send your outgoing (SMTP) host and port, like:\n"
+                "  smtp.example.com 587   (STARTTLS)\n"
+                "  smtp.example.com 465   (SSL)"
+            )
+        return
+
+    if st["step"] == "host":
+        parts = text.split()
+        if len(parts) < 2 or not parts[1].isdigit():
+            await update.message.reply_text("Send it as:  smtp.example.com 587")
+            return
+        st["host"], st["port"], st["step"] = parts[0], int(parts[1]), "user"
+        await update.message.reply_text(
+            f"Using {st['host']}:{st['port']}.\n"
+            "What's the SMTP *login username*? For some providers (Amazon SES, "
+            "Postmark, Mailgun) the login is a separate key, not your email address.\n\n"
+            f"Reply with the username, or send  same  to use {st['email']}.",
+            parse_mode="Markdown",
+        )
+        return
+
+    if st["step"] == "user":
+        user = text.strip()
+        st["user"] = st["email"] if user.lower() == "same" else user
+        st["step"] = "pass"
+        await update.message.reply_text(
+            f"Login user: {st['user']}. Now paste your SMTP password / app password.\n\n"
+            "(I'll delete the message with your password right after.)"
+        )
+        return
+
+    if st["step"] == "pass":
+        password = text.strip()
+        if st["host"] == "smtp.gmail.com":
+            password = password.replace(" ", "")
+        chat_id = update.message.chat_id
+        # scrub the password message from the chat
+        try:
+            await update.message.delete()
+        except Exception:  # noqa: BLE001
+            pass
+        sender = {
+            "from": st["email"],
+            "smtp_host": st["host"],
+            "smtp_port": st["port"],
+            "smtp_user": st["user"],
+            "smtp_pass": password,
+        }
+        await ctx.bot.send_chat_action(chat_id, ChatAction.TYPING)
+        await ctx.bot.send_message(chat_id, "Testing those details by sending you a quick test email...")
+        try:
+            await asyncio.to_thread(
+                mailer.send,
+                "Nightshift bot - email test",
+                "Your Nightshift bot email is set up correctly. Reports will now send from this address.",
+                [st["email"]],
+                sender,
+            )
+        except mailer.MailError as e:
+            await ctx.bot.send_message(
+                chat_id,
+                f"\u274c Couldn't send with those details: {e}\n\n"
+                "Paste the app password again, or /cancelemail to stop.",
+            )
+            return  # stay on the 'pass' step
+        try:
+            employee_email.save_sender(uid, sender)
+        except Exception as e:  # noqa: BLE001
+            EMAIL_SETUP.pop(uid, None)
+            await ctx.bot.send_message(chat_id, f"Test worked but saving failed: {e}. Tell Greg.")
+            return
+        EMAIL_SETUP.pop(uid, None)
+        await ctx.bot.send_message(
+            chat_id,
+            f"\u2705 Done! Check {st['email']} for the test email. "
+            "Your reports will now send from your own address.",
+        )
+        return
+
+
+async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Bot can't OCR images; guide the user to send the value as text."""
+    if not authorized(update):
+        return
+    if update.effective_user.id in EMAIL_SETUP:
+        await update.message.reply_text(
+            "I can't read screenshots - please *type* the value as text "
+            "(the mail server, login username, or password).",
+            parse_mode="Markdown",
+        )
+        return
+    await update.message.reply_text(
+        "I can't read images yet - please send the details as text."
+    )
 
 
 def main() -> None:
@@ -585,14 +763,22 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
+    app.add_handler(CommandHandler("setupemail", cmd_setupemail))
+    app.add_handler(CommandHandler("cancelemail", cmd_cancelemail))
     app.add_handler(CommandHandler("research", cmd_research))
     app.add_handler(CommandHandler("draft", cmd_draft))
     app.add_handler(CommandHandler("media", cmd_media))
     app.add_handler(CommandHandler("pause", cmd_pause))
     app.add_handler(CommandHandler("report", cmd_report))
+    app.add_handler(CommandHandler("files", employee_drive.cmd_files))
+    app.add_handler(CommandHandler("find", employee_drive.cmd_find))
+    app.add_handler(CommandHandler("get", employee_drive.cmd_get))
+    app.add_handler(CommandHandler("mkdir", employee_drive.cmd_mkdir))
     app.add_handler(CallbackQueryHandler(on_campaign_button, pattern=r"^camp:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
+    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL, on_document))
     log.info("Starting nightshift employee bot")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

@@ -42,14 +42,32 @@ def configured() -> bool:
     return bool(SMTP_HOST and SMTP_USER and SMTP_PASSWORD)
 
 
-def send(subject: str, body: str, recipients: list[str]) -> None:
-    """Send a plain-text email. Blocking — call via asyncio.to_thread() from async code.
+def _resolve(sender: dict | None):
+    """Pick SMTP creds: an employee's own identity dict, else the shared env config."""
+    if sender:
+        host = sender.get("smtp_host") or SMTP_HOST
+        port = int(sender.get("smtp_port") or SMTP_PORT)
+        user = sender.get("smtp_user") or SMTP_USER
+        password = sender.get("smtp_pass") or SMTP_PASSWORD
+        from_addr = sender.get("from") or user
+    else:
+        host, port, user, password, from_addr = (
+            SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, MAIL_FROM
+        )
+    return host, port, user, password, from_addr
 
-    Raises MailError on misconfiguration or any SMTP failure.
+
+def send(subject: str, body: str, recipients: list[str], sender: dict | None = None) -> None:
+    """Send a plain-text email. Blocking - call via asyncio.to_thread() from async code.
+
+    If `sender` is given (an employee's own SMTP identity) it overrides the shared env
+    config, so each employee sends from their own address. Raises MailError on
+    misconfiguration or any SMTP failure.
     """
-    if not configured():
+    host, port, user, password, from_addr = _resolve(sender)
+    if not (host and user and password):
         raise MailError(
-            "SMTP not configured — set SMTP_HOST, SMTP_USER and SMTP_PASSWORD in .env."
+            "Email not set up - run /setupemail to add your sending address."
         )
     recipients = [r.strip() for r in recipients if r and r.strip()]
     if not recipients:
@@ -57,23 +75,23 @@ def send(subject: str, body: str, recipients: list[str]) -> None:
 
     msg = EmailMessage()
     msg["Subject"] = subject
-    msg["From"] = MAIL_FROM
+    msg["From"] = from_addr
     msg["To"] = ", ".join(recipients)
     msg.set_content(body)
 
     ctx = ssl.create_default_context()
     try:
-        if SMTP_PORT == 465:
-            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30, context=ctx) as s:
-                s.login(SMTP_USER, SMTP_PASSWORD)
-                s.send_message(msg)
+        if port == 465:
+            with smtplib.SMTP_SSL(host, port, timeout=30, context=ctx) as srv:
+                srv.login(user, password)
+                srv.send_message(msg)
         else:
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as s:
-                s.starttls(context=ctx)
-                s.login(SMTP_USER, SMTP_PASSWORD)
-                s.send_message(msg)
+            with smtplib.SMTP(host, port, timeout=30) as srv:
+                srv.starttls(context=ctx)
+                srv.login(user, password)
+                srv.send_message(msg)
     except MailError:
         raise
     except Exception as e:  # noqa: BLE001 - surface a clean message to the caller
         raise MailError(f"{type(e).__name__}: {e}") from e
-    log.info("emailed report '%s' to %s", subject, ", ".join(recipients))
+    log.info("emailed '%s' to %s (from %s)", subject, ", ".join(recipients), from_addr)
