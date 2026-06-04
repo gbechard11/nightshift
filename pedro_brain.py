@@ -130,12 +130,13 @@ _HANDOFF_PROMPT = (
 )
 
 
-async def _rotate_session(base, sid, session_file, workdir, timeout):
+async def _rotate_session(base, sid, session_file, workdir, timeout,
+                          handoff_prompt=_HANDOFF_PROMPT, env=None):
     """Write a handoff to BRAIN.md on the OLD session, then drop the session pointer
     so the next run starts fresh (and reloads BRAIN.md). Best-effort: never raises."""
     try:
-        args = base + ["--resume", sid, "-p", _HANDOFF_PROMPT]
-        await _run_claude(args, workdir, min(timeout, 180))
+        args = base + ["--resume", sid, "-p", handoff_prompt]
+        await _run_claude(args, workdir, min(timeout, 180), env=env)
     except Exception as e:  # noqa: BLE001
         log.warning("handoff before rotation failed (resetting anyway): %s", e)
     try:
@@ -156,6 +157,7 @@ async def run_claude(
     mcp_config: str | None = None,
     env: dict | None = None,
     lock: asyncio.Lock | None = None,
+    handoff_prompt: str | None = None,
     timeout: int = CLAUDE_TIMEOUT,
 ) -> str:
     """Invoke claude for `prompt` and return its reply text.
@@ -240,6 +242,7 @@ async def run_claude(
         ):
             log.info("session at %d ctx tokens (>= %d) — rotating",
                      ctx_tokens, ROTATE_AT_TOKENS)
-            await _rotate_session(base, sid, session_file, workdir, timeout)
+            await _rotate_session(base, sid, session_file, workdir, timeout,
+                                  handoff_prompt or _HANDOFF_PROMPT, env=env)
 
         return (text or "").strip() or "(empty response)"

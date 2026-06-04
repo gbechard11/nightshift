@@ -136,6 +136,16 @@ def _session_file(uid: int) -> str:
     return os.path.join(SESSION_DIR, f"employee-{uid}")
 
 
+EMPLOYEE_HANDOFF = (
+    "SYSTEM: your conversation memory is about to be rotated to stay within "
+    "context limits. You CANNOT write files here -- instead, call the `remember` "
+    "tool ONCE for EACH open item, in-progress task, pending request, and key "
+    "fact from this conversation that a fresh session would need to continue "
+    "seamlessly (names, addresses, amounts, dates, the exact next action). Then "
+    "reply 'saved'."
+)
+
+
 def _with_notes(uid: int, prompt: str) -> str:
     """Prepend the employee's saved notes so preferences survive session
     resets. Notes come from the agent's `remember` MCP tool."""
@@ -166,6 +176,7 @@ async def _ask(update: Update, ctx: ContextTypes.DEFAULT_TYPE, prompt: str) -> N
             disallowed_tools=EMPLOYEE_DENY_TOOLS,
             strict_mcp=True,
             mcp_config=REQUEST_MCP_CONFIG,
+            handoff_prompt=EMPLOYEE_HANDOFF,
             env={
                 "NS_REQUESTER_ID": str(uid),
                 "NS_REQUESTER_NAME": employee_notify.who(uid),
