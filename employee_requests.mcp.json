@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "nsrequests": {
+      "command": "/home/gregnightshift/nightshift/.venv/bin/python",
+      "args": ["/home/gregnightshift/nightshift/employee_request_mcp.py"]
+    }
+  }
+}

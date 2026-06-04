@@ -56,7 +56,7 @@ class PedroError(Exception):
     """User-facing failure from a claude run (timeout, nonzero exit, etc.)."""
 
 
-async def _run_claude(args: list[str], workdir: str, timeout: int):
+async def _run_claude(args: list[str], workdir: str, timeout: int, env: dict | None = None):
     """Run claude; return (returncode, stdout_str, stderr_str).
     returncode is None on timeout or missing binary (message is in stderr_str)."""
     try:
@@ -65,6 +65,7 @@ async def _run_claude(args: list[str], workdir: str, timeout: int):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=workdir,
+            env=({**os.environ, **env} if env else None),
         )
     except FileNotFoundError:
         return None, "", f"claude binary not found at {CLAUDE_BIN}"
@@ -152,6 +153,8 @@ async def run_claude(
     allowed_tools: str | None = None,
     disallowed_tools: str | None = None,
     strict_mcp: bool = False,
+    mcp_config: str | None = None,
+    env: dict | None = None,
     lock: asyncio.Lock | None = None,
     timeout: int = CLAUDE_TIMEOUT,
 ) -> str:
@@ -179,6 +182,8 @@ async def run_claude(
                 "--output-format", "json"]
         if strict_mcp:
             base.append("--strict-mcp-config")
+        if mcp_config:
+            base += ["--mcp-config", mcp_config]
         if allowed_tools:
             # --tools is variadic; the following arg (-p or a session flag) ends it.
             base += ["--tools", *allowed_tools.replace(",", " ").split()]
@@ -194,7 +199,7 @@ async def run_claude(
             session_flag = "--session-id" if is_new else "--resume"
             args = base + [session_flag, sid, "-p", prompt]
 
-        rc, out, err = await _run_claude(args, workdir, timeout)
+        rc, out, err = await _run_claude(args, workdir, timeout, env=env)
 
         # Recover from a broken/locked/missing session: wipe the pointer, start a
         # genuinely fresh session, retry once. (Stateless runs have no session to
@@ -215,7 +220,7 @@ async def run_claude(
                 pass
             sid, _ = _get_session_id(session_file)  # creates a new one
             args = base + ["--session-id", sid, "-p", prompt]
-            rc, out, err = await _run_claude(args, workdir, timeout)
+            rc, out, err = await _run_claude(args, workdir, timeout, env=env)
 
         if rc is None:
             raise PedroError(err)  # timeout / missing-binary message

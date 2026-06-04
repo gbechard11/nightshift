@@ -67,10 +67,27 @@ CONNECT_CODES = os.environ.get(
 )
 CONNECT_TTL = 600  # seconds a /connect code stays valid
 # The security boundary: an ALLOWLIST of the only tools that exist for the run.
-# Web research only — no shell/file/sub-agent/cron/MCP, so .env and tokens are
-# unreachable. (A denylist is unsafe here; see module docstring.) Paired with
-# strict_mcp=True below to drop ambient MCP servers.
-ALLOWED_TOOLS = os.environ.get("EMPLOYEE_ALLOWED_TOOLS", "WebSearch WebFetch")
+# Locked-down lane: a comprehensive DENYLIST removes every shell/file/sub-agent/
+# cron/skill/worktree tool from the model's context. Bare tool names are
+# context-gated (the CLI strips them from the tool definitions sent to the
+# model), so they are ABSENT, not merely permission-gated — unrecoverable even
+# via ToolSearch. We must use a denylist (not the --tools allowlist) because
+# --tools is built-in-only and silently drops MCP tools; the denylist is the
+# only way to keep WebSearch/WebFetch + the submit_request MCP tool while
+# removing escalation tools. ToolSearch MUST stay allowed — the CLI surfaces
+# MCP tools through it (deny it and submit_request never loads). Verified live.
+# Paired with strict_mcp=True to drop ambient MCP servers.
+EMPLOYEE_DENY_TOOLS = os.environ.get(
+    "EMPLOYEE_DENY_TOOLS",
+    "Bash Read Edit Write Agent Glob Grep NotebookEdit Task TodoWrite "
+    "Cron Monitor BashOutput KillShell CronCreate CronDelete CronList "
+    "Skill Workflow EnterWorktree ExitWorktree RemoteTrigger "
+    "PushNotification ScheduleWakeup EnterPlanMode ExitPlanMode",
+)
+REQUEST_MCP_CONFIG = os.environ.get(
+    "EMPLOYEE_REQUEST_MCP_CONFIG",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "employee_requests.mcp.json"),
+)
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_TRANSCRIBE_MODEL = os.environ.get("GROQ_TRANSCRIBE_MODEL", "whisper-large-v3-turbo")
 TELEGRAM_MAX_MSG = 4000
@@ -131,8 +148,13 @@ async def _ask(update: Update, ctx: ContextTypes.DEFAULT_TYPE, prompt: str) -> N
             prompt,
             workdir=WORKDIR,
             session_file=_session_file(uid),
-            allowed_tools=ALLOWED_TOOLS,
+            disallowed_tools=EMPLOYEE_DENY_TOOLS,
             strict_mcp=True,
+            mcp_config=REQUEST_MCP_CONFIG,
+            env={
+                "NS_REQUESTER_ID": str(uid),
+                "NS_REQUESTER_NAME": employee_notify.who(uid),
+            },
             lock=lock,
         )
     except PedroError as e:
