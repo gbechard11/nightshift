@@ -29,8 +29,10 @@ separate from nightshift.service.
 """
 import asyncio
 import logging
+import json
 import os
 import secrets
+import time
 
 import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -58,6 +60,10 @@ EMPLOYEE_USERS = {
 # employee sessions live in their own namespace away from the owner's.
 WORKDIR = os.environ.get("EMPLOYEE_WORKDIR", "/data/employees")
 SESSION_DIR = os.environ.get("EMPLOYEE_SESSION_DIR", "/data/employees/sessions")
+CONNECT_CODES = os.environ.get(
+    "EMPLOYEE_CONNECT_CODES", "/data/employees/mcp-connect-codes.json"
+)
+CONNECT_TTL = 600  # seconds a /connect code stays valid
 # The security boundary: an ALLOWLIST of the only tools that exist for the run.
 # Web research only — no shell/file/sub-agent/cron/MCP, so .env and tokens are
 # unreachable. (A denylist is unsafe here; see module docstring.) Paired with
@@ -150,6 +156,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/pause <campaign_id> - stop a campaign's spend\n"
         "/report [id]   - last-7-day ad insights\n"
         "/setupemail    - set up YOUR email so reports send from you\n"
+        "/connect       - link this bot to your Claude app\n"
         "/new           - clear my memory of our conversation\n"
         "/whoami        - your Telegram user ID\n\n"
         "Drive (read everything, create new only - cannot edit or delete existing):\n  /files [folderId]  (no arg = shared folders)\n  /find <name>\n  /get <fileId>\n  /mkdir <name> | <parentId>\n  attach a file captioned: /upload <folderId>\n  /replace <fileId> overwrites it (write access required)\n\nVoice notes work too. Campaigns are always drafted PAUSED; only the "
@@ -630,6 +637,52 @@ async def cmd_cancelemail(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text("Email setup cancelled.")
 
 
+def _mint_connect_code(uid: int) -> str:
+    """Write a short-lived one-time code the MCP server trades for this uid.
+
+    Format matches employee_mcp._consume_connect_code: {code: {uid, exp}}.
+    Prunes expired codes and any prior code for the same uid so a fresh
+    /connect always supersedes an older unused one.
+    """
+    now = int(time.time())
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    try:
+        with open(CONNECT_CODES, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError):
+        data = {}
+    data = {
+        k: v
+        for k, v in data.items()
+        if int(v.get("exp", 0)) >= now and int(v.get("uid", 0)) != uid
+    }
+    data[code] = {"uid": uid, "exp": now + CONNECT_TTL}
+    os.makedirs(os.path.dirname(CONNECT_CODES), exist_ok=True)
+    tmp = CONNECT_CODES + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh)
+    os.replace(tmp, CONNECT_CODES)
+    try:
+        os.chmod(CONNECT_CODES, 0o600)
+    except OSError:
+        pass
+    return code
+
+
+async def cmd_connect(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Give the employee a one-time code to link this bot to their Claude app."""
+    if not authorized(update):
+        return
+    code = await asyncio.to_thread(_mint_connect_code, update.effective_user.id)
+    await update.message.reply_text(
+        "*Connect to your Claude app*\n\n"
+        f"Your one-time code is:  `{code}`\n\n"
+        "In the Claude app, add the Nightshift Team Bot connector, sign in, "
+        "and paste this code when asked. It expires in 10 minutes and works once.",
+        parse_mode="Markdown",
+    )
+
+
 async def _email_setup_step(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     uid = update.effective_user.id
     st = EMAIL_SETUP.get(uid)
@@ -765,6 +818,7 @@ def main() -> None:
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("setupemail", cmd_setupemail))
     app.add_handler(CommandHandler("cancelemail", cmd_cancelemail))
+    app.add_handler(CommandHandler("connect", cmd_connect))
     app.add_handler(CommandHandler("research", cmd_research))
     app.add_handler(CommandHandler("draft", cmd_draft))
     app.add_handler(CommandHandler("media", cmd_media))
