@@ -37,6 +37,7 @@ from mcp.server.auth.provider import (
     construct_redirect_uri,
 )
 from mcp.server.auth.middleware.auth_context import get_access_token
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
 from starlette.requests import Request
@@ -215,6 +216,20 @@ class NSProvider(OAuthAuthorizationServerProvider):
 # --------------------------------------------------------------------------- #
 # FastMCP app
 # --------------------------------------------------------------------------- #
+# DNS-rebinding protection trusts only loopback by default, which 421s the
+# public Funnel host. Allow the Funnel host (derived from PUBLIC_URL) plus
+# loopback so both the live connector and local tests pass. Claude connects
+# server-side (no Origin header), so Origin validation passes when absent.
+from urllib.parse import urlparse as _urlparse
+
+_pub = _urlparse(PUBLIC_URL)
+_ALLOWED_HOSTS = list(dict.fromkeys(filter(None, [
+    _pub.netloc, _pub.hostname, f"{HOST}:{PORT}", "127.0.0.1:8780", "localhost:8780",
+])))
+_ALLOWED_ORIGINS = list(dict.fromkeys(filter(None, [
+    PUBLIC_URL, f"{_pub.scheme}://{_pub.hostname}" if _pub.hostname else None,
+])))
+
 mcp = FastMCP(
     name="Nightshift Team Bot",
     instructions="Browse/search/read Greg's Google Drive, create new folders/files, "
@@ -232,6 +247,11 @@ mcp = FastMCP(
     host=HOST,
     port=PORT,
     streamable_http_path="/mcp",
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=_ALLOWED_HOSTS,
+        allowed_origins=_ALLOWED_ORIGINS,
+    ),
 )
 
 
