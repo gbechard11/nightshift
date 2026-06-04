@@ -1,0 +1,31 @@
+[Unit]
+Description=Nightshift Team Bot MCP server (Claude-app connector, OAuth 2.1)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=gregnightshift
+WorkingDirectory=/home/gregnightshift/nightshift
+EnvironmentFile=/home/gregnightshift/nightshift/.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+# Binds 127.0.0.1:8780 by default (MCP_PUBLIC_URL unset = loopback). It stays
+# private until the Funnel route is opened; do NOT add a public bind here.
+ExecStart=/home/gregnightshift/nightshift/.venv/bin/python /home/gregnightshift/nightshift/employee_mcp.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/data/employees /home/gregnightshift/.claude
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

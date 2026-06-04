@@ -34,7 +34,14 @@ if echo "$CHANGED" | grep -q '^nightshift-employees.service$'; then
     sudo systemctl daemon-reload
 fi
 
+# If mcp unit file changed, reinstall + daemon-reload
+if echo "$CHANGED" | grep -q '^nightshift-mcp.service$'; then
+    sudo cp nightshift-mcp.service /etc/systemd/system/nightshift-mcp.service
+    sudo systemctl daemon-reload
+fi
+
 sudo systemctl restart nightshift
 sudo systemctl restart nightshift-employees 2>/dev/null || true
+sudo systemctl restart nightshift-mcp 2>/dev/null || true
 
 logger -t nightshift-update "Deployed $LOCAL -> $REMOTE. Changed: $(echo "$CHANGED" | tr '\n' ' ')"
