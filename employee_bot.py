@@ -48,6 +48,7 @@ from telegram.ext import (
 
 import mailer
 import meta_ads
+import employee_notify
 import employee_drive
 import employee_email
 from pedro_brain import PedroError, run_claude
@@ -490,6 +491,11 @@ async def on_campaign_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         f"${draft['daily_cad']:.2f} CAD/day.\n"
         f"Pause anytime with /pause {draft['campaign_id']}."
     )
+    asyncio.create_task(asyncio.to_thread(
+        employee_notify.notify_owner,
+        f"\U0001F680 {employee_notify.who(update.effective_user.id)} launched Meta campaign "
+        f"{draft['campaign_id']} - spending up to ${draft['daily_cad']:.2f} CAD/day.",
+    ))
 
 
 async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -783,6 +789,10 @@ async def _email_setup_step(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text
             f"\u2705 Done! Check {st['email']} for the test email. "
             "Your reports will now send from your own address.",
         )
+        asyncio.create_task(asyncio.to_thread(
+            employee_notify.notify_owner,
+            f"\U0001F4E7 {employee_notify.who(uid)} set up a sending email: {st['email']}",
+        ))
         return
 
 
