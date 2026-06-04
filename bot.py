@@ -28,6 +28,7 @@ import vapi_call
 import whatsapp
 import wire
 from pedro_brain import PedroError, run_claude
+from imap_email import get_unread_emails
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED_USERS = {
@@ -1040,6 +1041,28 @@ async def _post_init(application: Application) -> None:
     )
 
 
+async def cmd_sebamail(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not authorized(update):
+        await update.message.reply_text("Not authorized.")
+        return
+    await ctx.bot.send_chat_action(update.message.chat_id, ChatAction.TYPING)
+    try:
+        emails = await asyncio.to_thread(get_unread_emails, 24)
+    except Exception as e:  # noqa: BLE001
+        await update.message.reply_text(f"Seba inbox check failed: {e}")
+        return
+    if not emails:
+        await update.message.reply_text("\U0001F4EC No unread emails in Seba inbox (last 24h).")
+        return
+    lines = [f"\U0001F4EC Seba inbox — {len(emails)} unread (last 24h):", ""]
+    for e in emails:
+        lines.append(f"From: {e['from']}\nSubject: {e['subject']}\nPreview: {e['body'][:150]}")
+        lines.append("—")
+    text = "\n".join(lines)
+    for i in range(0, len(text), TELEGRAM_MAX_MSG):
+        await update.message.reply_text(text[i:i + TELEGRAM_MAX_MSG])
+
+
 async def _post_shutdown(application: Application) -> None:
     runner = application.bot_data.get("_wh_runner")
     if runner is not None:
@@ -1070,6 +1093,7 @@ def main() -> None:
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
+    app.add_handler(CommandHandler("sebamail", cmd_sebamail))
     app.add_handler(CallbackQueryHandler(on_call_button, pattern=r"^call:"))
     app.add_handler(CallbackQueryHandler(on_campaign_button, pattern=r"^camp:"))
     app.add_handler(CallbackQueryHandler(on_wire_button, pattern=r"^wire:"))
