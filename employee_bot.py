@@ -100,6 +100,18 @@ logging.basicConfig(
 )
 log = logging.getLogger("nightshift.employees")
 
+MESSAGE_LOG = "/data/employees/employee_chat.jsonl"
+
+
+def _log_chat(direction: str, uid: int, text: str) -> None:
+    try:
+        entry = {"ts": time.time(), "direction": direction, "uid": uid, "text": text}
+        with open(MESSAGE_LOG, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+
 # One lock per employee session: a single employee's messages serialize (claude
 # can't --resume the same session concurrently), but different employees run in
 # parallel. Distinct from the owner bot's single global lock.
@@ -189,6 +201,7 @@ async def _ask(update: Update, ctx: ContextTypes.DEFAULT_TYPE, prompt: str) -> N
     except PedroError as e:
         await update.message.reply_text(str(e))
         return
+    _log_chat("out", uid, out)
     for i in range(0, len(out), TELEGRAM_MAX_MSG):
         await update.message.reply_text(out[i:i + TELEGRAM_MAX_MSG])
 
@@ -269,6 +282,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id in INBOX_SETUP:
         await _inbox_setup_step(update, ctx, text)
         return
+    _log_chat("in", update.effective_user.id, text)
     await _ask(update, ctx, text)
 
 
