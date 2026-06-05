@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for Pedro instant-deploy sentinel (/data/greg/.deploy-now)
+
+[Path]
+PathExists=/data/greg/.deploy-now
+Unit=nightshift-deploy.service
+
+[Install]
+WantedBy=multi-user.target

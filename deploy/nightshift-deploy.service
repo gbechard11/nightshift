@@ -1,0 +1,7 @@
+[Unit]
+Description=Pedro instant deploy: restart bots to load on-disk code changes
+Documentation=file:/data/greg/CLAUDE.md
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/nightshift-deploy.sh
