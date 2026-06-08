@@ -284,5 +284,40 @@ def drive_create_text_file(name: str, content: str, parent_id: str = "") -> str:
     return "Created new file:\n%s" % out
 
 
+@mcp.tool()
+def draft_blast(city: str, subject: str, html: str, image_drive_ids: str = "") -> str:
+    """Prepare a marketing EMAIL BLAST to a city segment and QUEUE it for Greg's
+    approval. Use this whenever an employee asks you to create or send an email
+    blast / eblast to customers (e.g. "blast Edmonton about DJ Mina this weekend").
+
+    YOU write the full HTML email body and pass it as `html` -- follow the
+    Nightshift style: a bold headline, a short hype intro that greets {first}, the
+    event details, and a clear GET TICKETS button linking to the ticket URL.
+    Reference each image as src="cid:NAME".
+
+    Args:
+      city: segment to target, e.g. "Edmonton" (matches the contact list's City).
+      subject: subject line (you may personalize with {first}).
+      html: the complete HTML email body you wrote.
+      image_drive_ids: OPTIONAL comma-separated NAME=DRIVE_FILE_ID pairs for images
+        referenced as cid:NAME (e.g. "hero=1F332...,ev1=1Ygh..."). Each is uploaded
+        to S3 and the cid:NAME link is swapped for the hosted URL.
+
+    Does NOT send to the list -- it uploads images, renders the email, QUEUES it,
+    emails Greg a PREVIEW, and pings him to approve. Only Greg fires the real send."""
+    rid = _uid()
+    if not rid:
+        return "I couldn't identify who's asking, so I can't draft that."
+    name = os.environ.get("NS_REQUESTER_NAME") or employee_notify.who(rid)
+    try:
+        import blast_compose
+        return blast_compose.draft(rid=rid, requester=name, city=city,
+                                   subject=subject, html=html,
+                                   image_drive_ids=image_drive_ids,
+                                   gdrive=_gdrive, dl_dir=DL_DIR)
+    except Exception as e:
+        return "Couldn't draft the blast: %s" % e
+
+
 if __name__ == "__main__":
     mcp.run()
