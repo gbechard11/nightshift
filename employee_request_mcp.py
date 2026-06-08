@@ -37,6 +37,7 @@ except FileNotFoundError:
 sys.path.insert(0, HERE)
 
 import employee_email  # noqa: E402
+import imap_email  # noqa: E402
 import employee_notify  # noqa: E402
 import employee_notes  # noqa: E402
 import employee_requests  # noqa: E402
@@ -141,6 +142,48 @@ def email_send(to: str, subject: str, body: str, attach_file_ids: str = "") -> s
             shutil.rmtree(w, ignore_errors=True)
     extra = (" with %d attachment(s)" % len(paths)) if paths else ""
     return "Sent '%s'%s from %s to %s." % (subject, extra, sender.get("from"), ", ".join(recipients))
+
+
+@mcp.tool()
+def email_unread(since_hours: int = 24) -> str:
+    """Scan the employee's OWN inbox and summarize UNREAD mail from the last
+    since_hours hours (default 24, max 168). Read-only: uses BODY.PEEK so nothing
+    is marked read. Use this whenever the employee asks you to check, scan, read,
+    or go through their email. If their inbox isn't connected, returns guidance to
+    run /setupinbox."""
+    rid = _uid()
+    if not rid:
+        return "I couldn't identify who's asking. Ask them to run /setupinbox in this bot."
+    creds = employee_email.inbox_for(int(rid))
+    if not creds:
+        # Seba's mailbox lives in the SEBA_* env block, not employee-inboxes.json.
+        sc = imap_email.seba_creds()
+        sender = employee_email.sender_for(int(rid)) or {}
+        from_addr = (sender.get('from') or '').lower()
+        if sc.get('email') and sc.get('password') and sc['email'].lower() == from_addr:
+            creds = sc
+    if not creds:
+        return (
+            "Your inbox isn't connected yet. Run /setupinbox here in the Telegram "
+            "bot (~1 min, it auto-detects your GreenGeeks server) and then I can "
+            "scan your unread mail."
+        )
+    try:
+        hrs = max(1, min(int(since_hours), 168))
+    except (TypeError, ValueError):
+        hrs = 24
+    try:
+        emails = imap_email.get_unread_emails(creds, hrs)
+    except Exception as e:  # noqa: BLE001
+        return "Couldn't read your inbox: %s" % e
+    if not emails:
+        return "No unread mail in the last %dh." % hrs
+    lines = ["%d unread in the last %dh:" % (len(emails), hrs), ""]
+    for e in emails:
+        lines.append("From: %s\nSubject: %s\nPreview: %s" % (
+            e.get('from', ''), e.get('subject', ''), (e.get('body') or '')[:200]))
+        lines.append("--")
+    return "\n".join(lines)
 
 
 @mcp.tool()
