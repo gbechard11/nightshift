@@ -21,8 +21,10 @@ import smtplib
 import ssl
 import sys
 import time
+from email.generator import BytesGenerator
 from email.message import EmailMessage
 from email.utils import make_msgid
+from io import BytesIO
 from pathlib import Path
 
 
@@ -41,6 +43,18 @@ def _load_env(path: str) -> None:
 def _die(msg: str, **extra) -> None:
     print(json.dumps({"ok": False, "error": msg, **extra}), file=sys.stderr)
     sys.exit(1)
+
+
+def _append_sent(msg: EmailMessage, host: str, port: int, user: str, password: str,
+                 folder: str) -> None:
+    """APPEND a copy of msg to the given IMAP Sent folder. Raises on failure."""
+    with imaplib.IMAP4_SSL(host, port) as imap:
+        imap.login(user, password)
+        buf = BytesIO()
+        BytesGenerator(buf, mangle_from_=False).flatten(msg)
+        raw = buf.getvalue().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+        box = '"%s"' % folder if " " in folder else folder
+        imap.append(box, "\\Seen", imaplib.Time2Internaldate(time.time()), raw)
 
 
 def main() -> None:
@@ -131,40 +145,49 @@ def main() -> None:
     except Exception as e:
         _die(f"SMTP send failed: {type(e).__name__}: {e}")
 
-    # Save a copy to the Sent folder so it shows up in Outlook/webmail.
-    # CRITICAL: this MUST use the SMTP account's own credentials (greg@nightshiftent.ca
-    # on the GreenGeeks/cPanel server). The generic IMAP_* env keys point at a
-    # DIFFERENT mailbox (Greg's personal Gmail) and are used by the inbox-reading
-    # scripts — appending the Sent copy there would put it in the wrong account
-    # (which is the bug this code originally had). Defaults derive from SMTP creds;
-    # override only via the dedicated SENT_IMAP_* / SENT_FOLDER keys if ever needed.
-    save_host = os.environ.get("SENT_IMAP_HOST") or smtp_host
-    save_port = int(os.environ.get("SENT_IMAP_PORT", "993"))
-    save_user = os.environ.get("SENT_IMAP_USER") or smtp_user
-    save_pass = os.environ.get("SENT_IMAP_PASS") or smtp_pass
-    sent_folder = os.environ.get("SENT_FOLDER", "INBOX.Sent")
-    if save_user and save_pass:
-        try:
-            with imaplib.IMAP4_SSL(save_host, save_port) as imap:
-                imap.login(save_user, save_pass)
-                from io import BytesIO
-                from email.generator import BytesGenerator
-                buf = BytesIO()
-                BytesGenerator(buf, mangle_from_=False).flatten(msg)
-                raw = buf.getvalue().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
-                folder = '"%s"' % sent_folder if " " in sent_folder else sent_folder
-                imap.append(
-                    folder,
-                    "\\Seen",
-                    imaplib.Time2Internaldate(time.time()),
-                    raw,
-                )
-        except Exception as e:
-            # Non-fatal — email was sent, just couldn't save to Sent folder
-            print(json.dumps({"ok": True, "to": args.to, "subject": args.subject, "sent_folder_warning": str(e)}))
-            return
+    # Save a copy to the Sent folder(s) so it shows up wherever Greg reads mail.
+    # Greg chose BOTH: the nightshiftent.ca cPanel mailbox (so it shows in Outlook)
+    # AND the personal Gmail that POP3-aggregates his mail (so it shows there too).
+    # Each append is best-effort — the mail is already sent, so a Sent-copy failure
+    # is reported as a warning, never a hard failure.
+    warnings: dict[str, str] = {}
 
-    print(json.dumps({"ok": True, "to": args.to, "subject": args.subject}))
+    # 1) The sending mailbox's own Sent — greg@nightshiftent.ca -> INBOX.Sent
+    #    (cPanel/GreenGeeks). Uses the SMTP account's own creds by default.
+    n_user = os.environ.get("SENT_IMAP_USER") or smtp_user
+    n_pass = os.environ.get("SENT_IMAP_PASS") or smtp_pass
+    if n_user and n_pass:
+        try:
+            _append_sent(
+                msg,
+                os.environ.get("SENT_IMAP_HOST") or smtp_host,
+                int(os.environ.get("SENT_IMAP_PORT", "993")),
+                n_user, n_pass,
+                os.environ.get("SENT_FOLDER", "INBOX.Sent"),
+            )
+        except Exception as e:  # noqa: BLE001
+            warnings["nightshiftent_sent"] = f"{type(e).__name__}: {e}"
+
+    # 2) The personal Gmail Sent (IMAP_* creds: gbechard11@gmail.com) so the copy
+    #    also appears in Greg's Gmail-aggregated view, not just Outlook.
+    g_user = os.environ.get("IMAP_USER")
+    g_pass = os.environ.get("IMAP_PASS")
+    if g_user and g_pass:
+        try:
+            _append_sent(
+                msg,
+                os.environ.get("IMAP_HOST", "imap.gmail.com"),
+                int(os.environ.get("IMAP_PORT", "993")),
+                g_user, g_pass,
+                os.environ.get("GMAIL_SENT_FOLDER", "[Gmail]/Sent Mail"),
+            )
+        except Exception as e:  # noqa: BLE001
+            warnings["gmail_sent"] = f"{type(e).__name__}: {e}"
+
+    out = {"ok": True, "to": args.to, "subject": args.subject}
+    if warnings:
+        out["sent_folder_warning"] = warnings
+    print(json.dumps(out))
 
 
 if __name__ == "__main__":
