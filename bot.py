@@ -1044,13 +1044,22 @@ async def _post_init(application: Application) -> None:
     )
 
 
+SEBA_UID = 8722742818  # Seba's employee-bot Telegram id
+
+
 async def cmd_sebamail(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorized(update):
         await update.message.reply_text("Not authorized.")
         return
+    creds = employee_email.inbox_for(SEBA_UID)
+    if not creds:
+        await update.message.reply_text(
+            "Seba hasn't connected his inbox yet - have him run /setupinbox in the Team Bot."
+        )
+        return
     await ctx.bot.send_chat_action(update.message.chat_id, ChatAction.TYPING)
     try:
-        emails = await asyncio.to_thread(get_unread_emails, imap_email.seba_creds(), 24)
+        emails = await asyncio.to_thread(get_unread_emails, creds, 24)
     except Exception as e:  # noqa: BLE001
         await update.message.reply_text(f"Seba inbox check failed: {e}")
         return

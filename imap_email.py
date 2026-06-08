@@ -10,21 +10,8 @@ import os
 # Generalized mailbox helpers: every function takes an explicit `creds` dict so
 # the SAME code serves any employee's mailbox. creds keys: imap_host, imap_port,
 # smtp_host, smtp_port, email, password (smtp_* only needed by send_reply).
-# Seba's mailbox comes from the SEBA_* env block via seba_creds(); other
-# employees self-enroll their IMAP creds through the Team Bot (/setupinbox),
-# stored per-uid by employee_email.
-
-
-def seba_creds():
-    """Seba's mailbox creds from the SEBA_* env block (GreenGeeks cPanel mail)."""
-    return {
-        "imap_host": os.getenv("SEBA_IMAP_HOST"),
-        "imap_port": int(os.getenv("SEBA_IMAP_PORT", 993)),
-        "smtp_host": os.getenv("SEBA_SMTP_HOST"),
-        "smtp_port": int(os.getenv("SEBA_SMTP_PORT", 465)),
-        "email": os.getenv("SEBA_EMAIL"),
-        "password": os.getenv("SEBA_EMAIL_PASSWORD"),
-    }
+# Employees self-enroll their IMAP creds through the Team Bot (/setupinbox),
+# stored per-uid by employee_email (employee-inboxes.json).
 
 
 def _decode(value):

@@ -156,13 +156,6 @@ def email_unread(since_hours: int = 24) -> str:
         return "I couldn't identify who's asking. Ask them to run /setupinbox in this bot."
     creds = employee_email.inbox_for(int(rid))
     if not creds:
-        # Seba's mailbox lives in the SEBA_* env block, not employee-inboxes.json.
-        sc = imap_email.seba_creds()
-        sender = employee_email.sender_for(int(rid)) or {}
-        from_addr = (sender.get('from') or '').lower()
-        if sc.get('email') and sc.get('password') and sc['email'].lower() == from_addr:
-            creds = sc
-    if not creds:
         return (
             "Your inbox isn't connected yet. Run /setupinbox here in the Telegram "
             "bot (~1 min, it auto-detects your GreenGeeks server) and then I can "
