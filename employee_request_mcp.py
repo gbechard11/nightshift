@@ -42,6 +42,7 @@ import employee_notify  # noqa: E402
 import employee_notes  # noqa: E402
 import employee_requests  # noqa: E402
 import mailer  # noqa: E402
+import pending_email  # noqa: E402
 from mcp.server.fastmcp import FastMCP  # noqa: E402
 
 mcp = FastMCP("nsrequests")
@@ -134,14 +135,22 @@ def email_send(to: str, subject: str, body: str, attach_file_ids: str = "") -> s
             final = os.path.join(work, os.path.basename(real))
             os.rename(raw, final)
             paths.append(final)
-        mailer.send(subject, body, recipients, sender, attachments=paths)
+        token = pending_email.stage(int(rid), sender.get("from"), recipients, [],
+                                    subject, body, attachments=paths)
     except Exception as e:
-        return "Couldn't send the email: %s" % e
+        return "Couldn't prepare the email: %s" % e
     finally:
         for w in workdirs:
             shutil.rmtree(w, ignore_errors=True)
+    ok = pending_email.send_confirm_prompt(pending_email.load(token))
+    if not ok:
+        pending_email.discard(token)
+        return ("I prepared the email but couldn't reach you on Telegram to confirm it. "
+                "Open the NS Team Bot in Telegram (send /start) and try again.")
     extra = (" with %d attachment(s)" % len(paths)) if paths else ""
-    return "Sent '%s'%s from %s to %s." % (subject, extra, sender.get("from"), ", ".join(recipients))
+    return ("Staged for your confirmation%s -- NOT sent. I've sent the exact draft to your "
+            "Telegram with a Send / Cancel button; tap Send there to send it. Nothing goes "
+            "out until you tap Send. Do not tell the user it was already sent." % extra)
 
 
 @mcp.tool()

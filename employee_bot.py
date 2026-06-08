@@ -54,6 +54,8 @@ import employee_drive
 import employee_email
 import employee_notes
 import imap_email
+import mailer
+import pending_email
 from pedro_brain import PedroError, run_claude
 
 TOKEN = os.environ["EMPLOYEE_BOT_TOKEN"]
@@ -268,6 +270,73 @@ async def cmd_whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"User ID: {u.id}\nUsername: @{u.username}\nName: {u.full_name}"
     )
+
+
+async def on_email_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Employee taps Send/Cancel on a staged email. The actual send happens ONLY
+    here, on an explicit human tap -- the chat agent can stage a draft but can never
+    send it. This gate stops a misread instruction (an ambiguous 'push it') from
+    ever putting real mail in someone's outbox."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:  # noqa: BLE001
+        pass
+    if not authorized(update):
+        return
+    try:
+        _, action, token = query.data.split(":", 2)
+    except ValueError:
+        return
+    rec = pending_email.load(token)
+    if not rec:
+        try:
+            await query.edit_message_text("This draft expired or was already handled.")
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    if int(rec.get("uid", 0)) != update.effective_user.id:
+        return  # only the person who staged it may confirm their own send
+    if action == "cancel":
+        pending_email.discard(token)
+        try:
+            await query.edit_message_text("\u274C Cancelled \u2014 nothing was sent.")
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    sender = employee_email.sender_for(rec["uid"])
+    if not sender:
+        pending_email.discard(token)
+        try:
+            await query.edit_message_text("\u26A0\uFE0F Your sending address isn't set up. Run /setupemail.")
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    to_list = rec.get("to") or []
+    try:
+        await asyncio.to_thread(
+            mailer.send, rec.get("subject", ""), rec.get("body", ""),
+            to_list, sender, rec.get("attachments") or None,
+        )
+    except Exception as e:  # noqa: BLE001
+        try:
+            await query.edit_message_text(f"\u26A0\uFE0F Send failed: {e}")
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    pending_email.discard(token)
+    to_str = ", ".join(to_list) if isinstance(to_list, list) else str(to_list)
+    try:
+        await query.edit_message_text(f"\u2705 Sent to {to_str}.")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        employee_notify.notify_owner(
+            f"\U0001F4E7 {employee_notify.who(rec['uid'])} sent an email to {to_str} "
+            f"(subj: {rec.get('subject','')[:80]})."
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1032,6 +1101,7 @@ def main() -> None:
     app.add_handler(CommandHandler("mkdir", employee_drive.cmd_mkdir))
     app.add_handler(CommandHandler("request", cmd_request))
     app.add_handler(CallbackQueryHandler(on_campaign_button, pattern=r"^camp:"))
+    app.add_handler(CallbackQueryHandler(on_email_confirm, pattern=r"^emailsend:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))

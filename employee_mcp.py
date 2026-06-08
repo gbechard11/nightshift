@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 
 import mailer
 import employee_email
+import pending_email
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
@@ -412,8 +413,15 @@ async def email_send(to: str, subject: str, body: str) -> str:
     recipients = [r.strip() for r in to.replace(";", ",").split(",") if r.strip()]
     if not recipients:
         raise ValueError("No recipient address given.")
-    await asyncio.to_thread(mailer.send, subject, body, recipients, sender)
-    return f"Sent '{subject}' from {sender.get('from')} to {', '.join(recipients)}."
+    token = pending_email.stage(uid, sender.get("from"), recipients, [], subject, body)
+    ok = await asyncio.to_thread(pending_email.send_confirm_prompt, pending_email.load(token))
+    if not ok:
+        pending_email.discard(token)
+        return ("I prepared the email but couldn't reach you on Telegram to confirm it. "
+                "Open the NS Team Bot in Telegram (send /start) and try again.")
+    return ("Staged for your confirmation -- NOT sent. I've sent the exact draft to your "
+            "Telegram (NS Team Bot) with a Send / Cancel button. Tap Send there to send it; "
+            "nothing goes out until you do. Do not tell the user it was already sent.")
 
 
 # --------------------------------------------------------------------------- #
