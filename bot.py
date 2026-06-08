@@ -1106,6 +1106,19 @@ async def cmd_andrewmail(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(text[i:i + TELEGRAM_MAX_MSG])
 
 
+APPROVED_IMPL_PROMPT = (
+    "An employee feature request was just APPROVED by Greg. You have full tools "
+    "and self-deploy — actually implement it, don't punt it back.\n\n"
+    "Request from {name}:\n{text}\n\n"
+    "Diagnose first (read the relevant code/state), then make the change. "
+    "CONFIRM-FIRST before anything reaches production: show Greg a concise summary "
+    "of exactly what you changed (files + what/why) and WAIT for his explicit 'yes' "
+    "in chat before you git commit / push / touch the deploy trigger. If it's only a "
+    "read-only diagnosis, or you can't finish within your run limit, say precisely "
+    "what's done, what's blocking, and the next step. Keep it tight."
+)
+
+
 async def on_request_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Owner taps Approve/Reject on an employee feature request."""
     query = update.callback_query
@@ -1139,8 +1152,15 @@ async def on_request_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     name = rec.get("requester_name", "employee")
     text = rec.get("text", "")
     if status == "approved":
-        owner_msg = f"✅ Approved {name}'s request. They've been notified."
-        emp_msg = f"✅ Greg approved your request:\n\n{text}\n\nHe'll get it built."
+        owner_msg = (
+            f"✅ Approved {name}'s request — handing it to Pedro to implement now. "
+            "I'll report back here with what changed and wait for your OK before "
+            "anything deploys to production."
+        )
+        emp_msg = (
+            f"✅ Greg approved your request:\n\n{text}\n\n"
+            "It's being implemented now — I'll let you know once it's live."
+        )
     else:
         owner_msg = f"❌ Rejected {name}'s request. They've been notified."
         emp_msg = f"❌ Greg declined your request:\n\n{text}"
@@ -1149,6 +1169,21 @@ async def on_request_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     except Exception:  # noqa: BLE001
         pass
     employee_requests.notify_employee(rec["requester_id"], emp_msg)
+
+    # On approval, actually BUILD it: hand the request to the full owner brain
+    # (every tool + self-deploy). Confirm-first is baked into the prompt, so
+    # nothing reaches production without Greg's explicit yes in chat.
+    if status == "approved":
+        chat_id = query.message.chat_id if query.message else rec["requester_id"]
+        try:
+            reply = await run_pedro(APPROVED_IMPL_PROMPT.format(name=name, text=text))
+        except PedroError as e:
+            reply = f"⚠️ Couldn't auto-start the build for {name}'s request: {e}"
+        for _i in range(0, len(reply), TELEGRAM_MAX_MSG):
+            try:
+                await ctx.bot.send_message(chat_id, reply[_i:_i + TELEGRAM_MAX_MSG])
+            except Exception:  # noqa: BLE001
+                pass
 
 
 async def _post_shutdown(application: Application) -> None:
