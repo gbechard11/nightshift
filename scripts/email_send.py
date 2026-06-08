@@ -131,22 +131,30 @@ def main() -> None:
     except Exception as e:
         _die(f"SMTP send failed: {type(e).__name__}: {e}")
 
-    # Append to Gmail Sent Mail so it shows up in the sent folder
-    imap_host = os.environ.get("IMAP_HOST", "imap.gmail.com")
-    imap_port = int(os.environ.get("IMAP_PORT", "993"))
-    imap_user = os.environ.get("IMAP_USER")
-    imap_pass = os.environ.get("IMAP_PASS")
-    if imap_user and imap_pass:
+    # Save a copy to the Sent folder so it shows up in Outlook/webmail.
+    # CRITICAL: this MUST use the SMTP account's own credentials (greg@nightshiftent.ca
+    # on the GreenGeeks/cPanel server). The generic IMAP_* env keys point at a
+    # DIFFERENT mailbox (Greg's personal Gmail) and are used by the inbox-reading
+    # scripts — appending the Sent copy there would put it in the wrong account
+    # (which is the bug this code originally had). Defaults derive from SMTP creds;
+    # override only via the dedicated SENT_IMAP_* / SENT_FOLDER keys if ever needed.
+    save_host = os.environ.get("SENT_IMAP_HOST") or smtp_host
+    save_port = int(os.environ.get("SENT_IMAP_PORT", "993"))
+    save_user = os.environ.get("SENT_IMAP_USER") or smtp_user
+    save_pass = os.environ.get("SENT_IMAP_PASS") or smtp_pass
+    sent_folder = os.environ.get("SENT_FOLDER", "INBOX.Sent")
+    if save_user and save_pass:
         try:
-            with imaplib.IMAP4_SSL(imap_host, imap_port) as imap:
-                imap.login(imap_user, imap_pass)
+            with imaplib.IMAP4_SSL(save_host, save_port) as imap:
+                imap.login(save_user, save_pass)
                 from io import BytesIO
                 from email.generator import BytesGenerator
                 buf = BytesIO()
                 BytesGenerator(buf, mangle_from_=False).flatten(msg)
                 raw = buf.getvalue().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+                folder = '"%s"' % sent_folder if " " in sent_folder else sent_folder
                 imap.append(
-                    '"[Gmail]/Sent Mail"',
+                    folder,
                     "\\Seen",
                     imaplib.Time2Internaldate(time.time()),
                     raw,
