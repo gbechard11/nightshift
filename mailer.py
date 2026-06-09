@@ -18,6 +18,7 @@ shared with meta_ads so there's one source of truth.
 
 smtplib is blocking, so callers should invoke send() via asyncio.to_thread().
 """
+import html as _htmllib
 import imaplib
 import logging
 import mimetypes
@@ -29,6 +30,48 @@ import time
 from email.generator import BytesGenerator
 from email.message import EmailMessage
 from io import BytesIO
+
+_TAG_RE = re.compile(r"<[a-zA-Z!/][^>]*>")
+
+
+def _looks_like_html(s: str) -> bool:
+    """True if the string is really an HTML document/fragment (not plain text).
+
+    Used so a mailer passed as the email body is sent as a real HTML email instead
+    of going out as visible <table>/<div> source. Conservative: needs an obvious
+    HTML signature or several tags, so ordinary prose with a stray '<' is unaffected.
+    """
+    if not s:
+        return False
+    low = s.lower()
+    if ("<!doctype html" in low or "<html" in low or "</body>" in low
+            or "</table>" in low or "</div>" in low):
+        return True
+    return len(_TAG_RE.findall(s)) >= 4
+
+
+def _html_to_text(s: str) -> str:
+    """Best-effort plain-text fallback for an HTML body (no external deps).
+
+    Keeps link targets visible (label (url)), turns block tags into line breaks,
+    strips the rest, and unescapes entities. Good enough for the text/plain part of
+    a multipart/alternative — real clients render the HTML part."""
+    if not s:
+        return ""
+    t = re.sub(r"(?is)<\s*(script|style)\b.*?</\s*\1\s*>", "", s)
+    t = re.sub(r"(?i)<\s*br\s*/?>", "\n", t)
+    t = re.sub(r"(?i)</\s*(p|div|tr|h[1-6]|li|table)\s*>", "\n", t)
+    t = re.sub(
+        r'(?is)<a\b[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+        lambda m: "%s (%s)" % (re.sub(r"<[^>]+>", "", m.group(2)).strip(), m.group(1)),
+        t,
+    )
+    t = re.sub(r"(?s)<[^>]+>", "", t)
+    t = _htmllib.unescape(t)
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n[ \t]+", "\n", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
 
 log = logging.getLogger("nightshift.mailer")
 
@@ -131,8 +174,12 @@ def _save_to_sent(msg: EmailMessage, host: str, user: str, password: str,
 
 
 def send(subject: str, body: str, recipients: list[str], sender: dict | None = None,
-         attachments: list[str] | None = None) -> None:
-    """Send a plain-text email. Blocking - call via asyncio.to_thread() from async code.
+         attachments: list[str] | None = None, html: str | None = None) -> None:
+    """Send an email. Blocking - call via asyncio.to_thread() from async code.
+
+    If `html` is given (or `body` is itself HTML), the message is sent as a proper
+    multipart/alternative with a plain-text fallback, so recipients see a rendered
+    email -- never raw <table>/<div> source.
 
     If `sender` is given (an employee's own SMTP identity) it overrides the shared env
     config, so each employee sends from their own address. Raises MailError on
@@ -155,7 +202,20 @@ def send(subject: str, body: str, recipients: list[str], sender: dict | None = N
     msg["Subject"] = subject
     msg["From"] = from_addr
     msg["To"] = ", ".join(recipients)
-    msg.set_content(body)
+
+    # Decide plain vs HTML. Explicit html= wins; otherwise auto-detect an HTML body
+    # (the common case: an agent-built mailer handed in as `body`). Either way the
+    # recipient gets a rendered email, never visible source code.
+    html_body = html
+    text_body = body
+    if html_body is None and _looks_like_html(body):
+        html_body = body
+        text_body = _html_to_text(body)
+    if html_body:
+        msg.set_content(text_body or _html_to_text(html_body) or " ")
+        msg.add_alternative(html_body, subtype="html")
+    else:
+        msg.set_content(body)
     for _path in (attachments or []):
         with open(_path, "rb") as _fh:
             _data = _fh.read()
