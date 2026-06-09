@@ -43,14 +43,20 @@ import employee_notes  # noqa: E402
 import employee_requests  # noqa: E402
 import mailer  # noqa: E402
 import pending_email  # noqa: E402
-from mcp.server.fastmcp import FastMCP  # noqa: E402
+from mcp.server.fastmcp import FastMCP, Image  # noqa: E402
 
 mcp = FastMCP("nsrequests")
 
 GDRIVE_BIN = os.path.join(HERE, "gdrive.py")
 DRIVE_TOKEN = os.environ.get("EMPLOYEE_GDRIVE_TOKEN", "/data/employees/token.json")
 DL_DIR = os.environ.get("EMPLOYEE_DL_DIR", "/data/employees/dl")
+# Where employee_bot saves images/screenshots dropped into the chat. view_attachment
+# is hard-scoped to this dir so the sandboxed agent can SEE what the employee sent
+# without gaining read access to anything else on disk.
+INBOX_DIR = os.environ.get("EMPLOYEE_INBOX_DIR", "/data/employees/inbox")
 _ALLOWED = {"list", "find", "download", "mkdir", "upload"}
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+_MAX_VIEW_BYTES = 12 * 1024 * 1024  # 12 MB ceiling, well above any Telegram photo
 
 
 def _uid() -> str:
@@ -326,6 +332,36 @@ def draft_blast(city: str, subject: str, html: str, image_drive_ids: str = "") -
                                    gdrive=_gdrive, dl_dir=DL_DIR)
     except Exception as e:
         return "Couldn't draft the blast: %s" % e
+
+
+@mcp.tool()
+def view_attachment(path: str) -> Image:
+    """Look at an image or screenshot the employee just sent you in the chat.
+
+    When an employee drops a photo/screenshot, the chat tells you the exact disk
+    `path` it was saved to. Pass that path here to actually SEE the image, then
+    respond — diagnose the problem they're showing you, read text off the screen,
+    describe what's in the picture, etc. This is how you look at images, exactly
+    like Greg's own assistant does. Only works on files the employee just sent
+    (the inbox dir); it cannot open anything else on disk.
+    """
+    real = os.path.realpath(path)
+    root = os.path.realpath(INBOX_DIR)
+    if real != root and not real.startswith(root + os.sep):
+        raise ValueError(
+            "I can only view an image the employee just sent me in this chat."
+        )
+    if not os.path.isfile(real):
+        raise ValueError("That image is no longer on disk — ask them to resend it.")
+    ext = os.path.splitext(real)[1].lower()
+    if ext not in _IMAGE_EXTS:
+        raise ValueError(
+            "That attachment isn't an image I can view (%s). I can only look at "
+            "photos/screenshots." % (ext or "no extension")
+        )
+    if os.path.getsize(real) > _MAX_VIEW_BYTES:
+        raise ValueError("That image is too large for me to open.")
+    return Image(path=real)
 
 
 if __name__ == "__main__":

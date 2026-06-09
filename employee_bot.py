@@ -31,9 +31,11 @@ import asyncio
 import logging
 import json
 import os
+import re
 import secrets
 import subprocess
 import time
+from datetime import datetime
 
 import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -67,6 +69,9 @@ EMPLOYEE_USERS = {
 # employee sessions live in their own namespace away from the owner's.
 WORKDIR = os.environ.get("EMPLOYEE_WORKDIR", "/data/employees")
 SESSION_DIR = os.environ.get("EMPLOYEE_SESSION_DIR", "/data/employees/sessions")
+# Where chat photos/screenshots land so the agent can view them via the
+# nsrequests `view_attachment` MCP tool (which is hard-scoped to this dir).
+INBOX_DIR = os.environ.get("EMPLOYEE_INBOX_DIR", "/data/employees/inbox")
 CONNECT_CODES = os.environ.get(
     "EMPLOYEE_CONNECT_CODES", "/data/employees/mcp-connect-codes.json"
 )
@@ -207,6 +212,45 @@ async def _ask(update: Update, ctx: ContextTypes.DEFAULT_TYPE, prompt: str) -> N
     _log_chat("out", uid, out)
     for i in range(0, len(out), TELEGRAM_MAX_MSG):
         await update.message.reply_text(out[i:i + TELEGRAM_MAX_MSG])
+
+
+async def _ingest_attachment(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Download a photo/image the employee sent and let the agent view it.
+
+    Saves the file under INBOX_DIR, then hands the agent the path so it can open
+    it with the `view_attachment` MCP tool — same as how Greg shows images to his
+    own assistant. Only images are routed here; PDFs/other docs go via /upload.
+    """
+    msg = update.message
+    file_id = None
+    filename = None
+    if msg.photo:
+        file_id = msg.photo[-1].file_id
+        filename = f"photo-{file_id}.jpg"
+    elif msg.document:
+        file_id = msg.document.file_id
+        filename = msg.document.file_name or f"{file_id}.bin"
+    if not file_id:
+        return
+
+    await ctx.bot.send_chat_action(msg.chat_id, ChatAction.TYPING)
+    os.makedirs(INBOX_DIR, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    safe_name = re.sub(r"[^\w.\-]", "_", filename)
+    path = os.path.join(INBOX_DIR, f"{stamp}-{safe_name}")
+    tg_file = await ctx.bot.get_file(file_id)
+    await tg_file.download_to_drive(path)
+    log.info("attachment from %s saved to %s", update.effective_user.id, path)
+
+    caption = (msg.caption or "").strip()
+    prompt = (
+        f"The employee just sent you an image in the chat. It is saved on disk at "
+        f"`{path}`. Use the `view_attachment` tool with that exact path to look at "
+        f"it, then respond helpfully."
+    )
+    if caption:
+        prompt += f' Their message with it: "{caption}".'
+    await _ask(update, ctx, prompt)
 
 
 async def cmd_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -661,7 +705,7 @@ async def on_campaign_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Route an uploaded file to Drive: caption /upload (create) or /replace (overwrite)."""
+    """Drive caption (/upload, /replace) saves to Drive; an image gets viewed; else help."""
     if not authorized(update):
         return
     caption = (update.message.caption or "").strip()
@@ -671,10 +715,21 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if caption.lower().startswith("/replace"):
         await employee_drive.handle_replace(update, ctx)
         return
+    # No Drive command — if it's an image sent as a file, look at it like a screenshot.
+    doc = update.message.document
+    mime = (doc.mime_type or "") if doc else ""
+    name = (doc.file_name or "") if doc else ""
+    is_image = mime.startswith("image/") or os.path.splitext(name)[1].lower() in (
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"
+    )
+    if is_image:
+        await _ingest_attachment(update, ctx)
+        return
     await update.message.reply_text(
-        "To save a file to Drive, attach it with a caption:\n"
+        "Got the file. If you want me to save it to Drive, resend it with a caption:\n"
         "/upload <folderId>   - add it as a NEW file\n"
-        "/replace <fileId>    - overwrite an existing file (write access required)"
+        "/replace <fileId>    - overwrite an existing file (write access required)\n"
+        "(Screenshots and photos I can just look at — no caption needed.)"
     )
 
 async def cmd_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1057,19 +1112,19 @@ async def _email_setup_step(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text
 
 
 async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Bot can't OCR images; guide the user to send the value as text."""
+    """Read the screenshot/image the employee sent and respond to it."""
     if not authorized(update):
         return
+    # Credential setup is a typed state machine — a screenshot of a password can't
+    # be entered into it, so keep asking for the typed value during setup.
     if update.effective_user.id in EMAIL_SETUP or update.effective_user.id in INBOX_SETUP:
         await update.message.reply_text(
-            "I can't read screenshots - please *type* the value as text "
-            "(the mail server, login username, or password).",
+            "For setup I need the value *typed* as text "
+            "(the mail server, login username, or password) — a screenshot won't work here.",
             parse_mode="Markdown",
         )
         return
-    await update.message.reply_text(
-        "I can't read images yet - please send the details as text."
-    )
+    await _ingest_attachment(update, ctx)
 
 
 async def on_blast_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
