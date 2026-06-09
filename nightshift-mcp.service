@@ -22,7 +22,10 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/data/employees /data/greg/blast_queue /home/gregnightshift/.claude
+# /data/greg/brain is writable so the OWNER (Greg) can append to his personal
+# brain via the connector's brain_* tools. The tool code gates writes there to
+# Greg's uid only; employees' brain tools resolve to /data/employees/brain.
+ReadWritePaths=/data/employees /data/greg/blast_queue /data/greg/brain /home/gregnightshift/.claude
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true

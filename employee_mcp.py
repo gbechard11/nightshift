@@ -22,6 +22,7 @@ import secrets
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 
 import mailer
 import employee_email
@@ -99,6 +100,24 @@ _USERS = {int(x) for x in os.environ.get("EMPLOYEE_USERS", "").split(",") if x.s
 # The only gdrive.py subcommands this server may run. No --file-id (overwrite),
 # no delete (gdrive.py has none). READ + CREATE only.
 _ALLOWED = {"list", "find", "download", "mkdir", "upload"}
+
+# --------------------------------------------------------------------------- #
+# Brain (assistant knowledge base) access.
+#   * Greg (OWNER_UID) reads/appends his REAL personal brain at /data/greg/brain.
+#   * Every other connected user reads/appends a SHARED TEAM brain at
+#     /data/employees/brain -- they never see or touch Greg's private brain.
+# Writes are APPEND-ONLY: a new dated entry is added (atomically, with an
+# automatic timestamped backup); existing notes are never edited or deleted.
+# This mirrors the create-only Drive model -- nothing already written can be
+# destroyed through this connector.
+# --------------------------------------------------------------------------- #
+OWNER_UID = int(
+    (os.environ.get("OWNER_UID")
+     or os.environ.get("ALLOWED_USERS", "").split(",")[0]
+     or "0").strip() or 0
+)
+GREG_BRAIN_DIR = os.environ.get("GREG_BRAIN_DIR", "/data/greg/brain")
+TEAM_BRAIN_DIR = os.environ.get("TEAM_BRAIN_DIR", "/data/employees/brain")
 
 
 # --------------------------------------------------------------------------- #
@@ -263,8 +282,10 @@ _ALLOWED_ORIGINS = list(dict.fromkeys(filter(None, [
 mcp = FastMCP(
     name="Nightshift Team Bot",
     instructions="Browse/search/read Greg's Google Drive, create new folders/files, "
-                 "and send email from your own Nightshift address. Cannot edit, "
-                 "overwrite, or delete anything that already exists.",
+                 "send email from your own Nightshift address, and read/append "
+                 "the team brain (shared knowledge base) with brain_list / "
+                 "brain_read / brain_append. Cannot edit, overwrite, or delete "
+                 "anything that already exists.",
     auth_server_provider=NSProvider(),
     auth=AuthSettings(
         issuer_url=PUBLIC_URL,
@@ -290,6 +311,77 @@ def _uid() -> int:
     if not at or at.subject is None:
         raise ValueError("Not authenticated.")
     return int(at.subject)
+
+
+# --------------------------------------------------------------------------- #
+# Brain helpers
+# --------------------------------------------------------------------------- #
+def _brain_root(uid: int) -> tuple[str, str, bool]:
+    """Return (root_dir, main_log_path, is_owner) for this caller's brain.
+    Greg gets his real personal brain; everyone else the shared team brain."""
+    if uid == OWNER_UID:
+        return GREG_BRAIN_DIR, os.path.join(GREG_BRAIN_DIR, "BRAIN.md"), True
+    return TEAM_BRAIN_DIR, os.path.join(TEAM_BRAIN_DIR, "TEAM_BRAIN.md"), False
+
+
+def _brain_resolve(root: str, name: str) -> str:
+    """Resolve a brain filename safely inside root (blocks path traversal)."""
+    name = (name or "").strip().lstrip("/").lstrip("\\")
+    cand = os.path.normpath(os.path.join(root, name))
+    if cand != os.path.normpath(root) and not cand.startswith(os.path.normpath(root) + os.sep):
+        raise ValueError("That path is outside your brain.")
+    return cand
+
+
+def _brain_who(uid: int) -> str:
+    """Human label for brain-entry attribution."""
+    if uid == OWNER_UID:
+        return "Greg"
+    try:
+        sender = employee_email.sender_for(uid)
+        if sender and sender.get("from"):
+            return sender["from"]
+    except Exception:
+        pass
+    return f"uid {uid}"
+
+
+def _brain_append_entry(uid: int, text: str) -> str:
+    """Append a dated, attributed entry to the caller's brain log. Append-only:
+    a timestamped .bak is written first, then the file is rewritten atomically
+    with the new entry added (top for Greg's newest-first log, else bottom)."""
+    root, main, is_owner = _brain_root(uid)
+    os.makedirs(root, exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    day = datetime.now().strftime("%Y-%m-%d")
+    who = _brain_who(uid)
+    entry = f"## {day} [note] (via {who} @ {stamp})\n\n{text.strip()}\n"
+
+    old = ""
+    if os.path.exists(main):
+        with open(main, encoding="utf-8") as fh:
+            old = fh.read()
+        # safety backup before any rewrite -- never lose existing notes
+        bak = f"{main}.bak-{int(time.time())}"
+        with open(bak, "w", encoding="utf-8") as fh:
+            fh.write(old)
+
+    if is_owner and "\n---\n" in old:
+        # Greg's BRAIN.md keeps newest entries on top, just under the preamble.
+        head, rest = old.split("\n---\n", 1)
+        new = f"{head}\n---\n\n{entry}\n{rest.lstrip()}"
+    elif old:
+        new = old.rstrip() + "\n\n" + entry
+    else:
+        title = "Brain — Greg" if is_owner else "Nightshift Team Brain"
+        new = (f"# {title}\n\nRunning log. Header format: "
+               f"`## YYYY-MM-DD [tag] headline`.\n\n---\n\n{entry}")
+
+    tmp = main + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(new)
+    os.replace(tmp, main)
+    return f"Added to {'your personal brain' if is_owner else 'the team brain'} ({os.path.basename(main)})."
 
 
 async def _gdrive(args: list[str], timeout: int = 120) -> str:
@@ -422,6 +514,66 @@ async def email_send(to: str, subject: str, body: str) -> str:
     return ("Staged for your confirmation -- NOT sent. I've sent the exact draft to your "
             "Telegram (NS Team Bot) with a Send / Cancel button. Tap Send there to send it; "
             "nothing goes out until you do. Do not tell the user it was already sent.")
+
+
+@mcp.tool()
+async def brain_list() -> str:
+    """List the notes in your brain (the assistant's knowledge base). Greg sees
+    his personal brain; team members see the shared Nightshift team brain.
+    Returns each file's path (relative to the brain) and size."""
+    uid = _uid()
+    root, main, is_owner = _brain_root(uid)
+    if not os.path.isdir(root):
+        which = "personal brain" if is_owner else "team brain"
+        return f"Your {which} is empty so far. Use brain_append to add the first note."
+    rows = []
+    for dirpath, _dirs, files in os.walk(root):
+        for fn in sorted(files):
+            if fn.endswith((".tmp",)) or ".bak-" in fn:
+                continue
+            full = os.path.join(dirpath, fn)
+            rel = os.path.relpath(full, root)
+            try:
+                size = os.path.getsize(full)
+            except OSError:
+                size = 0
+            rows.append(f"  {rel}  ({size:,} bytes)")
+    label = "Your personal brain" if is_owner else "Nightshift team brain"
+    body = "\n".join(sorted(rows)) or "  (empty)"
+    return f"{label} — read any with brain_read(name=...):\n{body}"
+
+
+@mcp.tool()
+async def brain_read(name: str = "") -> str:
+    """Read a note from your brain. With no name, returns the main running log
+    (Greg: BRAIN.md; team: TEAM_BRAIN.md). Pass a path from brain_list (e.g.
+    'memory/project_nightshift.md') to read a specific note."""
+    uid = _uid()
+    root, main, is_owner = _brain_root(uid)
+    path = main if not name.strip() else _brain_resolve(root, name)
+    if not os.path.exists(path):
+        return f"No such note: {name or os.path.basename(main)}. Use brain_list to see what's there."
+    if os.path.isdir(path):
+        raise ValueError("That's a folder, not a note. Use brain_list.")
+    with open(path, "rb") as fh:
+        data = fh.read()
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return f"That note is binary ({len(data)} bytes) and can't be shown as text."
+    return text[:100_000]
+
+
+@mcp.tool()
+async def brain_append(text: str) -> str:
+    """Add a new dated, attributed note to your brain's running log. This ONLY
+    ADDS — it never edits or deletes anything already written (the file is
+    backed up before each write). Greg's notes go to his personal brain; team
+    members' notes go to the shared team brain."""
+    uid = _uid()
+    if not text.strip():
+        raise ValueError("Give me the note text to add.")
+    return await asyncio.to_thread(_brain_append_entry, uid, text)
 
 
 # --------------------------------------------------------------------------- #
