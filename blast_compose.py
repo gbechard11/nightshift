@@ -26,6 +26,31 @@ CONTACTS = "/data/greg/contacts/ticketweb_customers.csv"
 OWNER_EMAIL = os.environ.get("OWNER_EMAIL", "gbechard11@gmail.com")
 FROM_ADDR = "info@nightshiftent.ca"
 
+# Per Greg's standing rule: blasts that ANDREW initiates default to Pawn Shop
+# Live's address, not the Nightshift address. He will say if a given blast is
+# NOT from Pawnshop (handled case-by-case); the default lives here.
+ANDREW_UID = "8621126122"
+PAWNSHOP_FROM = "gm@pawnshop-live.ca"
+SENDERS_PATH = "/home/gregnightshift/nightshift/blast-senders.json"
+
+
+def _sender_for(rid: str) -> str:
+    """Default From address for whoever is drafting the blast."""
+    return PAWNSHOP_FROM if str(rid).strip() == ANDREW_UID else FROM_ADDR
+
+
+def _sender_ready(addr: str) -> bool:
+    """True if blast.py can legitimately send from addr (has an SMTP profile)."""
+    import json
+    if addr.lower().endswith("@nightshiftent.ca"):
+        return True  # served by the default SES profile (same-domain rule)
+    try:
+        cfg = json.load(open(SENDERS_PATH))
+    except Exception:
+        return False
+    dom = addr.rsplit("@", 1)[-1].lower()
+    return bool(cfg.get(addr) or cfg.get(dom))
+
 
 def _slug(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")[:24] or "blast"
@@ -56,6 +81,16 @@ def draft(rid, requester, city, subject, html, image_drive_ids, gdrive, dl_dir) 
     if _segment_count(city) <= 0:
         return (f"I couldn't find any contacts for city '{city}'. "
                 f"Check the spelling (e.g. Edmonton, Winnipeg, Calgary).")
+
+    from_addr = _sender_for(rid)
+    if not _sender_ready(from_addr):
+        return (
+            f"This blast would go out from {from_addr} (Pawn Shop Live), but that "
+            f"sender is not connected yet. In the NS Team Bot run /setupemail for "
+            f"{from_addr} (have its SMTP host, login, and an app password ready). "
+            f"Once it is connected the blast system picks it up automatically -- "
+            f"then re-run this."
+        )
 
     bid = f"emp-{_slug(city)}-{secrets.token_hex(3)}"
     os.makedirs(dl_dir, exist_ok=True)
@@ -90,7 +125,7 @@ def draft(rid, requester, city, subject, html, image_drive_ids, gdrive, dl_dir) 
     # 3) queue it (owner-only send later)
     rc, out = _run([PYTHON, QUEUE, "add", "--id", bid, "--city", city,
                     "--subject", subject, "--html-file", html_path,
-                    "--list", CONTACTS, "--from", FROM_ADDR,
+                    "--list", CONTACTS, "--from", from_addr,
                     "--created-by", requester])
     if rc != 0:
         return f"Couldn't queue the blast: {out}"
@@ -100,7 +135,7 @@ def draft(rid, requester, city, subject, html, image_drive_ids, gdrive, dl_dir) 
     with open(prev_csv, "w", encoding="utf-8") as f:
         f.write("first,email\nGreg,%s\n" % OWNER_EMAIL)
     _run([PYTHON, BLAST, "--list", prev_csv, "--channel", "email",
-          "--from", FROM_ADDR, "--subject", subject, "--html-file", html_path,
+          "--from", from_addr, "--subject", subject, "--html-file", html_path,
           "--campaign", f"{bid}-preview", "--yes"])
 
     # 5) notify Greg
@@ -109,7 +144,7 @@ def draft(rid, requester, city, subject, html, image_drive_ids, gdrive, dl_dir) 
         import employee_notify
         employee_notify.notify_owner(
             f"📣 {requester} drafted an email blast for your approval:\n"
-            f"• {subject}\n• Audience: {city} (~{count:,} contacts)\n"
+            f"• {subject}\n• From: {from_addr}\n• Audience: {city} (~{count:,} contacts)\n"
             f"• Preview just sent to your inbox.\n\n"
             f"To send it, tell Pedro: send blast {bid}  "
             f"(runs `blast_queue.py send {bid} --yes`). Nothing goes out until you do."
