@@ -412,6 +412,7 @@ async def create_adcreative(
     image_hash: str | None = None,
     image_url: str | None = None,
     call_to_action_type: str = "GET_TICKETS",
+    url_tags: str | None = None,
 ) -> dict:
     """Create an ad creative for a ticket-link ad. Returns {'id': ...}.
 
@@ -447,6 +448,14 @@ async def create_adcreative(
         "name": name,
         "object_story_spec": json.dumps(story_spec),
     }
+    # Standardized UTM tracking auto-appended to every outbound ticket link.
+    if url_tags is None:
+        url_tags = (
+            "utm_source=facebook&utm_medium=paid_social"
+            "&utm_campaign={{campaign.name}}&utm_term={{adset.name}}"
+            "&utm_content={{ad.name}}&utm_id={{ad.id}}"
+        )
+    data["url_tags"] = url_tags
     return await _post(client, f"{AD_ACCOUNT_ID}/adcreatives", data)
 
 
