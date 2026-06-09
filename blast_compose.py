@@ -52,6 +52,13 @@ def _sender_ready(addr: str) -> bool:
     return bool(cfg.get(addr) or cfg.get(dom))
 
 
+def _self_approvers() -> set:
+    """Telegram uids allowed to approve + send their OWN drafted blasts
+    (Seba + Andrew by default; override with BLAST_SELF_APPROVE in .env)."""
+    raw = os.environ.get("BLAST_SELF_APPROVE", "8722742818,8621126122")
+    return {x.strip() for x in raw.replace(";", ",").split(",") if x.strip()}
+
+
 def _slug(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")[:24] or "blast"
 
@@ -126,35 +133,70 @@ def draft(rid, requester, city, subject, html, image_drive_ids, gdrive, dl_dir) 
     rc, out = _run([PYTHON, QUEUE, "add", "--id", bid, "--city", city,
                     "--subject", subject, "--html-file", html_path,
                     "--list", CONTACTS, "--from", from_addr,
-                    "--created-by", requester])
+                    "--created-by", requester, "--created-by-uid", str(rid)])
     if rc != 0:
         return f"Couldn't queue the blast: {out}"
 
-    # 4) send Greg a live PREVIEW (to him only — never the segment)
+    # 4) count the segment once, then route the draft to whoever approves it
+    count = _segment_count(city)
+    self_approve = str(rid).strip() in _self_approvers()
+    import employee_notify
+
+    if self_approve:
+        # The requesting employee reviews their OWN draft and approves it;
+        # Greg is out of the loop for Seba's / Andrew's blasts (his standing rule).
+        try:
+            import employee_email
+            sender = employee_email.sender_for(rid) or {}
+            reviewer_email = sender.get("from") or OWNER_EMAIL
+        except Exception:
+            reviewer_email = OWNER_EMAIL
+        first = requester.split()[0] if requester else "there"
+        prev_csv = os.path.join(dl_dir, f"{bid}_preview.csv")
+        with open(prev_csv, "w", encoding="utf-8") as f:
+            f.write("first,email\n%s,%s\n" % (first, reviewer_email))
+        _run([PYTHON, BLAST, "--list", prev_csv, "--channel", "email",
+              "--from", from_addr, "--subject", subject, "--html-file", html_path,
+              "--campaign", f"{bid}-preview", "--yes"])
+        try:
+            employee_notify.notify_blast_approval(
+                rid, bid,
+                f"\U0001F4E3 Your email blast is ready to review:\n"
+                f"\u2022 {subject}\n\u2022 From: {from_addr}\n"
+                f"\u2022 Audience: {city} (~{count:,} contacts)\n"
+                f"\u2022 A preview was just emailed to {reviewer_email}.\n\n"
+                f"Open the preview, then tap Approve & send to blast it to all "
+                f"~{count:,} {city} contacts. Nothing goes out until you tap Approve."
+            )
+        except Exception:
+            pass
+        return (
+            f"\u2705 Drafted '{subject}' for {city} (~{count:,} contacts) and emailed "
+            f"you a preview at {reviewer_email}. I also sent Approve / Cancel buttons here "
+            f"-- review the preview, then tap Approve & send to blast it. Queue id: {bid}."
+        )
+
+    # 5) otherwise the owner (Greg) reviews + approves -- original behavior
     prev_csv = os.path.join(dl_dir, f"{bid}_preview.csv")
     with open(prev_csv, "w", encoding="utf-8") as f:
         f.write("first,email\nGreg,%s\n" % OWNER_EMAIL)
     _run([PYTHON, BLAST, "--list", prev_csv, "--channel", "email",
           "--from", from_addr, "--subject", subject, "--html-file", html_path,
           "--campaign", f"{bid}-preview", "--yes"])
-
-    # 5) notify Greg
-    count = _segment_count(city)
     try:
-        import employee_notify
         employee_notify.notify_owner(
-            f"📣 {requester} drafted an email blast for your approval:\n"
-            f"• {subject}\n• From: {from_addr}\n• Audience: {city} (~{count:,} contacts)\n"
-            f"• Preview just sent to your inbox.\n\n"
+            f"\U0001F4E3 {requester} drafted an email blast for your approval:\n"
+            f"\u2022 {subject}\n\u2022 From: {from_addr}\n"
+            f"\u2022 Audience: {city} (~{count:,} contacts)\n"
+            f"\u2022 Preview just sent to your inbox.\n\n"
             f"To send it, tell Pedro: send blast {bid}  "
             f"(runs `blast_queue.py send {bid} --yes`). Nothing goes out until you do."
         )
     except Exception:
         pass
-
     return (
-        f"✅ Drafted and queued '{subject}' for {city} (~{count:,} contacts). "
-        f"Greg has a live preview in his inbox and a note to approve it — "
+        f"\u2705 Drafted and queued '{subject}' for {city} (~{count:,} contacts). "
+        f"Greg has a live preview in his inbox and a note to approve it -- "
         f"nothing sends until he gives the go. Queue id: {bid}."
     )
 

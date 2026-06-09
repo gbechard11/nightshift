@@ -32,6 +32,7 @@ import logging
 import json
 import os
 import secrets
+import subprocess
 import time
 
 import httpx
@@ -1071,6 +1072,88 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def on_blast_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Employee approves/cancels their OWN queued blast. The real mass-send to the
+    list happens ONLY here, on an explicit Approve tap by the employee who drafted it
+    -- the chat agent can queue a draft but can never fire it."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:  # noqa: BLE001
+        pass
+    if not authorized(update):
+        return
+    try:
+        action, bid = query.data.split(":", 1)
+    except ValueError:
+        return
+    uid = update.effective_user.id
+    spec_path = os.path.join("/data/greg/blast_queue", "%s.json" % bid)
+    try:
+        spec = json.load(open(spec_path))
+    except Exception:  # noqa: BLE001
+        try:
+            await query.edit_message_text("This draft expired or was already handled.")
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    approvers = {x.strip() for x in os.environ.get(
+        "BLAST_SELF_APPROVE", "8722742818,8621126122").replace(";", ",").split(",") if x.strip()}
+    if str(spec.get("created_by_uid")) != str(uid) or str(uid) not in approvers:
+        return  # only the employee who drafted it, and only if allowed, may fire it
+    status = spec.get("status")
+    if status == "sent":
+        try:
+            await query.edit_message_text("\u2705 Already sent (%s)." % spec.get("sent_at", ""))
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    if status == "cancelled":
+        try:
+            await query.edit_message_text("This blast was already cancelled.")
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    py = "/home/gregnightshift/nightshift/.venv/bin/python"
+    qbin = "/home/gregnightshift/nightshift/scripts/blast_queue.py"
+    if action == "blastcancel":
+        await asyncio.to_thread(subprocess.run, [py, qbin, "cancel", bid], capture_output=True)
+        try:
+            await query.edit_message_text("\u274C Cancelled \u2014 nothing was sent.")
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    city = spec.get("city", "")
+    count = spec.get("segment_count", "?")
+    try:
+        await query.edit_message_text(
+            "\U0001F4E4 Sending to ~%s %s contacts\u2026 I'll confirm here when it's done." % (count, city))
+    except Exception:  # noqa: BLE001
+        pass
+    res = await asyncio.to_thread(
+        subprocess.run, [py, qbin, "send", bid, "--yes"], capture_output=True, text=True)
+    if res.returncode == 0:
+        try:
+            await query.edit_message_text(
+                "\u2705 Sent '%s' to ~%s %s contacts." % (spec.get("subject", ""), count, city))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            employee_notify.notify_owner(
+                "\U0001F4E3 %s approved + SENT a blast (FYI, no action needed):\n"
+                "\u2022 %s\n\u2022 From: %s\n\u2022 Audience: %s (~%s contacts)\nQueue id: %s." % (
+                    employee_notify.who(uid), spec.get("subject", ""),
+                    spec.get("from", ""), city, count, bid))
+        except Exception:  # noqa: BLE001
+            pass
+    else:
+        err = ((res.stdout or "") + (res.stderr or ""))[-300:]
+        try:
+            await query.edit_message_text("\u26A0\uFE0F Send failed: %s" % err)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def main() -> None:
     if not EMPLOYEE_USERS:
         log.warning(
@@ -1102,6 +1185,7 @@ def main() -> None:
     app.add_handler(CommandHandler("request", cmd_request))
     app.add_handler(CallbackQueryHandler(on_campaign_button, pattern=r"^camp:"))
     app.add_handler(CallbackQueryHandler(on_email_confirm, pattern=r"^emailsend:"))
+    app.add_handler(CallbackQueryHandler(on_blast_button, pattern=r"^blast(send|cancel):"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))

@@ -78,3 +78,29 @@ def notify_owner_request(rec) -> None:
             resp.read()
     except Exception as exc:  # noqa: BLE001
         log.warning("owner request notify failed: %s", exc)
+
+
+def notify_blast_approval(uid, bid, text) -> None:
+    """DM the employee (via the NS Team Bot) their drafted blast with Approve/Cancel
+    buttons. The Approve tap is what authorizes the real send (handled in employee_bot).
+    Best-effort, never raises."""
+    token = os.environ.get("EMPLOYEE_BOT_TOKEN") or _TOKEN
+    if not token or not uid:
+        return
+    import json as _json
+    markup = {"inline_keyboard": [[
+        {"text": "\u2705 Approve & send", "callback_data": f"blastsend:{bid}"},
+        {"text": "\u274C Cancel", "callback_data": f"blastcancel:{bid}"},
+    ]]}
+    try:
+        data = urllib.parse.urlencode(
+            {"chat_id": uid, "text": text, "reply_markup": _json.dumps(markup),
+             "disable_web_page_preview": "true"}
+        ).encode()
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage", data=data
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("blast approval notify failed: %s", exc)
