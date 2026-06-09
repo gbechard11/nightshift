@@ -24,6 +24,7 @@ import argparse
 import io
 import mimetypes
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -86,25 +87,76 @@ def cmd_list(args):
     _print_files(result.get("files", []))
 
 
+# Generic words that shouldn't drive a filename match (so "DJ Mina June 12 2026
+# artwork" still finds files named "MINA 2026 - EDM - 16X9"). Short numeric tokens
+# (day/month like "12") are dropped too — event art is named by year + city, not date.
+_FIND_STOPWORDS = {
+    "the", "a", "an", "of", "for", "and", "to", "in", "on", "dj", "mr", "ms",
+    "artwork", "art", "image", "images", "img", "photo", "photos", "pic", "pics",
+    "picture", "flyer", "flyers", "poster", "posters", "graphic", "graphics",
+    "banner", "banners", "file", "files", "show", "event", "events", "please",
+    "find", "get", "send", "use", "drive", "this", "that", "from", "with",
+}
+
+
+def _find_tokens(name: str) -> list[str]:
+    toks = re.findall(r"[A-Za-z0-9]+", name.lower())
+    out = []
+    for t in toks:
+        if len(t) < 2 or t in _FIND_STOPWORDS:
+            continue
+        if t.isdigit() and len(t) < 4:  # drop day/month numbers, keep years like 2026
+            continue
+        out.append(t)
+    # de-dupe, preserve order
+    seen = set()
+    return [t for t in out if not (t in seen or seen.add(t))]
+
+
 def cmd_find(args):
     service = get_service()
-    parts = [f"name contains '{args.name}'", "trashed = false"]
     folder = args.folder or DEFAULT_FOLDER
+    raw = args.name.strip()
+    tokens = _find_tokens(raw)
+    base = ["trashed = false"]
     if folder:
-        parts.append(f"'{folder}' in parents")
-    q = " and ".join(parts)
-    result = (
-        service.files()
-        .list(
-            q=q,
-            pageSize=args.max,
-            fields="files(id, name, mimeType, size, modifiedTime)",
-            orderBy="modifiedTime desc",
-            **SHARED,
+        base.append(f"'{folder}' in parents")
+
+    def _run(qstr, page):
+        return (
+            service.files()
+            .list(
+                q=qstr,
+                pageSize=page,
+                fields="files(id, name, mimeType, size, modifiedTime)",
+                orderBy="modifiedTime desc",
+                **SHARED,
+            )
+            .execute()
+            .get("files", [])
         )
-        .execute()
-    )
-    _print_files(result.get("files", []))
+
+    if len(tokens) <= 1:
+        # Single term (or a quoted exact phrase): original substring behaviour.
+        safe = raw.replace("\\", "\\\\").replace("'", "\\'")
+        files = _run(" and ".join([f"name contains '{safe}'"] + base), args.max)
+    else:
+        # Multi-word query: match ANY token, then rank by how many tokens appear in
+        # the name (newer first on ties). Forgiving of date-based / wordy searches.
+        ors = " or ".join(f"name contains '{t}'" for t in tokens)
+        cand = _run(" and ".join([f"({ors})"] + base), max(args.max * 4, 80))
+
+        def score(f):
+            low = f["name"].lower()
+            return sum(1 for t in tokens if t in low)
+
+        cand.sort(key=lambda f: (score(f), f.get("modifiedTime", "")), reverse=True)
+        files = cand[:args.max]
+        if not files:  # nothing matched any token — fall back to whole-string
+            safe = raw.replace("\\", "\\\\").replace("'", "\\'")
+            files = _run(" and ".join([f"name contains '{safe}'"] + base), args.max)
+
+    _print_files(files)
 
 
 def cmd_download(args):
