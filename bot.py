@@ -88,6 +88,34 @@ def _is_owner(update: Update) -> bool:
     return bool(update.effective_user and update.effective_user.id == OWNER_ID)
 
 
+def _pop_account(text: str):
+    """Pull an optional leading '@account' selector off a command's text.
+
+    Lets any ad command pick which account to launch from, e.g.
+    '/draft @pawnshop My Show | ids | 20'. Returns (profile, remaining_text);
+    with no '@key' prefix it falls back to the default profile (Nightshift).
+    Raises meta_ads.MetaError on an unknown key.
+    """
+    text = (text or "").strip()
+    if text.startswith("@"):
+        head, _, rest = text.partition(" ")
+        return meta_ads.get_profile(head), rest.strip()
+    return meta_ads.get_profile(None), text
+
+
+def _meta_not_ready(acct) -> str:
+    """Per-account 'not configured yet' message naming exactly what's missing."""
+    KU = acct.key.upper()
+    return (
+        f"📣 Ad account @{acct.key} ({acct.label}) isn't ready yet.\n"
+        f"{acct.status_line()}\n\n"
+        f"Set in .env on the VPS, then restart nightshift.service:\n"
+        f"  META_{KU}_ACCESS_TOKEN, META_{KU}_AD_ACCOUNT_ID, META_{KU}_PAGE_ID\n"
+        f"Once the token is set, run  scripts/find_meta_assets.py @{acct.key}  "
+        f"to discover the account/page/pixel ids."
+    )
+
+
 # Serialize the owner's claude runs — there is one shared, persistent session,
 # so only one stateful run may proceed at a time. Restricted runs are one-shot
 # and stateless, so they stay concurrent (no lock passed).
@@ -137,11 +165,12 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/ask <prompt>  - same as plain text\n"
         "/safe <prompt> - read-only, no memory, no shell/file writes\n"
         "/call <number> <objective> - I call someone on your behalf (you approve first)\n"
-        "/research <artist> [genre=hip_hop] [similar=A,B] [label=Label] - smart Meta targeting research\n"
-        "/draft <name> | <ids> | <$CAD/day> | [objective] | [ticket_link] | [caption] | [flyer.jpg] - build a PAUSED campaign + ad\n"
+        "/accounts - list ad accounts you can launch from (Nightshift, Pawnshop, …)\n"
+        "/research [@acct] <artist> [genre=hip_hop] [similar=A,B] [label=Label] - smart Meta targeting research\n"
+        "/draft [@acct] <name> | <ids> | <$/day> | [objective] | [ticket_link] | [caption] | [flyer.jpg] - build a PAUSED campaign + ad\n"
         "/media - list images available for ads (drop files in /data/greg/ads/)\n"
-        "/pause <campaign_id> - stop a campaign's spend\n"
-        "/report [id]   - last-7-day ad insights (defaults to the account)\n"
+        "/pause [@acct] <campaign_id> - stop a campaign's spend\n"
+        "/report [@acct] [id] - last-7-day ad insights (defaults to the account)\n"
         "/shows [days|all] - upcoming Prism shows (default: next 60 days)\n"
         "/show <event_id>  - details for one Prism show\n"
         "/settlement <event_id> - ticket revenue, taxes, expenses for a show\n"
@@ -364,15 +393,19 @@ async def cmd_research(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Read-only: search Meta targeting interests for an artist/genre/topic."""
     if not authorized(update):
         return
-    if not meta_ads.configured():
-        await update.message.reply_text(META_NOT_CONFIGURED)
+    try:
+        acct, query = _pop_account(" ".join(ctx.args).strip() if ctx.args else "")
+    except meta_ads.MetaError as e:
+        await update.message.reply_text(str(e))
         return
-    query = " ".join(ctx.args).strip() if ctx.args else ""
+    if not meta_ads.configured(acct):
+        await update.message.reply_text(_meta_not_ready(acct))
+        return
     if not query:
         await update.message.reply_text(
-            "Usage: /research <artist> [genre=<genre>] [similar=artist1,artist2] [label=<label>]\n"
+            "Usage: /research [@account] <artist> [genre=<genre>] [similar=artist1,artist2] [label=<label>]\n"
             "Example: /research Drake genre=hip_hop similar=Future,Travis_Scott label=OVO_Sound\n"
-            "Simple: /research Drake\n"
+            "Simple: /research Drake   •   Other account: /research @pawnshop Comedy Night\n"
             "(use _ for spaces inside a value, e.g. genre=hip_hop)"
         )
         return
@@ -406,6 +439,7 @@ async def cmd_research(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 genre=genre,
                 similar_artists=similar_artists or None,
                 label=label,
+                acct=acct,
             )
     except meta_ads.MetaError as e:
         await update.message.reply_text(f"Research failed: {e}")
@@ -423,9 +457,10 @@ async def cmd_research(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if len(summary) > 3800:  # Telegram hard-caps at 4096
         summary = summary[:3800] + "\n…(truncated)"
     ids_csv = ",".join(all_ids)
+    acct_prefix = "" if acct.key == meta_ads.DEFAULT_PROFILE_KEY else f"@{acct.key} "
     summary += (
-        f"\n\nTo draft a campaign with all {len(all_ids)} interests:\n"
-        f"/draft {artist_name} fans | {ids_csv} | 20"
+        f"\n\nTo draft a campaign on {acct.label} with all {len(all_ids)} interests:\n"
+        f"/draft {acct_prefix}{artist_name} fans | {ids_csv} | 20"
     )
     await update.message.reply_text(summary)
 
@@ -439,15 +474,21 @@ async def cmd_draft(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """
     if not authorized(update):
         return
-    if not meta_ads.configured():
-        await update.message.reply_text(META_NOT_CONFIGURED)
-        return
     raw = (update.message.text or "").partition(" ")[2].strip()
+    try:
+        acct, raw = _pop_account(raw)
+    except meta_ads.MetaError as e:
+        await update.message.reply_text(str(e))
+        return
+    if not (acct.token and acct.ad_account_id):
+        await update.message.reply_text(_meta_not_ready(acct))
+        return
     parts = [p.strip() for p in raw.split("|")]
     if len(parts) < 3 or not parts[0]:
         await update.message.reply_text(
-            "Usage: /draft <name> | <interest_ids csv> | <daily $CAD> | [objective] | [ticket_link] | [caption] | [image_url]\n"
+            "Usage: /draft [@account] <name> | <interest_ids csv> | <daily $> | [objective] | [ticket_link] | [caption] | [image_url]\n"
             "Example: /draft Drake fans YEG | 6003123456789 | 20 | OUTCOME_TRAFFIC | https://showpass.com/event | Get tickets before they sell out!\n"
+            "Other account: /draft @pawnshop Comedy Night | 6003123456789 | 20 | ... (see /accounts for keys)\n"
             "Get interest ids from /research. Objective defaults to OUTCOME_TRAFFIC.\n"
             "ticket_link, caption, image_url are optional — include them to create the full ad creative."
         )
@@ -457,7 +498,7 @@ async def cmd_draft(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         daily_cad = float(parts[2])
     except ValueError:
-        await update.message.reply_text(f"Daily budget must be a number in CAD. Got: {parts[2]}")
+        await update.message.reply_text(f"Daily budget must be a number in {acct.currency}. Got: {parts[2]}")
         return
     if daily_cad <= 0:
         await update.message.reply_text("Daily budget must be greater than 0.")
@@ -467,20 +508,20 @@ async def cmd_draft(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     caption = parts[5] if len(parts) > 5 and parts[5] else None
     image_url = parts[6] if len(parts) > 6 and parts[6] else None
     daily_cents = int(round(daily_cad * 100))
-    targeting = meta_ads.build_targeting(interest_ids)
+    targeting = meta_ads.build_targeting(interest_ids, countries=acct.default_countries)
 
     await ctx.bot.send_chat_action(update.message.chat_id, ChatAction.TYPING)
     creative_id = None
     ad_id = None
     try:
         async with httpx.AsyncClient(timeout=45.0) as client:
-            camp = await meta_ads.create_campaign(client, name, objective=objective)
+            camp = await meta_ads.create_campaign(client, name, objective=objective, acct=acct)
             campaign_id = camp.get("id")
             if not campaign_id:
                 await update.message.reply_text(f"Meta returned no campaign id:\n{camp}")
                 return
             adset = await meta_ads.create_adset(
-                client, campaign_id, f"{name} — ad set", daily_cents, targeting
+                client, campaign_id, f"{name} — ad set", daily_cents, targeting, acct=acct
             )
             adset_id = adset.get("id")
             creative_error = None
@@ -492,23 +533,23 @@ async def cmd_draft(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                     # local media file — resolve it, upload to Meta, use the hash.
                     if image_url and not image_url.startswith("http"):
                         file_path = meta_ads.resolve_media_path(image_url)
-                        image_hash = await meta_ads.upload_ad_image(client, file_path)
+                        image_hash = await meta_ads.upload_ad_image(client, file_path, acct=acct)
                         image_label = image_url  # show the original filename in confirmation
                         image_url = None  # clear so create_adcreative uses hash path
                     creative = await meta_ads.create_adcreative(
                         client, f"{name} — creative", ticket_link, caption,
-                        image_hash=image_hash, image_url=image_url,
+                        image_hash=image_hash, image_url=image_url, acct=acct,
                     )
                     creative_id = creative.get("id")
                     if creative_id:
                         ad = await meta_ads.create_ad(
-                            client, adset_id, f"{name} — ad", creative_id
+                            client, adset_id, f"{name} — ad", creative_id, acct=acct
                         )
                         ad_id = ad.get("id")
                 except meta_ads.MetaError as ce:
                     creative_error = str(ce)
             try:
-                est = await meta_ads.reach_estimate(client, targeting)
+                est = await meta_ads.reach_estimate(client, targeting, acct=acct)
             except meta_ads.MetaError:
                 est = None
     except meta_ads.MetaError as e:
@@ -520,6 +561,7 @@ async def cmd_draft(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "campaign_id": campaign_id,
         "name": name,
         "daily_cad": daily_cad,
+        "acct_key": acct.key,
     }
     reach_line = _format_reach(est)
     creative_lines = ""
@@ -543,15 +585,16 @@ async def cmd_draft(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
     await update.message.reply_text(
         "📋 Campaign drafted — PAUSED, not spending:\n\n"
+        f"Account: {acct.label} (@{acct.key})\n"
         f"Name: {name}\n"
         f"Campaign id: {campaign_id}\n"
         f"Objective: {objective}\n"
-        f"Daily budget: ${daily_cad:.2f} CAD\n"
+        f"Daily budget: ${daily_cad:.2f} {acct.currency}\n"
         f"Interests: {', '.join(interest_ids) or '(none — broad)'}\n"
-        f"Geo: Canada\n"
+        f"Geo: {', '.join(acct.default_countries)}\n"
         f"{creative_lines}"
         + (f"{reach_line}\n" if reach_line else "")
-        + "\nLaunching starts real spend on the Nightshift CAD account. Launch now?",
+        + f"\nLaunching starts real spend on the {acct.label} account. Launch now?",
         reply_markup=keyboard,
     )
 
@@ -585,10 +628,15 @@ async def on_campaign_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     PENDING_CAMPAIGNS.pop(token, None)
-    await query.edit_message_text(f"🚀 Launching campaign {draft['campaign_id']}…")
+    try:
+        acct = meta_ads.get_profile(draft.get("acct_key"))
+    except meta_ads.MetaError as e:
+        await query.message.reply_text(f"Launch failed (campaign stays paused): {e}")
+        return
+    await query.edit_message_text(f"🚀 Launching campaign {draft['campaign_id']} on {acct.label}…")
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            await meta_ads.activate_campaign(client, draft["campaign_id"])
+            await meta_ads.activate_campaign(client, draft["campaign_id"], acct=acct)
     except meta_ads.MetaError as e:
         await query.message.reply_text(f"Launch failed (campaign stays paused): {e}")
         return
@@ -596,10 +644,11 @@ async def on_campaign_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         log.exception("campaign activate failed")
         await query.message.reply_text(f"Launch error (campaign stays paused): {e}")
         return
+    pause_hint = f"/pause {draft['campaign_id']}" if acct.key == meta_ads.DEFAULT_PROFILE_KEY else f"/pause @{acct.key} {draft['campaign_id']}"
     await query.message.reply_text(
-        f"✅ Campaign {draft['campaign_id']} is ACTIVE, spending up to "
-        f"${draft['daily_cad']:.2f} CAD/day.\n"
-        f"Pause anytime with /pause {draft['campaign_id']}."
+        f"✅ Campaign {draft['campaign_id']} on {acct.label} is ACTIVE, spending up to "
+        f"${draft['daily_cad']:.2f} {acct.currency}/day.\n"
+        f"Pause anytime with {pause_hint}."
     )
 
 
@@ -623,44 +672,70 @@ async def cmd_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def cmd_accounts(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """List the ad accounts you can launch from and whether each is ready."""
+    if not authorized(update):
+        return
+    profiles = meta_ads.list_profiles()
+    if not profiles:
+        await update.message.reply_text("No ad accounts configured.")
+        return
+    lines = ["📒 Ad accounts (use @key with /draft, /research, /pause, /report):\n"]
+    for p in profiles:
+        default = " (default)" if p.key == meta_ads.DEFAULT_PROFILE_KEY else ""
+        lines.append(f"• {p.status_line()}{default}")
+    lines.append("\nExample: /draft @pawnshop Comedy Night | 6003123456789 | 20 | OUTCOME_TRAFFIC | https://...")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def cmd_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Pause a campaign — always safe, stops spend immediately."""
     if not authorized(update):
         return
-    if not meta_ads.configured():
-        await update.message.reply_text(META_NOT_CONFIGURED)
+    try:
+        acct, rest = _pop_account(" ".join(ctx.args) if ctx.args else "")
+    except meta_ads.MetaError as e:
+        await update.message.reply_text(str(e))
         return
-    cid = (ctx.args[0] if ctx.args else "").strip()
+    if not meta_ads.configured(acct):
+        await update.message.reply_text(_meta_not_ready(acct))
+        return
+    cid = rest.strip().split()[0] if rest.strip() else ""
     if not cid:
-        await update.message.reply_text("Usage: /pause <campaign_id>")
+        await update.message.reply_text("Usage: /pause [@account] <campaign_id>")
         return
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            await meta_ads.pause_campaign(client, cid)
+            await meta_ads.pause_campaign(client, cid, acct=acct)
     except meta_ads.MetaError as e:
         await update.message.reply_text(f"Pause failed: {e}")
         return
-    await update.message.reply_text(f"⏸ Campaign {cid} paused — spend stopped.")
+    await update.message.reply_text(f"⏸ Campaign {cid} paused on {acct.label} — spend stopped.")
 
 
 async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Read-only insights for a campaign/adset/ad/account (last 7 days)."""
     if not authorized(update):
         return
-    if not meta_ads.configured():
-        await update.message.reply_text(META_NOT_CONFIGURED)
+    try:
+        acct, rest = _pop_account(" ".join(ctx.args) if ctx.args else "")
+    except meta_ads.MetaError as e:
+        await update.message.reply_text(str(e))
         return
-    obj = (ctx.args[0] if ctx.args else meta_ads.AD_ACCOUNT_ID).strip()
+    if not meta_ads.configured(acct):
+        await update.message.reply_text(_meta_not_ready(acct))
+        return
+    obj = (rest.strip().split()[0] if rest.strip() else acct.ad_account_id).strip()
     if not obj:
         await update.message.reply_text(
-            "Usage: /report <campaign_id|account_id>\n"
-            "(defaults to META_AD_ACCOUNT_ID once that's set)"
+            "Usage: /report [@account] <campaign_id|account_id>\n"
+            f"(defaults to the @{acct.key} account id once that's set)"
         )
         return
     await ctx.bot.send_chat_action(update.message.chat_id, ChatAction.TYPING)
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            rows = await meta_ads.get_insights(client, obj)
+            rows = await meta_ads.get_insights(client, obj, acct=acct)
     except meta_ads.MetaError as e:
         await update.message.reply_text(f"Report failed: {e}")
         return
@@ -691,7 +766,7 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         await asyncio.to_thread(
             mailer.send,
-            f"Nightshift Ads report — {obj} (last 7 days)",
+            f"{acct.label} Ads report — {obj} (last 7 days)",
             report_text,
             recipients,
         )
@@ -1206,6 +1281,7 @@ def main() -> None:
     app.add_handler(CommandHandler("call", cmd_call))
     app.add_handler(CommandHandler("research", cmd_research))
     app.add_handler(CommandHandler("draft", cmd_draft))
+    app.add_handler(CommandHandler("accounts", cmd_accounts))
     app.add_handler(CommandHandler("media", cmd_media))
     app.add_handler(CommandHandler("pause", cmd_pause))
     app.add_handler(CommandHandler("report", cmd_report))

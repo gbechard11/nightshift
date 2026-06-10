@@ -1,23 +1,32 @@
 """Meta (Facebook/Instagram) Marketing API client for Pedro.
 
-Gives Pedro the primitives to research audiences and build ad campaigns on the
-Nightshift **CAD** ad account, while enforcing one hard rule in code:
+Gives Pedro the primitives to research audiences and build ad campaigns across
+**multiple ad accounts** (e.g. Nightshift Entertainment CAD and Pawn Shop Live),
+while enforcing one hard rule in code:
 
     Nothing this module creates ever goes live on its own.
 
-Every campaign, ad set and ad is created **PAUSED**. The only function that can
-start spend is `activate_campaign()`, and bot.py only calls it after an explicit
-per-campaign approval (the inline-button flow, mirroring /call). Do not add an
-`ACTIVE` status anywhere else.
+Every campaign, ad set and ad is created **PAUSED**. The only functions that can
+start spend are `activate_campaign()` / `activate_full()`, and bot.py only calls
+them after an explicit per-campaign approval (the inline-button flow, mirroring
+/call). Do not add an `ACTIVE` status anywhere else.
 
-Design mirrors whatsapp.py: env config up top, a `configured()` gate, and async
-httpx calls. The module never imports bot.py.
+Multi-account model
+-------------------
+Each ad account is an `AdProfile` carrying its OWN access token, ad-account id,
+Facebook Page id, pixel id, currency and audience names. Profiles are loaded from
+env (see `_load_profiles`). The default profile is `nightshift`, built from the
+legacy `META_*` env vars so existing callers behave exactly as before. Every API
+function takes an optional `acct=<AdProfile>`; when omitted it uses the default
+profile. Adding a new account = add a profile to `META_PROFILES` and set its
+`META_<KEY>_*` env vars. Nothing else changes.
 
-Auth: set META_ACCESS_TOKEN to a long-lived **System User token** with the
-`ads_management` permission (read-only insights only need `ads_read`). The CAD
-ad account id is discovered with `find_ad_accounts()` / scripts/find_cad_account.py
-and then pinned in META_AD_ACCOUNT_ID so we never accidentally touch the USD one.
+Auth: each profile's token is a long-lived **System User token** with the
+`ads_management` permission (read-only insights only need `ads_read`), generated
+in the Business Manager that owns that ad account + page, with those assets
+assigned to the system user.
 """
+import dataclasses
 import logging
 import os
 
@@ -25,17 +34,22 @@ import httpx
 
 log = logging.getLogger("nightshift.meta_ads")
 
+# --------------------------------------------------------------------------
+# Legacy / default (Nightshift) config. These remain the source of truth for the
+# default `nightshift` profile so existing callers and scripts keep working.
+# --------------------------------------------------------------------------
 ACCESS_TOKEN = os.environ.get("META_ACCESS_TOKEN", "")
 # Pinned CAD ad account, e.g. "act_1234567890". Discover it once via
-# scripts/find_cad_account.py, then set it here so we never touch the USD account.
+# scripts/find_meta_assets.py, then set it here so we never touch the USD account.
 AD_ACCOUNT_ID = os.environ.get("META_AD_ACCOUNT_ID", "")
 # Facebook Page ID — required for ad creatives. Find it at facebook.com/your-page → About.
 PAGE_ID = os.environ.get("META_PAGE_ID", "")
+PIXEL_ID = os.environ.get("META_PIXEL_ID", "")
 GRAPH_VERSION = os.environ.get("META_GRAPH_VERSION", "v21.0")
 # Local folder where ad media (flyers, images) are stored. Drop files here and
 # reference them by filename in /draft. Synced from Drive via scripts/drive_sync.py.
 MEDIA_DIR = os.environ.get("META_MEDIA_DIR", "/data/greg/ads")
-# Currency the account MUST be in. A guard against pointing at the wrong account.
+# Currency the default account MUST be in. A guard against pointing at the wrong account.
 REQUIRED_CURRENCY = os.environ.get("META_REQUIRED_CURRENCY", "CAD")
 # Who gets copied on reports / optimization updates (comma-separated).
 REPORT_RECIPIENTS = [
@@ -46,31 +60,160 @@ REPORT_RECIPIENTS = [
 
 GRAPH_BASE = "https://graph.facebook.com/{ver}"
 
+# Default Nightshift custom-audience names (used when a profile doesn't override).
+RETARGET_AUDIENCES = [
+    "NS | Ticket page viewers 180d",
+    "NS | Initiated checkout 180d",
+    "NS | Purchasers 180d",
+    "NS | Website - All visitors 180d",
+    "NS | FB Page engagers 365d",
+]
+LOOKALIKE_AUDIENCES = [
+    "NS | LAL 1% Purchasers (CA)",
+    "NS | LAL 1% Ticket viewers (CA)",
+    "NS | LAL 2% Website visitors (CA)",
+]
+
+# Ticketing domains where a pixel CAN fire (so optimize for purchases) vs not.
+_PIXEL_TRACKABLE = ("ticketweb", "showpass", "eventbrite", "dice.fm", "seetickets")
+_NO_PIXEL = ("ticketmaster", "livenation", "axs.com")
+
 
 class MetaError(Exception):
     """User-facing failure from a Graph API call."""
 
 
-def configured() -> bool:
-    """True if we at least have a token. Account id is needed for writes but not
-    for discovery, so it isn't required here."""
-    return bool(ACCESS_TOKEN)
+# --------------------------------------------------------------------------
+# Ad-account profiles — one per account we can launch from.
+# --------------------------------------------------------------------------
+@dataclasses.dataclass
+class AdProfile:
+    """Everything needed to operate on ONE ad account: its token, ids and naming."""
+    key: str
+    label: str
+    token: str
+    ad_account_id: str
+    page_id: str = ""
+    pixel_id: str = ""
+    currency: str = "CAD"
+    retarget_audiences: list = dataclasses.field(default_factory=list)
+    lookalike_audiences: list = dataclasses.field(default_factory=list)
+    default_countries: list = dataclasses.field(default_factory=lambda: ["CA"])
+
+    @property
+    def has_token(self) -> bool:
+        return bool(self.token)
+
+    @property
+    def ready(self) -> bool:
+        """True if this profile can actually build campaigns (token + account + page)."""
+        return bool(self.token and self.ad_account_id and self.page_id)
+
+    def status_line(self) -> str:
+        if self.ready:
+            state = "✅ ready"
+        elif self.token:
+            missing = [n for n, v in (("account", self.ad_account_id), ("page", self.page_id)) if not v]
+            state = "⚠️ token set, missing " + "+".join(missing)
+        else:
+            state = "❌ not configured (no token)"
+        acct = self.ad_account_id or "—"
+        return f"@{self.key} — {self.label} [{self.currency}] {state} (acct {acct})"
+
+
+def _csv(v: str | None) -> list[str]:
+    return [x.strip() for x in (v or "").split(",") if x.strip()]
+
+
+def _load_profiles() -> dict[str, "AdProfile"]:
+    """Build the profile registry from env.
+
+    `META_PROFILES` is a comma list of profile keys (default "nightshift,pawnshop").
+    The `nightshift` profile is built from the legacy bare `META_*` vars. Every
+    other key `<k>` reads `META_<K>_ACCESS_TOKEN`, `META_<K>_AD_ACCOUNT_ID`,
+    `META_<K>_PAGE_ID`, `META_<K>_PIXEL_ID`, `META_<K>_CURRENCY`, `META_<K>_LABEL`,
+    `META_<K>_RETARGET_AUDIENCES`, `META_<K>_LOOKALIKE_AUDIENCES`, `META_<K>_COUNTRIES`.
+    """
+    keys = _csv(os.environ.get("META_PROFILES", "nightshift,pawnshop")) or ["nightshift"]
+    profiles: dict[str, AdProfile] = {}
+    for key in keys:
+        ku = key.upper()
+        if key == "nightshift":
+            profiles[key] = AdProfile(
+                key="nightshift",
+                label=os.environ.get("META_NIGHTSHIFT_LABEL", "Nightshift Entertainment"),
+                token=ACCESS_TOKEN,
+                ad_account_id=AD_ACCOUNT_ID,
+                page_id=PAGE_ID,
+                pixel_id=PIXEL_ID,
+                currency=REQUIRED_CURRENCY,
+                retarget_audiences=_csv(os.environ.get("META_NIGHTSHIFT_RETARGET_AUDIENCES")) or list(RETARGET_AUDIENCES),
+                lookalike_audiences=_csv(os.environ.get("META_NIGHTSHIFT_LOOKALIKE_AUDIENCES")) or list(LOOKALIKE_AUDIENCES),
+                default_countries=_csv(os.environ.get("META_NIGHTSHIFT_COUNTRIES")) or ["CA"],
+            )
+        else:
+            profiles[key] = AdProfile(
+                key=key,
+                label=os.environ.get(f"META_{ku}_LABEL", key.replace("_", " ").title()),
+                token=os.environ.get(f"META_{ku}_ACCESS_TOKEN", ""),
+                ad_account_id=os.environ.get(f"META_{ku}_AD_ACCOUNT_ID", ""),
+                page_id=os.environ.get(f"META_{ku}_PAGE_ID", ""),
+                pixel_id=os.environ.get(f"META_{ku}_PIXEL_ID", ""),
+                currency=os.environ.get(f"META_{ku}_CURRENCY", "CAD"),
+                retarget_audiences=_csv(os.environ.get(f"META_{ku}_RETARGET_AUDIENCES")),
+                lookalike_audiences=_csv(os.environ.get(f"META_{ku}_LOOKALIKE_AUDIENCES")),
+                default_countries=_csv(os.environ.get(f"META_{ku}_COUNTRIES")) or ["CA"],
+            )
+    return profiles
+
+
+PROFILES: dict[str, AdProfile] = _load_profiles()
+DEFAULT_PROFILE_KEY = next(iter(PROFILES), "nightshift")
+
+
+def list_profiles() -> list[AdProfile]:
+    return list(PROFILES.values())
+
+
+def get_profile(key: str | None) -> AdProfile:
+    """Look up a profile by key (case-insensitive, leading '@' allowed)."""
+    if not key:
+        return PROFILES[DEFAULT_PROFILE_KEY]
+    k = key.strip().lstrip("@").lower()
+    if k not in PROFILES:
+        known = ", ".join("@" + p for p in PROFILES)
+        raise MetaError(f"Unknown ad account '@{k}'. Known accounts: {known}.")
+    return PROFILES[k]
+
+
+def _resolve(acct: "AdProfile | None") -> AdProfile:
+    return acct if acct is not None else PROFILES[DEFAULT_PROFILE_KEY]
+
+
+def configured(acct: "AdProfile | None" = None) -> bool:
+    """True if the (default or given) profile at least has a token. Account id is
+    needed for writes but not for discovery, so it isn't required here."""
+    return bool(_resolve(acct).token)
 
 
 def _base() -> str:
     return GRAPH_BASE.format(ver=GRAPH_VERSION)
 
 
-async def _get(client: httpx.AsyncClient, path: str, params: dict | None = None) -> dict:
+async def _get(
+    client: httpx.AsyncClient, path: str, params: dict | None = None, token: str | None = None
+) -> dict:
     params = dict(params or {})
-    params["access_token"] = ACCESS_TOKEN
+    params["access_token"] = token or ACCESS_TOKEN
     resp = await client.get(f"{_base()}/{path.lstrip('/')}", params=params)
     return _handle(resp)
 
 
-async def _post(client: httpx.AsyncClient, path: str, data: dict) -> dict:
+async def _post(
+    client: httpx.AsyncClient, path: str, data: dict, token: str | None = None
+) -> dict:
     data = dict(data)
-    data["access_token"] = ACCESS_TOKEN
+    data["access_token"] = token or ACCESS_TOKEN
     resp = await client.post(f"{_base()}/{path.lstrip('/')}", data=data)
     return _handle(resp)
 
@@ -88,10 +231,11 @@ def _handle(resp: httpx.Response) -> dict:
 
 
 # --------------------------------------------------------------------------
-# Account discovery — how we find the CAD ad account id.
+# Account discovery — how we find an ad account id for a profile's token.
 # --------------------------------------------------------------------------
-async def find_ad_accounts(client: httpx.AsyncClient) -> list[dict]:
+async def find_ad_accounts(client: httpx.AsyncClient, acct: "AdProfile | None" = None) -> list[dict]:
     """Return every ad account the token can see, with name + currency + status."""
+    a = _resolve(acct)
     out: list[dict] = []
     params = {
         # NB: no `business` field — that requires business_management permission,
@@ -99,7 +243,7 @@ async def find_ad_accounts(client: httpx.AsyncClient) -> list[dict]:
         "fields": "id,account_id,name,currency,account_status",
         "limit": 200,
     }
-    data = await _get(client, "me/adaccounts", params)
+    data = await _get(client, "me/adaccounts", params, token=a.token)
     while True:
         out.extend(data.get("data", []))
         next_url = (data.get("paging") or {}).get("next")
@@ -110,22 +254,29 @@ async def find_ad_accounts(client: httpx.AsyncClient) -> list[dict]:
     return out
 
 
-def pick_required_currency_account(accounts: list[dict]) -> dict:
-    """From a list of accounts, return the single one in REQUIRED_CURRENCY (CAD).
+async def find_pages(client: httpx.AsyncClient, acct: "AdProfile | None" = None) -> list[dict]:
+    """Return every Facebook Page the token can see, with id + name + category."""
+    a = _resolve(acct)
+    data = await _get(client, "me/accounts", {"fields": "id,name,category", "limit": 200}, token=a.token)
+    return data.get("data", [])
+
+
+def pick_required_currency_account(accounts: list[dict], currency: str | None = None) -> dict:
+    """From a list of accounts, return the single one in the required currency.
 
     Raises if there are zero or more than one — we never guess which to spend on.
     """
-    matches = [a for a in accounts if (a.get("currency") or "").upper() == REQUIRED_CURRENCY.upper()]
+    cur = (currency or REQUIRED_CURRENCY).upper()
+    matches = [a for a in accounts if (a.get("currency") or "").upper() == cur]
     if not matches:
         raise MetaError(
-            f"No ad account in {REQUIRED_CURRENCY} found among "
-            f"{[a.get('currency') for a in accounts]}."
+            f"No ad account in {cur} found among {[a.get('currency') for a in accounts]}."
         )
     if len(matches) > 1:
         listing = ", ".join(f"{a.get('id')} ({a.get('name')})" for a in matches)
         raise MetaError(
-            f"Multiple {REQUIRED_CURRENCY} accounts found: {listing}. "
-            f"Set META_AD_ACCOUNT_ID explicitly to the right one."
+            f"Multiple {cur} accounts found: {listing}. "
+            f"Set the account id explicitly."
         )
     return matches[0]
 
@@ -133,19 +284,23 @@ def pick_required_currency_account(accounts: list[dict]) -> dict:
 # --------------------------------------------------------------------------
 # Audience research — read-only, safe.
 # --------------------------------------------------------------------------
-async def search_interests(client: httpx.AsyncClient, query: str, limit: int = 20) -> list[dict]:
+async def search_interests(
+    client: httpx.AsyncClient, query: str, limit: int = 20, acct: "AdProfile | None" = None
+) -> list[dict]:
     """Search Meta's targeting interests (e.g. an artist or genre name).
 
     Returns dicts with id, name, audience_size_lower_bound/upper_bound, path.
     """
+    a = _resolve(acct)
     params = {
         "type": "adinterest",
         "q": query,
         "limit": limit,
         "fields": "id,name,audience_size_lower_bound,audience_size_upper_bound,path,topic",
     }
-    data = await _get(client, "search", params)
+    data = await _get(client, "search", params, token=a.token)
     return data.get("data", [])
+
 
 def build_targeting(
     interest_ids: list[str] | None = None,
@@ -155,7 +310,7 @@ def build_targeting(
     custom_audiences: list[str] | None = None,
     excluded_custom_audiences: list[str] | None = None,
 ) -> dict:
-    """Build a Meta targeting spec. Defaults to Canada (the CAD account's market).
+    """Build a Meta targeting spec. Defaults to Canada.
 
     Centralizes the Graph API targeting shape here so callers (bot.py) don't have
     to know it. `interest_ids` come from search_interests().
@@ -195,6 +350,7 @@ async def research_artist_targeting(
     genre: str | None = None,
     similar_artists: list[str] | None = None,
     label: str | None = None,
+    acct: "AdProfile | None" = None,
 ) -> dict:
     """Aggregate Meta targeting interests for an artist plus optional genre, similar
     artists, and label. Read-only — searches interests and de-dupes them.
@@ -202,6 +358,7 @@ async def research_artist_targeting(
     Returns {"all_ids": [interest_id, ...], "summary": human-readable text}.
     `all_ids` feeds straight into a /draft command; `summary` is shown to the user.
     """
+    a = _resolve(acct)
     queries: list[tuple[str, str]] = [("Artist", artist_name)]
     if genre:
         queries.append(("Genre", genre))
@@ -216,7 +373,7 @@ async def research_artist_targeting(
     sections: list[str] = []
     for tag, q in queries:
         try:
-            results = await search_interests(client, q, limit=15)
+            results = await search_interests(client, q, limit=15, acct=a)
         except MetaError:
             results = []
         # Relevance filter: Meta returns lots of tangential interests for a plain
@@ -259,39 +416,43 @@ async def research_artist_targeting(
 
 
 async def reach_estimate(
-    client: httpx.AsyncClient, targeting: dict, optimization_goal: str = "REACH"
+    client: httpx.AsyncClient,
+    targeting: dict,
+    optimization_goal: str = "REACH",
+    acct: "AdProfile | None" = None,
 ) -> dict:
-    """Estimate the daily reach of a targeting spec on the CAD account.
+    """Estimate the daily reach of a targeting spec on the account.
 
     `targeting` is a Meta targeting spec dict (geo, age, interests, etc.).
     """
-    _require_account()
+    a = _resolve(acct)
+    _require_account(a)
     import json
 
     params = {
         "targeting_spec": json.dumps(targeting),
         "optimization_goal": optimization_goal,
     }
-    data = await _get(client, f"{AD_ACCOUNT_ID}/reachestimate", params)
+    data = await _get(client, f"{a.ad_account_id}/reachestimate", params, token=a.token)
     return data.get("data", data)
 
 
 # --------------------------------------------------------------------------
 # Campaign building — ALWAYS created PAUSED. None of these start spend.
 # --------------------------------------------------------------------------
-def _require_account() -> None:
-    if not AD_ACCOUNT_ID:
+def _require_account(a: AdProfile) -> None:
+    if not a.ad_account_id:
         raise MetaError(
-            "META_AD_ACCOUNT_ID is not set. Run scripts/find_cad_account.py to "
-            "discover the CAD account, then pin it in .env."
+            f"No ad account set for @{a.key} ({a.label}). Run "
+            f"scripts/find_meta_assets.py @{a.key} to discover it, then pin it in .env."
         )
 
 
-def _require_page() -> None:
-    if not PAGE_ID:
+def _require_page(a: AdProfile) -> None:
+    if not a.page_id:
         raise MetaError(
-            "META_PAGE_ID is not set. Add your Facebook Page ID to .env as META_PAGE_ID. "
-            "Find it at facebook.com/your-page → About → Page transparency."
+            f"No Facebook Page set for @{a.key} ({a.label}). Add its Page ID to .env "
+            f"(find it at facebook.com/your-page → About → Page transparency)."
         )
 
 
@@ -300,13 +461,15 @@ async def create_campaign(
     name: str,
     objective: str = "OUTCOME_TRAFFIC",
     special_ad_categories: list[str] | None = None,
+    acct: "AdProfile | None" = None,
 ) -> dict:
     """Create a PAUSED campaign. Returns {'id': ...}.
 
     `special_ad_categories` defaults to [] (none). Meta requires the param to be
     present even when empty.
     """
-    _require_account()
+    a = _resolve(acct)
+    _require_account(a)
     import json
 
     data = {
@@ -319,7 +482,7 @@ async def create_campaign(
         # budget; keeps spend predictable per ad set.
         "is_adset_budget_sharing_enabled": "false",
     }
-    return await _post(client, f"{AD_ACCOUNT_ID}/campaigns", data)
+    return await _post(client, f"{a.ad_account_id}/campaigns", data, token=a.token)
 
 
 async def create_adset(
@@ -332,10 +495,12 @@ async def create_adset(
     billing_event: str = "IMPRESSIONS",
     bid_strategy: str = "LOWEST_COST_WITHOUT_CAP",
     promoted_object: dict | None = None,
+    acct: "AdProfile | None" = None,
 ) -> dict:
     """Create a PAUSED ad set. `daily_budget_cents` is in the account currency's
-    minor units (CAD cents)."""
-    _require_account()
+    minor units (e.g. CAD cents)."""
+    a = _resolve(acct)
+    _require_account(a)
     import json
 
     data = {
@@ -350,7 +515,7 @@ async def create_adset(
     }
     if promoted_object:
         data["promoted_object"] = json.dumps(promoted_object)
-    return await _post(client, f"{AD_ACCOUNT_ID}/adsets", data)
+    return await _post(client, f"{a.ad_account_id}/adsets", data, token=a.token)
 
 
 def resolve_media_path(filename: str) -> str:
@@ -381,14 +546,17 @@ def list_media() -> list[str]:
     return [f.name for f in files]
 
 
-async def upload_ad_image(client: httpx.AsyncClient, file_path: str) -> str:
+async def upload_ad_image(
+    client: httpx.AsyncClient, file_path: str, acct: "AdProfile | None" = None
+) -> str:
     """Upload a local image file to Meta's ad image library.
 
     Returns the image hash string, which can be used in create_adcreative()
     as `image_hash`. Meta deduplicates by content, so uploading the same file
     twice returns the same hash.
     """
-    _require_account()
+    a = _resolve(acct)
+    _require_account(a)
     import base64
     import pathlib
 
@@ -398,9 +566,9 @@ async def upload_ad_image(client: httpx.AsyncClient, file_path: str) -> str:
     data = {
         "bytes": encoded,
         "name": path.name,
-        "access_token": ACCESS_TOKEN,
+        "access_token": a.token,
     }
-    resp = await client.post(f"{_base()}/{AD_ACCOUNT_ID}/adimages", data=data)
+    resp = await client.post(f"{_base()}/{a.ad_account_id}/adimages", data=data)
     body = _handle(resp)
     images = body.get("images", {})
     if not images:
@@ -409,7 +577,7 @@ async def upload_ad_image(client: httpx.AsyncClient, file_path: str) -> str:
     h = info.get("hash")
     if not h:
         raise MetaError(f"Meta image upload succeeded but returned no hash: {info}")
-    log.info("Uploaded %s → hash %s", path.name, h)
+    log.info("Uploaded %s → hash %s (@%s)", path.name, h, a.key)
     return h
 
 
@@ -422,6 +590,7 @@ async def create_adcreative(
     image_url: str | None = None,
     call_to_action_type: str = "GET_EVENT_TICKETS",
     url_tags: str | None = None,
+    acct: "AdProfile | None" = None,
 ) -> dict:
     """Create an ad creative for a ticket-link ad. Returns {'id': ...}.
 
@@ -430,10 +599,11 @@ async def create_adcreative(
     `image_hash` takes priority — use upload_ad_image() to get one from a local file.
     `image_url` is a fallback for remote images.
     If neither is provided, Meta pulls the OG preview from the link.
-    Requires META_PAGE_ID to be set.
+    Requires the profile's Page ID to be set.
     """
-    _require_account()
-    _require_page()
+    a = _resolve(acct)
+    _require_account(a)
+    _require_page(a)
     import json
 
     link_data: dict = {
@@ -450,7 +620,7 @@ async def create_adcreative(
         link_data["picture"] = image_url
 
     story_spec = {
-        "page_id": PAGE_ID,
+        "page_id": a.page_id,
         "link_data": link_data,
     }
     data = {
@@ -465,7 +635,7 @@ async def create_adcreative(
             "&utm_content={{ad.name}}&utm_id={{ad.id}}"
         )
     data["url_tags"] = url_tags
-    return await _post(client, f"{AD_ACCOUNT_ID}/adcreatives", data)
+    return await _post(client, f"{a.ad_account_id}/adcreatives", data, token=a.token)
 
 
 async def create_ad(
@@ -473,9 +643,11 @@ async def create_ad(
     adset_id: str,
     name: str,
     creative_id: str,
+    acct: "AdProfile | None" = None,
 ) -> dict:
     """Create a PAUSED ad from an existing creative id."""
-    _require_account()
+    a = _resolve(acct)
+    _require_account(a)
     import json
 
     data = {
@@ -484,23 +656,29 @@ async def create_ad(
         "creative": json.dumps({"creative_id": creative_id}),
         "status": "PAUSED",  # never ACTIVE here
     }
-    return await _post(client, f"{AD_ACCOUNT_ID}/ads", data)
+    return await _post(client, f"{a.ad_account_id}/ads", data, token=a.token)
 
 
 # --------------------------------------------------------------------------
-# THE SPEND GATE. This is the only function that can start spending money.
-# bot.py must only call it after an explicit per-campaign approval.
+# THE SPEND GATE. These are the only functions that can start spending money.
+# bot.py must only call them after an explicit per-campaign approval.
 # --------------------------------------------------------------------------
-async def activate_campaign(client: httpx.AsyncClient, campaign_id: str) -> dict:
+async def activate_campaign(
+    client: httpx.AsyncClient, campaign_id: str, acct: "AdProfile | None" = None
+) -> dict:
     """Set a campaign ACTIVE — this STARTS SPEND. Caller is responsible for having
     obtained Greg's explicit, per-campaign go-ahead before calling."""
-    log.warning("ACTIVATING campaign %s — spend will begin", campaign_id)
-    return await _post(client, campaign_id, {"status": "ACTIVE"})
+    a = _resolve(acct)
+    log.warning("ACTIVATING campaign %s on @%s — spend will begin", campaign_id, a.key)
+    return await _post(client, campaign_id, {"status": "ACTIVE"}, token=a.token)
 
 
-async def pause_campaign(client: httpx.AsyncClient, campaign_id: str) -> dict:
+async def pause_campaign(
+    client: httpx.AsyncClient, campaign_id: str, acct: "AdProfile | None" = None
+) -> dict:
     """Set a campaign PAUSED — stops spend. Always safe to call."""
-    return await _post(client, campaign_id, {"status": "PAUSED"})
+    a = _resolve(acct)
+    return await _post(client, campaign_id, {"status": "PAUSED"}, token=a.token)
 
 
 # --------------------------------------------------------------------------
@@ -511,46 +689,29 @@ async def get_insights(
     object_id: str,
     date_preset: str = "last_7d",
     fields: str = "campaign_name,impressions,reach,clicks,ctr,cpc,spend,actions",
+    acct: "AdProfile | None" = None,
 ) -> list[dict]:
     """Pull insights for any object (campaign/adset/ad/account id)."""
+    a = _resolve(acct)
     params = {"date_preset": date_preset, "fields": fields, "limit": 200}
-    data = await _get(client, f"{object_id}/insights", params)
+    data = await _get(client, f"{object_id}/insights", params, token=a.token)
     return data.get("data", [])
 
 
 # --------------------------------------------------------------------------
-# Sales campaign framework (added 2026-06-09) — auto-objective + 3-ad-set build.
+# Sales campaign framework — auto-objective + 3-ad-set build.
 # --------------------------------------------------------------------------
-PIXEL_ID = os.environ.get("META_PIXEL_ID", "")
-
-RETARGET_AUDIENCES = [
-    "NS | Ticket page viewers 180d",
-    "NS | Initiated checkout 180d",
-    "NS | Purchasers 180d",
-    "NS | Website - All visitors 180d",
-    "NS | FB Page engagers 365d",
-]
-LOOKALIKE_AUDIENCES = [
-    "NS | LAL 1% Purchasers (CA)",
-    "NS | LAL 1% Ticket viewers (CA)",
-    "NS | LAL 2% Website visitors (CA)",
-]
-
-# Ticketing domains where our pixel CAN fire (so optimize for purchases) vs not.
-_PIXEL_TRACKABLE = ("ticketweb", "showpass", "eventbrite", "dice.fm", "seetickets")
-_NO_PIXEL = ("ticketmaster", "livenation", "axs.com")
-
-
-def plan_objective(ticket_link: str | None) -> dict:
+def plan_objective(ticket_link: str | None, acct: "AdProfile | None" = None) -> dict:
     """Pick objective + optimization for a ticket link's platform.
     Pixel-trackable (TicketWeb/Showpass/...) -> OUTCOME_SALES optimized for PURCHASE.
     Otherwise (Ticketmaster/unknown) -> OUTCOME_TRAFFIC optimized for landing-page views."""
+    a = _resolve(acct)
     link = (ticket_link or "").lower()
-    if PIXEL_ID and any(d in link for d in _PIXEL_TRACKABLE):
+    if a.pixel_id and any(d in link for d in _PIXEL_TRACKABLE):
         return {
             "objective": "OUTCOME_SALES",
             "optimization_goal": "OFFSITE_CONVERSIONS",
-            "promoted_object": {"pixel_id": PIXEL_ID, "custom_event_type": "PURCHASE"},
+            "promoted_object": {"pixel_id": a.pixel_id, "custom_event_type": "PURCHASE"},
             "platform": "pixel-trackable → purchase-optimized",
         }
     return {
@@ -561,10 +722,14 @@ def plan_objective(ticket_link: str | None) -> dict:
     }
 
 
-async def find_audiences(client: httpx.AsyncClient, names: list[str]) -> dict:
+async def find_audiences(
+    client: httpx.AsyncClient, names: list[str], acct: "AdProfile | None" = None
+) -> dict:
     """Return {name: id} for existing custom audiences matching the given names."""
-    data = await _get(client, f"{AD_ACCOUNT_ID}/customaudiences", {"fields": "name", "limit": 500})
-    by = {a.get("name"): a.get("id") for a in data.get("data", [])}
+    a = _resolve(acct)
+    data = await _get(client, f"{a.ad_account_id}/customaudiences",
+                      {"fields": "name", "limit": 500}, token=a.token)
+    by = {x.get("name"): x.get("id") for x in data.get("data", [])}
     return {n: by[n] for n in names if n in by}
 
 
@@ -578,19 +743,24 @@ async def build_show_campaign(
     image_hash: str | None = None,
     image_url: str | None = None,
     countries: list[str] | None = None,
+    acct: "AdProfile | None" = None,
 ) -> dict:
     """Build a PAUSED, sales-structured campaign for one show:
       - objective/optimization auto-picked from the ticket link platform
       - up to 3 ad sets: Retargeting (warm), Lookalike, Cold (interests)
       - one creative, cloned into an ad per ad set
-    Budget split 25/35/40 (retarget/lookalike/cold), min $1/day each. All PAUSED."""
-    plan = plan_objective(ticket_link)
-    camp = await create_campaign(client, name, objective=plan["objective"])
+    Budget split 25/35/40 (retarget/lookalike/cold), min 1.00/day each. All PAUSED.
+    `daily_cad` is in the profile's account currency (kept named for back-compat)."""
+    a = _resolve(acct)
+    countries = countries or a.default_countries
+    plan = plan_objective(ticket_link, acct=a)
+    camp = await create_campaign(client, name, objective=plan["objective"], acct=a)
     campaign_id = camp["id"]
 
-    auds = await find_audiences(client, RETARGET_AUDIENCES + LOOKALIKE_AUDIENCES)
-    retarget_ids = [auds[n] for n in RETARGET_AUDIENCES if n in auds]
-    lal_ids = [auds[n] for n in LOOKALIKE_AUDIENCES if n in auds]
+    aud_names = list(a.retarget_audiences) + list(a.lookalike_audiences)
+    auds = await find_audiences(client, aud_names, acct=a) if aud_names else {}
+    retarget_ids = [auds[n] for n in a.retarget_audiences if n in auds]
+    lal_ids = [auds[n] for n in a.lookalike_audiences if n in auds]
 
     total = int(round(daily_cad * 100))
     splits = {
@@ -605,7 +775,7 @@ async def build_show_campaign(
     }
 
     creative = await create_adcreative(client, f"{name} — creative", ticket_link, caption,
-                                       image_hash=image_hash, image_url=image_url)
+                                       image_hash=image_hash, image_url=image_url, acct=a)
     creative_id = creative["id"]
 
     adsets = []
@@ -615,8 +785,8 @@ async def build_show_campaign(
             continue
         aset = await create_adset(client, campaign_id, f"{name} — {layer}", splits[layer], tgt,
                                   optimization_goal=plan["optimization_goal"],
-                                  promoted_object=plan["promoted_object"])
-        await create_ad(client, aset["id"], f"{name} — {layer} ad", creative_id)
+                                  promoted_object=plan["promoted_object"], acct=a)
+        await create_ad(client, aset["id"], f"{name} — {layer} ad", creative_id, acct=a)
         adsets.append({"layer": layer, "adset_id": aset.get("id"), "daily_cents": splits[layer]})
 
     return {"campaign_id": campaign_id, "objective": plan["objective"],
@@ -624,14 +794,17 @@ async def build_show_campaign(
             "adsets": adsets, "creative_id": creative_id}
 
 
-async def activate_full(client: httpx.AsyncClient, campaign_id: str) -> dict:
+async def activate_full(
+    client: httpx.AsyncClient, campaign_id: str, acct: "AdProfile | None" = None
+) -> dict:
     """Activate a campaign AND all its ad sets + ads (STARTS SPEND). A campaign alone
     going ACTIVE won't deliver if its children are PAUSED, so flip every level."""
-    log.warning("ACTIVATING campaign %s (full: adsets+ads) — spend will begin", campaign_id)
-    adsets = await _get(client, f"{campaign_id}/adsets", {"fields": "id", "limit": 50})
-    for a in adsets.get("data", []):
-        await _post(client, a["id"], {"status": "ACTIVE"})
-        ads = await _get(client, f"{a['id']}/ads", {"fields": "id", "limit": 50})
+    a = _resolve(acct)
+    log.warning("ACTIVATING campaign %s on @%s (full: adsets+ads) — spend will begin", campaign_id, a.key)
+    adsets = await _get(client, f"{campaign_id}/adsets", {"fields": "id", "limit": 50}, token=a.token)
+    for aset in adsets.get("data", []):
+        await _post(client, aset["id"], {"status": "ACTIVE"}, token=a.token)
+        ads = await _get(client, f"{aset['id']}/ads", {"fields": "id", "limit": 50}, token=a.token)
         for ad in ads.get("data", []):
-            await _post(client, ad["id"], {"status": "ACTIVE"})
-    return await _post(client, campaign_id, {"status": "ACTIVE"})
+            await _post(client, ad["id"], {"status": "ACTIVE"}, token=a.token)
+    return await _post(client, campaign_id, {"status": "ACTIVE"}, token=a.token)
