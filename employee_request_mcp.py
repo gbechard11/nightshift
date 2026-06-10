@@ -364,5 +364,92 @@ def view_attachment(path: str) -> Image:
     return Image(path=real)
 
 
+@mcp.tool()
+def blast_stats(query: str = "") -> str:
+    """Report how an email blast is performing: delivered, total clicks, unique
+    clickers, click-through rate, and a per-link breakdown. Use this whenever an
+    employee asks how a blast/eblast is doing (e.g. "how's the DJ Mina blast?").
+
+    `query` matches a campaign by its id, city, or event/subject words (e.g.
+    "mina", "edmonton mina"). Leave blank to list the available blasts.
+    """
+    import glob
+    click_dir = os.path.join(HERE, "blast-clicks")
+    ledger_dir = os.path.join(HERE, "blast-ledger")
+    queue_dir = "/data/greg/blast_queue"
+
+    def _load(path):
+        out = []
+        if os.path.exists(path):
+            with open(path) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        out.append(json.loads(line))
+                    except Exception:
+                        pass
+        return out
+
+    # Real campaigns = ledger files, minus the throwaway preview campaigns.
+    camps = set()
+    for p in glob.glob(os.path.join(ledger_dir, "*.jsonl")):
+        cid = os.path.basename(p)[:-6]
+        if "preview" in cid:
+            continue
+        camps.add(cid)
+    labels = {}
+    for p in glob.glob(os.path.join(queue_dir, "*.json")):
+        try:
+            s = json.load(open(p))
+        except Exception:
+            continue
+        cid = s.get("id") or os.path.basename(p)[:-5]
+        labels[cid] = (str(s.get("subject", "")) + " " + str(s.get("city", ""))).lower()
+
+    if not camps:
+        return "No blasts have gone out yet."
+
+    q = query.strip().lower()
+    if not q:
+        return "Which blast? Here are the campaigns:\n" + "\n".join(
+            "• %s%s" % (c, (" — " + labels[c]) if labels.get(c) else "") for c in sorted(camps))
+
+    matches = [c for c in camps if q in c.lower() or q in labels.get(c, "")]
+    if not matches:
+        toks = q.split()
+        matches = [c for c in camps if all(t in (c.lower() + " " + labels.get(c, "")) for t in toks)]
+    if not matches:
+        return "I couldn't find a blast matching '%s'. Campaigns:\n%s" % (
+            query, "\n".join("• " + c for c in sorted(camps)))
+    if len(matches) > 1:
+        return "Several blasts match '%s' — which one?\n%s" % (
+            query, "\n".join("• " + c for c in sorted(matches)))
+
+    cid = matches[0]
+    clicks = _load(os.path.join(click_dir, cid + ".jsonl"))
+    uniq = {c.get("email", "").lower() for c in clicks if c.get("email")}
+    delivered = {r["recipient"].lower() for r in _load(os.path.join(ledger_dir, cid + ".jsonl"))
+                 if r.get("ok") and r.get("channel") == "email" and r.get("recipient")}
+    d = len(delivered)
+    by_url = {}
+    for c in clicks:
+        by_url[c.get("url", "?")] = by_url.get(c.get("url", "?"), 0) + 1
+
+    out = ["\U0001F4CA Blast: %s" % cid, "Delivered: %s" % f"{d:,}",
+           "Total clicks: %s" % f"{len(clicks):,}",
+           "Unique clickers: %s%s" % (f"{len(uniq):,}",
+                                      f" ({100 * len(uniq) / d:.1f}% click-through)" if d else "")]
+    if by_url:
+        out.append("By link:")
+        for url, n in sorted(by_url.items(), key=lambda x: -x[1])[:5]:
+            out.append("  %s → %s" % (f"{n:,}", url))
+    if not clicks:
+        out.append("(No clicks recorded — either nobody's clicked yet, or this blast "
+                   "went out before click tracking was turned on.)")
+    return "\n".join(out)
+
+
 if __name__ == "__main__":
     mcp.run()
