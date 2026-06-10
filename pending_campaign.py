@@ -5,8 +5,8 @@ but it must NEVER start spend on its own judgment. The draft_ad_campaign MCP too
 builds the PAUSED campaign, stages the launch here, and DMs the employee in
 Telegram with the campaign summary + a Launch / Keep-paused button. Spend starts
 ONLY when the human taps Launch (handled in employee_bot.on_campaign_button),
-which flips the existing PAUSED campaign ACTIVE. The agent can at most surface a
-paused draft to approve; it can never start spend on its own.
+which flips the existing PAUSED campaign ACTIVE on the campaign's own ad account.
+The agent can at most surface a paused draft to approve; it can never start spend.
 
 Disk-backed (one JSON per token) so it works across the bot process and the
 per-message MCP subprocesses, which don't share memory. Mirrors pending_email.py.
@@ -44,14 +44,16 @@ def _path(token: str) -> str:
     return os.path.join(PENDING_DIR, f"{token}.json")
 
 
-def stage(uid, campaign_id, name, daily_cad, summary) -> str:
-    """Persist a pending (already-built, PAUSED) campaign launch; return its token."""
+def stage(uid, campaign_id, name, daily_cad, summary, acct_key="nightshift") -> str:
+    """Persist a pending (already-built, PAUSED) campaign launch; return its token.
+    acct_key records which ad-account profile the campaign lives on so the Launch
+    button activates with the right token."""
     os.makedirs(PENDING_DIR, exist_ok=True)
     token = secrets.token_urlsafe(8)
     rec = {
         "token": token, "uid": int(uid), "campaign_id": campaign_id,
         "name": name, "daily_cad": float(daily_cad), "summary": summary,
-        "ts": int(time.time()),
+        "acct_key": acct_key, "ts": int(time.time()),
     }
     tmp = _path(token) + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
@@ -94,7 +96,7 @@ def send_confirm_prompt(rec) -> bool:
         {"text": "✖️ Keep paused", "callback_data": f"camp:hold:{rec['token']}"},
     ]]}
     text = (rec.get("summary", "") or "Campaign drafted (PAUSED).") + \
-        "\n\nLaunching starts real spend on the Nightshift CAD account. Launch now?"
+        "\n\nLaunching starts real spend on this ad account. Launch now?"
     try:
         data = urllib.parse.urlencode({
             "chat_id": rec["uid"],

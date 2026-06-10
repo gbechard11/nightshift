@@ -674,6 +674,7 @@ async def on_campaign_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
                 "campaign_id": disk["campaign_id"],
                 "name": disk.get("name"),
                 "daily_cad": disk.get("daily_cad", 0.0),
+                "acct_key": disk.get("acct_key"),
             }
     if not draft:
         await query.edit_message_text(
@@ -694,10 +695,13 @@ async def on_campaign_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 
     PENDING_CAMPAIGNS.pop(token, None)
     pending_campaign.discard(token)
-    await query.edit_message_text(f"🚀 Launching campaign {draft['campaign_id']}…")
+    acct = meta_ads.get_profile(draft.get("acct_key"))
+    await query.edit_message_text(
+        f"🚀 Launching campaign {draft['campaign_id']} on {acct.label}…"
+    )
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            await meta_ads.activate_campaign(client, draft["campaign_id"])
+            await meta_ads.activate_campaign(client, draft["campaign_id"], acct=acct)
     except meta_ads.MetaError as e:
         await query.message.reply_text(f"Launch failed (campaign stays paused): {e}")
         return
@@ -706,8 +710,8 @@ async def on_campaign_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         await query.message.reply_text(f"Launch error (campaign stays paused): {e}")
         return
     await query.message.reply_text(
-        f"✅ Campaign {draft['campaign_id']} is ACTIVE, spending up to "
-        f"${draft['daily_cad']:.2f} CAD/day.\n"
+        f"✅ Campaign {draft['campaign_id']} is ACTIVE on {acct.label}, spending up to "
+        f"${draft['daily_cad']:.2f} {acct.currency}/day.\n"
         f"Pause anytime with /pause {draft['campaign_id']}."
     )
     asyncio.create_task(asyncio.to_thread(
