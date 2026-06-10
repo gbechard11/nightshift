@@ -327,6 +327,9 @@ def build_targeting(
         spec["custom_audiences"] = [{"id": a} for a in custom_audiences]
     if excluded_custom_audiences:
         spec["excluded_custom_audiences"] = [{"id": a} for a in excluded_custom_audiences]
+    # Meta now requires an explicit Advantage Audience decision. 0 = respect our exact
+    # audience definitions (no algorithmic expansion); right for retarget/lookalike.
+    spec["targeting_automation"] = {"advantage_audience": 0}
     return spec
 
 
