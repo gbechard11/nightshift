@@ -396,7 +396,7 @@ def blast_stats(query: str = "") -> str:
     camps = set()
     for p in glob.glob(os.path.join(ledger_dir, "*.jsonl")):
         cid = os.path.basename(p)[:-6]
-        if "preview" in cid:
+        if any(x in cid.lower() for x in ("preview", "test", "sandbox", "firetest")):
             continue
         camps.add(cid)
     labels = {}
