@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """Check for new work emails to greg@nightshiftent.ca and push Telegram summaries.
-Runs every 5 minutes via cron. Tracks notified IDs in /data/greg/email_notified.json.
+Runs every 5 minutes via cron. Tracks notified UIDs in /data/greg/email_notified.json.
+
+Scoped to recent mail only (SINCE window) so a large unseen backlog is never
+processed. First run seeds the current window as already-seen and sends nothing,
+so only mail arriving after setup is notified. A non-blocking flock prevents
+overlapping cron runs from piling up / double-notifying.
 """
 from __future__ import annotations
 
 import email as email_lib
 import email.policy
+import fcntl
 import imaplib
 import json
 import os
@@ -14,11 +20,17 @@ import subprocess
 import sys
 import urllib.request
 import urllib.parse
+from datetime import datetime, timedelta
 from pathlib import Path
 
 
 SEEN_FILE = Path("/data/greg/email_notified.json")
+LOCK_FILE = "/tmp/email_notify.lock"
 WORK_ADDRESS = "greg@nightshiftent.ca"
+# Only look at mail received within this many days. Keeps the large unseen
+# backlog permanently out of scope; new arrivals always fall inside it.
+WINDOW_DAYS = 2
+SEEN_CAP = 1000
 
 NOISE_SENDERS = [
     "uber", "hyatt", "hotels.com", "godaddy", "printful", "constantcontact",
@@ -58,7 +70,7 @@ def load_seen() -> set:
 
 
 def save_seen(seen: set) -> None:
-    ids = list(seen)[-500:]
+    ids = list(seen)[-SEEN_CAP:]
     SEEN_FILE.write_text(json.dumps(ids))
 
 
@@ -154,35 +166,56 @@ def main() -> None:
     if not imap_user or not imap_pass:
         sys.exit(0)
 
+    first_run = not SEEN_FILE.exists()
     seen = load_seen()
     new_msgs = []
+    since = (datetime.now() - timedelta(days=WINDOW_DAYS)).strftime("%d-%b-%Y")
 
     try:
         with imaplib.IMAP4_SSL(imap_host, imap_port) as m:
             m.login(imap_user, imap_pass)
             m.select("INBOX", readonly=True)
-            _, data = m.search(None, "UNSEEN")
-            ids = data[0].split()
-            for msg_id in ids:
-                mid = msg_id.decode()
-                if mid in seen:
-                    continue
-                _, msg_data = m.fetch(msg_id, "(RFC822)")
-                raw = msg_data[0][1]
-                parsed = email_lib.message_from_bytes(raw, policy=email_lib.policy.default)
-                sender = decode_header_str(parsed.get("From", ""))
-                subject = decode_header_str(parsed.get("Subject", ""))
+            _, data = m.uid("search", None, "UNSEEN", "SINCE", since)
+            uids = data[0].split()
 
-                if not is_work_email(parsed):
-                    seen.add(mid)
+            # First run: seed the current recent window as already-seen and send
+            # nothing, so we never blast pre-existing mail.
+            if first_run:
+                for u in uids:
+                    seen.add(u.decode())
+                save_seen(seen)
+                print(f"First run: seeded {len(uids)} recent unseen UIDs in last "
+                      f"{WINDOW_DAYS}d (since {since}); no notifications sent.")
+                return
+
+            for u in uids:
+                uid = u.decode()
+                if uid in seen:
+                    continue
+                # Cheap header-only fetch first for filtering.
+                _, hdr_data = m.uid("fetch", uid, "(BODY.PEEK[HEADER])")
+                if not hdr_data or not hdr_data[0]:
+                    seen.add(uid)
+                    continue
+                raw_hdr = hdr_data[0][1]
+                hparsed = email_lib.message_from_bytes(raw_hdr, policy=email_lib.policy.default)
+                sender = decode_header_str(hparsed.get("From", ""))
+                subject = decode_header_str(hparsed.get("Subject", ""))
+
+                if not is_work_email(hparsed):
+                    seen.add(uid)
                     continue
                 if is_noise(sender, subject):
-                    seen.add(mid)
+                    seen.add(uid)
                     continue
 
+                # Survivor: fetch full message for the body.
+                _, msg_data = m.uid("fetch", uid, "(BODY.PEEK[])")
+                raw = msg_data[0][1]
+                parsed = email_lib.message_from_bytes(raw, policy=email_lib.policy.default)
                 body = extract_body(parsed)
-                new_msgs.append((mid, sender, subject, body))
-                seen.add(mid)
+                new_msgs.append((uid, sender, subject, body))
+                seen.add(uid)
     except Exception as e:
         print(f"IMAP error: {e}", file=sys.stderr)
         sys.exit(1)
@@ -193,7 +226,7 @@ def main() -> None:
         name = re.sub(r"\s*<.*?>", "", sender).strip() or sender
         summary = summarize_email(sender, subject, body)
         text = (
-            f"📬 <b>New work email</b>\n"
+            f"\U0001F4EC <b>New work email</b>\n"
             f"<b>From:</b> {name}\n"
             f"<b>Subject:</b> {subject}\n\n"
             f"{summary}"
@@ -205,4 +238,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    lock_fp = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit(0)
     main()
