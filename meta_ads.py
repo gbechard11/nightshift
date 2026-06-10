@@ -302,9 +302,37 @@ async def search_interests(
     return data.get("data", [])
 
 
+async def search_locations(
+    client: httpx.AsyncClient,
+    query: str,
+    country_codes: list[str] | None = None,
+    location_types: list[str] | None = None,
+    limit: int = 10,
+    acct: "AdProfile | None" = None,
+) -> list[dict]:
+    """Search Meta's geo-location targeting database, scoped to Canada by default.
+
+    Passing country_codes=["CA"] ensures "Edmonton" resolves to Alberta, not Venezuela.
+    Returns dicts with key, name, region, country_code, type, region_id.
+    """
+    a = _resolve(acct)
+    params: dict = {
+        "type": "adgeolocation",
+        "q": query,
+        "limit": limit,
+    }
+    for i, cc in enumerate(country_codes or ["CA"]):
+        params[f"country_codes[{i}]"] = cc
+    for i, lt in enumerate(location_types or ["city"]):
+        params[f"location_types[{i}]"] = lt
+    data = await _get(client, "search", params, token=a.token)
+    return data.get("data", [])
+
+
 def build_targeting(
     interest_ids: list[str] | None = None,
     countries: list[str] | None = None,
+    cities: list[dict] | None = None,
     age_min: int = 18,
     age_max: int = 65,
     custom_audiences: list[str] | None = None,
@@ -314,9 +342,16 @@ def build_targeting(
 
     Centralizes the Graph API targeting shape here so callers (bot.py) don't have
     to know it. `interest_ids` come from search_interests().
+    `cities` is a list of dicts like {"key": "293225", "radius": 40, "distance_unit": "kilometer"}
+    from search_locations(). When cities is provided it takes precedence over countries — use it
+    for city-specific campaigns so "Edmonton" never resolves to a non-Canadian city.
     """
+    if cities:
+        geo: dict = {"cities": cities}
+    else:
+        geo = {"countries": countries or ["CA"]}
     spec: dict = {
-        "geo_locations": {"countries": countries or ["CA"]},
+        "geo_locations": geo,
         "age_min": age_min,
         "age_max": age_max,
     }
