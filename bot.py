@@ -182,6 +182,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if _is_owner(update):
         await update.message.reply_text(
             "Owner tools:\n"
+            "/triage [days|full] - inbox attention queue: unanswered, real-person "
+            "mail, deal-critical first (read-only; default 90 days)\n"
             "/wire <recipient> <amount_usd> - prep an Agility Forex wire "
             "(info only, never sends money)\n"
             "/wire list - known wire recipients"
@@ -1161,6 +1163,42 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _call_claude(update, ctx, text)
 
 
+TRIAGE_SCRIPT = "/home/gregnightshift/nightshift/scripts/attention_triage.py"
+
+
+async def cmd_triage(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only, read-only: surface unanswered, real-person inbox mail,
+    deal-critical first. /triage [days] [full]  (default: 90-day brief)."""
+    if not _is_owner(update):
+        return
+    days, mode = "90", "brief"
+    for a in ctx.args or []:
+        if a.isdigit():
+            days = a
+        elif a.lower() in ("full", "all", "more"):
+            mode = "full"
+        else:
+            await update.message.reply_text(
+                "Usage: /triage [days] [full]  e.g. /triage 30  ·  /triage full"
+            )
+            return
+    cmd = ["/usr/bin/python3", TRIAGE_SCRIPT, "--days", days]
+    cmd += ["--brief"] if mode == "brief" else ["--top", "50"]
+    await ctx.bot.send_chat_action(update.message.chat_id, ChatAction.TYPING)
+    try:
+        proc = await asyncio.to_thread(
+            subprocess.run, cmd, capture_output=True, text=True, timeout=240
+        )
+    except subprocess.TimeoutExpired:
+        await update.message.reply_text(
+            "⏳ Triage timed out scanning the inbox. Try a shorter window, e.g. /triage 30."
+        )
+        return
+    out = (proc.stdout or "").strip() or (proc.stderr or "").strip() or "No output."
+    for i in range(0, len(out), TELEGRAM_MAX_MSG):
+        await update.message.reply_text(out[i:i + TELEGRAM_MAX_MSG])
+
+
 async def cmd_whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     u = update.effective_user
     await update.message.reply_text(
@@ -1386,6 +1424,7 @@ def main() -> None:
     app.add_handler(CommandHandler("show", cmd_show))
     app.add_handler(CommandHandler("settlement", cmd_settlement))
     app.add_handler(CommandHandler("wire", cmd_wire))
+    app.add_handler(CommandHandler("triage", cmd_triage))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
