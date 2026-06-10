@@ -374,6 +374,7 @@ def blast_stats(query: str = "") -> str:
     "mina", "edmonton mina"). Leave blank to list the available blasts.
     """
     import glob
+    import json
     click_dir = os.path.join(HERE, "blast-clicks")
     ledger_dir = os.path.join(HERE, "blast-ledger")
     queue_dir = "/data/greg/blast_queue"
