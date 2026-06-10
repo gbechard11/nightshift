@@ -4,10 +4,11 @@
 # Installed in gregnightshift's crontab.
 set -euo pipefail
 
+PY=/home/gregnightshift/nightshift/.venv/bin/python
 TRIAGE=/home/gregnightshift/nightshift/scripts/attention_triage.py
 SEND=/home/gregnightshift/nightshift/scripts/telegram_send.py
 
-OUT="$(/usr/bin/python3 "$TRIAGE" --brief 2>/dev/null || true)"
+OUT="$("$PY" "$TRIAGE" --brief 2>/dev/null || true)"
 [ -z "$OUT" ] && OUT="🗂️ Attention triage: no output this morning (pipeline may need a look)."
 
-/usr/bin/python3 "$SEND" --to greg --msg "$OUT"
+"$PY" "$SEND" --to greg --msg "$OUT"

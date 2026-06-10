@@ -1164,6 +1164,7 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 TRIAGE_SCRIPT = "/home/gregnightshift/nightshift/scripts/attention_triage.py"
+TRIAGE_PYTHON = "/home/gregnightshift/nightshift/.venv/bin/python"
 
 
 async def cmd_triage(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1182,7 +1183,7 @@ async def cmd_triage(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 "Usage: /triage [days] [full]  e.g. /triage 30  ·  /triage full"
             )
             return
-    cmd = ["/usr/bin/python3", TRIAGE_SCRIPT, "--days", days]
+    cmd = [TRIAGE_PYTHON, TRIAGE_SCRIPT, "--days", days]
     cmd += ["--brief"] if mode == "brief" else ["--top", "50"]
     await ctx.bot.send_chat_action(update.message.chat_id, ChatAction.TYPING)
     try:
