@@ -152,6 +152,8 @@ def build_targeting(
     countries: list[str] | None = None,
     age_min: int = 18,
     age_max: int = 65,
+    custom_audiences: list[str] | None = None,
+    excluded_custom_audiences: list[str] | None = None,
 ) -> dict:
     """Build a Meta targeting spec. Defaults to Canada (the CAD account's market).
 
@@ -166,6 +168,10 @@ def build_targeting(
     ids = [str(i).strip() for i in (interest_ids or []) if str(i).strip()]
     if ids:
         spec["flexible_spec"] = [{"interests": [{"id": i} for i in ids]}]
+    if custom_audiences:
+        spec["custom_audiences"] = [{"id": a} for a in custom_audiences]
+    if excluded_custom_audiences:
+        spec["excluded_custom_audiences"] = [{"id": a} for a in excluded_custom_audiences]
     return spec
 
 
@@ -325,6 +331,7 @@ async def create_adset(
     optimization_goal: str = "LINK_CLICKS",
     billing_event: str = "IMPRESSIONS",
     bid_strategy: str = "LOWEST_COST_WITHOUT_CAP",
+    promoted_object: dict | None = None,
 ) -> dict:
     """Create a PAUSED ad set. `daily_budget_cents` is in the account currency's
     minor units (CAD cents)."""
@@ -341,6 +348,8 @@ async def create_adset(
         "targeting": json.dumps(targeting),
         "status": "PAUSED",  # never ACTIVE here
     }
+    if promoted_object:
+        data["promoted_object"] = json.dumps(promoted_object)
     return await _post(client, f"{AD_ACCOUNT_ID}/adsets", data)
 
 
@@ -411,7 +420,7 @@ async def create_adcreative(
     caption: str,
     image_hash: str | None = None,
     image_url: str | None = None,
-    call_to_action_type: str = "GET_TICKETS",
+    call_to_action_type: str = "GET_EVENT_TICKETS",
     url_tags: str | None = None,
 ) -> dict:
     """Create an ad creative for a ticket-link ad. Returns {'id': ...}.
@@ -507,3 +516,122 @@ async def get_insights(
     params = {"date_preset": date_preset, "fields": fields, "limit": 200}
     data = await _get(client, f"{object_id}/insights", params)
     return data.get("data", [])
+
+
+# --------------------------------------------------------------------------
+# Sales campaign framework (added 2026-06-09) — auto-objective + 3-ad-set build.
+# --------------------------------------------------------------------------
+PIXEL_ID = os.environ.get("META_PIXEL_ID", "")
+
+RETARGET_AUDIENCES = [
+    "NS | Ticket page viewers 180d",
+    "NS | Initiated checkout 180d",
+    "NS | Purchasers 180d",
+    "NS | Website - All visitors 180d",
+    "NS | FB Page engagers 365d",
+]
+LOOKALIKE_AUDIENCES = [
+    "NS | LAL 1% Purchasers (CA)",
+    "NS | LAL 1% Ticket viewers (CA)",
+    "NS | LAL 2% Website visitors (CA)",
+]
+
+# Ticketing domains where our pixel CAN fire (so optimize for purchases) vs not.
+_PIXEL_TRACKABLE = ("ticketweb", "showpass", "eventbrite", "dice.fm", "seetickets")
+_NO_PIXEL = ("ticketmaster", "livenation", "axs.com")
+
+
+def plan_objective(ticket_link: str | None) -> dict:
+    """Pick objective + optimization for a ticket link's platform.
+    Pixel-trackable (TicketWeb/Showpass/...) -> OUTCOME_SALES optimized for PURCHASE.
+    Otherwise (Ticketmaster/unknown) -> OUTCOME_TRAFFIC optimized for landing-page views."""
+    link = (ticket_link or "").lower()
+    if PIXEL_ID and any(d in link for d in _PIXEL_TRACKABLE):
+        return {
+            "objective": "OUTCOME_SALES",
+            "optimization_goal": "OFFSITE_CONVERSIONS",
+            "promoted_object": {"pixel_id": PIXEL_ID, "custom_event_type": "PURCHASE"},
+            "platform": "pixel-trackable → purchase-optimized",
+        }
+    return {
+        "objective": "OUTCOME_TRAFFIC",
+        "optimization_goal": "LANDING_PAGE_VIEWS",
+        "promoted_object": None,
+        "platform": "no pixel → landing-page-view optimized",
+    }
+
+
+async def find_audiences(client: httpx.AsyncClient, names: list[str]) -> dict:
+    """Return {name: id} for existing custom audiences matching the given names."""
+    data = await _get(client, f"{AD_ACCOUNT_ID}/customaudiences", {"fields": "name", "limit": 500})
+    by = {a.get("name"): a.get("id") for a in data.get("data", [])}
+    return {n: by[n] for n in names if n in by}
+
+
+async def build_show_campaign(
+    client: httpx.AsyncClient,
+    name: str,
+    daily_cad: float,
+    ticket_link: str,
+    caption: str,
+    interest_ids: list[str] | None = None,
+    image_hash: str | None = None,
+    image_url: str | None = None,
+    countries: list[str] | None = None,
+) -> dict:
+    """Build a PAUSED, sales-structured campaign for one show:
+      - objective/optimization auto-picked from the ticket link platform
+      - up to 3 ad sets: Retargeting (warm), Lookalike, Cold (interests)
+      - one creative, cloned into an ad per ad set
+    Budget split 25/35/40 (retarget/lookalike/cold), min $1/day each. All PAUSED."""
+    plan = plan_objective(ticket_link)
+    camp = await create_campaign(client, name, objective=plan["objective"])
+    campaign_id = camp["id"]
+
+    auds = await find_audiences(client, RETARGET_AUDIENCES + LOOKALIKE_AUDIENCES)
+    retarget_ids = [auds[n] for n in RETARGET_AUDIENCES if n in auds]
+    lal_ids = [auds[n] for n in LOOKALIKE_AUDIENCES if n in auds]
+
+    total = int(round(daily_cad * 100))
+    splits = {
+        "Retargeting": max(100, int(total * 0.25)),
+        "Lookalike": max(100, int(total * 0.35)),
+        "Cold": max(100, int(total * 0.40)),
+    }
+    targetings = {
+        "Retargeting": build_targeting(custom_audiences=retarget_ids, countries=countries) if retarget_ids else None,
+        "Lookalike": build_targeting(custom_audiences=lal_ids, excluded_custom_audiences=retarget_ids, countries=countries) if lal_ids else None,
+        "Cold": build_targeting(interest_ids=interest_ids, excluded_custom_audiences=retarget_ids + lal_ids, countries=countries),
+    }
+
+    creative = await create_adcreative(client, f"{name} — creative", ticket_link, caption,
+                                       image_hash=image_hash, image_url=image_url)
+    creative_id = creative["id"]
+
+    adsets = []
+    for layer in ("Retargeting", "Lookalike", "Cold"):
+        tgt = targetings[layer]
+        if not tgt:
+            continue
+        aset = await create_adset(client, campaign_id, f"{name} — {layer}", splits[layer], tgt,
+                                  optimization_goal=plan["optimization_goal"],
+                                  promoted_object=plan["promoted_object"])
+        await create_ad(client, aset["id"], f"{name} — {layer} ad", creative_id)
+        adsets.append({"layer": layer, "adset_id": aset.get("id"), "daily_cents": splits[layer]})
+
+    return {"campaign_id": campaign_id, "objective": plan["objective"],
+            "optimization": plan["optimization_goal"], "platform": plan["platform"],
+            "adsets": adsets, "creative_id": creative_id}
+
+
+async def activate_full(client: httpx.AsyncClient, campaign_id: str) -> dict:
+    """Activate a campaign AND all its ad sets + ads (STARTS SPEND). A campaign alone
+    going ACTIVE won't deliver if its children are PAUSED, so flip every level."""
+    log.warning("ACTIVATING campaign %s (full: adsets+ads) — spend will begin", campaign_id)
+    adsets = await _get(client, f"{campaign_id}/adsets", {"fields": "id", "limit": 50})
+    for a in adsets.get("data", []):
+        await _post(client, a["id"], {"status": "ACTIVE"})
+        ads = await _get(client, f"{a['id']}/ads", {"fields": "id", "limit": 50})
+        for ad in ads.get("data", []):
+            await _post(client, ad["id"], {"status": "ACTIVE"})
+    return await _post(client, campaign_id, {"status": "ACTIVE"})
