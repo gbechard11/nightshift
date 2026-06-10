@@ -454,3 +454,226 @@ def blast_stats(query: str = "") -> str:
 
 if __name__ == "__main__":
     mcp.run()
+
+
+# ---------------------------------------------------------------------------
+# Meta ads — let the chat agent draft a campaign conversationally (no slash
+# commands). Everything is built PAUSED; spend is gated by a Telegram Launch
+# button (pending_campaign -> employee_bot.on_campaign_button). Mirrors the
+# email_send stage->confirm pattern: the agent can surface a paused draft to
+# approve, but can never start spend itself.
+# ---------------------------------------------------------------------------
+import asyncio  # noqa: E402
+import httpx  # noqa: E402
+import meta_ads  # noqa: E402
+import pending_campaign  # noqa: E402
+
+_AD_IMG_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+
+
+async def _resolve_creative_image(client, image: str):
+    """Return (image_hash, image_url, label) for the ad creative image.
+
+    Accepts an http(s) URL, an ad-media filename (list_ad_media), a path under the
+    chat inbox dir (an image the employee just dropped), or a Google Drive file id.
+    Returns (None, None, None) when no image is given."""
+    image = (image or "").strip()
+    if not image:
+        return None, None, None
+    if image.startswith("http"):
+        return None, image, image
+    _, ext = os.path.splitext(image)
+    if ext.lower() in _AD_IMG_EXTS:
+        path = None
+        try:
+            path = meta_ads.resolve_media_path(image)
+        except Exception:
+            cand = os.path.join(INBOX_DIR, os.path.basename(image))
+            if os.path.exists(cand):
+                path = cand
+        if not path:
+            raise ValueError("image file not found in ad media or inbox: %s" % image)
+        h = await meta_ads.upload_ad_image(client, path)
+        return h, None, os.path.basename(path)
+    # otherwise treat it as a Drive file id -> download, then upload to Meta
+    work = os.path.join(DL_DIR, "adimg_" + secrets.token_hex(6))
+    os.makedirs(work, exist_ok=True)
+    try:
+        raw = os.path.join(work, "raw")
+        msg = _gdrive(["download", "--file-id", image, "--out", raw])
+        if not os.path.exists(raw):
+            raise ValueError("couldn't download image from Drive id %s: %s" % (image, msg))
+        h = await meta_ads.upload_ad_image(client, raw)
+        return h, None, "Drive:" + image
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+async def _build_campaign(name, daily_cad, interest_ids, objective, ticket_link, caption, image):
+    daily_cents = int(round(daily_cad * 100))
+    targeting = meta_ads.build_targeting(interest_ids)
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        camp = await meta_ads.create_campaign(client, name, objective=objective)
+        campaign_id = camp.get("id")
+        if not campaign_id:
+            raise ValueError("Meta returned no campaign id: %s" % camp)
+        adset = await meta_ads.create_adset(
+            client, campaign_id, f"{name} — ad set", daily_cents, targeting
+        )
+        adset_id = adset.get("id")
+        creative_id = ad_id = image_label = creative_error = None
+        if ticket_link and caption and adset_id:
+            try:
+                image_hash, image_url, image_label = await _resolve_creative_image(client, image)
+                creative = await meta_ads.create_adcreative(
+                    client, f"{name} — creative", ticket_link, caption,
+                    image_hash=image_hash, image_url=image_url,
+                )
+                creative_id = creative.get("id")
+                if creative_id:
+                    ad = await meta_ads.create_ad(client, adset_id, f"{name} — ad", creative_id)
+                    ad_id = ad.get("id")
+            except Exception as ce:  # noqa: BLE001
+                creative_error = str(ce)
+        try:
+            est = await meta_ads.reach_estimate(client, targeting)
+        except Exception:  # noqa: BLE001
+            est = None
+    return {
+        "campaign_id": campaign_id, "objective": objective, "creative_id": creative_id,
+        "ad_id": ad_id, "image_label": image_label, "creative_error": creative_error, "est": est,
+    }
+
+
+def _reach_line(est) -> str:
+    if not isinstance(est, dict):
+        return ""
+    users = est.get("users") or est.get("estimate_mau") or est.get("estimate_dau")
+    if isinstance(users, (int, float)):
+        return "Est. audience: ~{:,}".format(int(users))
+    return ""
+
+
+@mcp.tool()
+def list_ad_media() -> str:
+    """List image filenames available in the server's ad-media folder, for use as
+    the `image` argument to draft_ad_campaign."""
+    files = meta_ads.list_media()
+    if not files:
+        return ("No ad-media files on the server. Use an http image URL, a Google Drive "
+                "file id, or have the employee drop the image in this chat instead.")
+    return "Ad media available:\n" + "\n".join("• " + f for f in files)
+
+
+@mcp.tool()
+def research_audience(artist: str, genre: str = "", similar: str = "") -> str:
+    """Find Meta targeting interest ids for an artist (plus optional genre and
+    comma-separated similar artists). Read-only. The returned interest ids feed
+    straight into draft_ad_campaign's `interest_ids`."""
+    if not meta_ads.configured():
+        return "Meta ads aren't configured on this account yet — tell Greg."
+    sims = [s.strip() for s in str(similar).replace(";", ",").split(",") if s.strip()]
+
+    async def _go():
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            return await meta_ads.research_artist_targeting(
+                client, artist, genre=genre or None, similar_artists=sims or None
+            )
+    try:
+        res = asyncio.run(_go())
+    except Exception as e:  # noqa: BLE001
+        return "Research failed: %s" % e
+    ids = res.get("all_ids", [])
+    summary = res.get("summary", "") or ""
+    return "%s\n\nInterest ids (pass to draft_ad_campaign): %s" % (summary, ",".join(ids))
+
+
+@mcp.tool()
+def draft_ad_campaign(name: str, daily_cad: float, interest_ids: str = "",
+                      objective: str = "OUTCOME_TRAFFIC", ticket_link: str = "",
+                      caption: str = "", image: str = "") -> str:
+    """Build a Meta (Facebook/Instagram) ad campaign on the Nightshift account.
+
+    Use this WHENEVER an employee asks you to make / build / run / launch / boost a
+    Facebook or Instagram ad or campaign. You can do this yourself — do NOT say you
+    have no Meta access and do NOT punt to Greg. The campaign is always created
+    PAUSED (no spend); the employee then gets a Launch button in Telegram and spend
+    starts ONLY when they tap it. So building a draft is always safe.
+
+    Args:
+      - name: short campaign name, e.g. "Ownboss YEG".
+      - daily_cad: DAILY budget in CAD dollars (e.g. 7). If the employee gives a
+        TOTAL budget over N days/weeks, divide it (total / days) and confirm the
+        daily number and run length with them before calling.
+      - interest_ids: OPTIONAL comma-separated Meta interest ids from
+        research_audience. Leave empty for broad Canada-wide targeting.
+      - objective: OUTCOME_TRAFFIC (default; link clicks to tickets) or
+        OUTCOME_AWARENESS (reach).
+      - ticket_link + caption: include BOTH to attach a clickable ad creative.
+        Omit both to create just the campaign + ad set (copy added later).
+      - image: OPTIONAL creative image — an http image URL, a Google Drive file id
+        (from drive_find), an ad-media filename (from list_ad_media), or the
+        filename of an image the employee just dropped in this chat.
+
+    Note: Meta's daily budget has a minimum (about $1.50–$5 CAD/day depending on
+    objective); if Meta rejects a tiny budget, raise daily_cad and retry.
+    """
+    rid = _uid()
+    if not rid:
+        return "I couldn't identify who's asking. Ask them to message me in the NS Team Bot."
+    if not meta_ads.configured():
+        return "Meta ads aren't configured on this account yet — tell Greg."
+    try:
+        daily = float(daily_cad)
+    except (TypeError, ValueError):
+        return "daily_cad must be a number of CAD dollars (e.g. 7)."
+    if daily <= 0:
+        return "daily_cad must be greater than 0."
+    if not str(name).strip():
+        return "Give the campaign a short name."
+    ids = [x.strip() for x in str(interest_ids).replace(";", ",").split(",") if x.strip()]
+    try:
+        res = asyncio.run(_build_campaign(
+            str(name).strip(), daily, ids, (objective or "OUTCOME_TRAFFIC").strip(),
+            str(ticket_link).strip(), str(caption).strip(), str(image).strip(),
+        ))
+    except Exception as e:  # noqa: BLE001
+        return "Draft failed (nothing was launched, no spend started): %s" % e
+
+    lines = [
+        "\U0001F4CB Campaign drafted — PAUSED, not spending:",
+        "",
+        "Name: %s" % str(name).strip(),
+        "Campaign id: %s" % res["campaign_id"],
+        "Objective: %s" % res["objective"],
+        "Daily budget: $%.2f CAD" % daily,
+        "Interests: %s" % (", ".join(ids) or "(none — broad Canada)"),
+        "Geo: Canada",
+    ]
+    if res["creative_id"]:
+        lines.append("Creative id: %s" % res["creative_id"])
+        lines.append("Ticket link: %s" % str(ticket_link).strip())
+        if res["image_label"]:
+            lines.append("Image: %s" % res["image_label"])
+    elif res["creative_error"]:
+        lines.append("Creative: FAILED — %s (campaign + ad set still created)" % res["creative_error"])
+    elif not (str(ticket_link).strip() and str(caption).strip()):
+        lines.append("Creative: none (give a ticket link + caption to attach a clickable ad)")
+    rl = _reach_line(res["est"])
+    if rl:
+        lines.append(rl)
+    summary = "\n".join(lines)
+
+    token = pending_campaign.stage(int(rid), res["campaign_id"], str(name).strip(), daily, summary)
+    ok = pending_campaign.send_confirm_prompt(pending_campaign.load(token))
+    if not ok:
+        return ("Campaign %s is built and PAUSED, but I couldn't reach you on Telegram with the "
+                "Launch button. Open the NS Team Bot (send /start) and ask me to try again, or "
+                "launch it from Ads Manager." % res["campaign_id"])
+    extra = ""
+    if res.get("creative_error"):
+        extra = (" The campaign + ad set were created, but the ad creative failed (%s) — "
+                 "mention that to the employee." % res["creative_error"])
+    return ("Built and staged — the campaign is PAUSED (no spend). I've sent the summary to your "
+            "Telegram with a Launch button; spend only starts when you tap Launch. Do NOT tell the "
+            "user it is already live." + extra)

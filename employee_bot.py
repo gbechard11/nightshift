@@ -59,6 +59,7 @@ import employee_notes
 import imap_email
 import mailer
 import pending_email
+import pending_campaign
 from pedro_brain import PedroError, run_claude
 
 TOKEN = os.environ["EMPLOYEE_BOT_TOKEN"]
@@ -665,13 +666,24 @@ async def on_campaign_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 
     draft = PENDING_CAMPAIGNS.get(token)
     if not draft:
+        disk = pending_campaign.load(token)
+        if disk:
+            if disk.get("uid") and update.effective_user.id != disk["uid"]:
+                return  # only the employee who staged it may launch it
+            draft = {
+                "campaign_id": disk["campaign_id"],
+                "name": disk.get("name"),
+                "daily_cad": disk.get("daily_cad", 0.0),
+            }
+    if not draft:
         await query.edit_message_text(
-            "This draft expired. The campaign is still PAUSED and safe. Re-draft with /draft."
+            "This draft expired. The campaign is still PAUSED and safe. Re-draft it."
         )
         return
 
     if action == "hold":
         PENDING_CAMPAIGNS.pop(token, None)
+        pending_campaign.discard(token)
         await query.edit_message_text(
             f"✋ Kept PAUSED. Campaign {draft['campaign_id']} is not spending."
         )
@@ -681,6 +693,7 @@ async def on_campaign_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     PENDING_CAMPAIGNS.pop(token, None)
+    pending_campaign.discard(token)
     await query.edit_message_text(f"🚀 Launching campaign {draft['campaign_id']}…")
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
