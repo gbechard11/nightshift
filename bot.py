@@ -599,6 +599,99 @@ async def cmd_draft(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def cmd_campaign(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Build a full PAUSED, sales-structured campaign for one show (3 ad sets:
+    retargeting / lookalike / cold) wired to the NS custom audiences, confirm-first.
+    Objective is auto-picked from the ticket link (Sales+Purchase for pixel-trackable
+    ticketing, Traffic+LandingPageViews otherwise). Spend starts only on Launch."""
+    if not authorized(update):
+        return
+    if not meta_ads.configured():
+        await update.message.reply_text(META_NOT_CONFIGURED)
+        return
+    raw = (update.message.text or "").partition(" ")[2].strip()
+    parts = [p.strip() for p in raw.split("|")]
+    if len(parts) < 4 or not parts[0] or not parts[2] or not parts[3]:
+        await update.message.reply_text(
+            "Usage: /campaign <name> | <daily $CAD> | <ticket_link> | <caption> | [flyer.jpg or image_url] | [interest_ids csv]\n\n"
+            "Builds a PAUSED sales campaign: 3 ad sets (retargeting / lookalike / cold), "
+            "objective auto-picked from the ticket link, your NS audiences attached, UTM "
+            "tracking on the link. Confirm-first — nothing spends until you tap Launch.\n\n"
+            "Example:\n/campaign Webby Hamilton | 30 | https://www.ticketweb.ca/event/x | "
+            "Chris Webby live in Hamilton — tickets on sale now! | webby.jpg"
+        )
+        return
+    name = parts[0]
+    try:
+        daily_cad = float(parts[1])
+    except ValueError:
+        await update.message.reply_text(f"Daily budget must be a number in CAD. Got: {parts[1]}")
+        return
+    if daily_cad <= 0:
+        await update.message.reply_text("Daily budget must be greater than 0.")
+        return
+    ticket_link = parts[2]
+    caption = parts[3]
+    image = parts[4] if len(parts) > 4 and parts[4] else None
+    interest_ids = [x.strip() for x in parts[5].split(",") if x.strip()] if len(parts) > 5 and parts[5] else None
+
+    await ctx.bot.send_chat_action(update.message.chat_id, ChatAction.TYPING)
+    try:
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            image_hash = None
+            image_url = None
+            image_label = None
+            if image:
+                if image.startswith("http"):
+                    image_url = image
+                    image_label = image
+                else:
+                    file_path = meta_ads.resolve_media_path(image)
+                    image_hash = await meta_ads.upload_ad_image(client, file_path)
+                    image_label = image
+            res = await meta_ads.build_show_campaign(
+                client, name, daily_cad, ticket_link, caption,
+                interest_ids=interest_ids, image_hash=image_hash, image_url=image_url,
+            )
+    except meta_ads.MetaError as e:
+        await update.message.reply_text(f"Campaign build failed (nothing launched): {e}")
+        return
+    except Exception as e:  # noqa: BLE001
+        log.exception("campaign build failed")
+        await update.message.reply_text(f"Campaign build error (nothing launched): {e}")
+        return
+
+    token = secrets.token_urlsafe(8)
+    PENDING_CAMPAIGNS[token] = {
+        "campaign_id": res["campaign_id"],
+        "name": name,
+        "daily_cad": daily_cad,
+        "acct_key": meta_ads.DEFAULT_PROFILE_KEY,
+        "full": True,
+    }
+    adset_lines = "\n".join(
+        f"  • {a['layer']}: ${a['daily_cents'] / 100:.2f}/day" for a in res["adsets"]
+    )
+    keyboard = InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("\U0001F680 Launch (start spend)", callback_data=f"camp:go:{token}"),
+            InlineKeyboardButton("✖️ Keep paused", callback_data=f"camp:hold:{token}"),
+        ]]
+    )
+    await update.message.reply_text(
+        "\U0001F4CB Sales campaign built — PAUSED, not spending:\n\n"
+        f"Name: {name}\n"
+        f"Campaign id: {res['campaign_id']}\n"
+        f"Objective: {res['objective']} ({res['platform']})\n"
+        f"Total daily: ${daily_cad:.2f} CAD, split across:\n"
+        f"{adset_lines}\n"
+        f"Creative: {image_label or '(OG preview from link)'}\n"
+        f"Ticket link: {ticket_link}\n\n"
+        "Launching starts real spend on the Nightshift CAD account. Launch now?",
+        reply_markup=keyboard,
+    )
+
+
 async def on_campaign_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """The spend gate. 'go' flips a PAUSED campaign ACTIVE; 'hold' leaves it paused."""
     query = update.callback_query
@@ -636,7 +729,10 @@ async def on_campaign_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     await query.edit_message_text(f"🚀 Launching campaign {draft['campaign_id']} on {acct.label}…")
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            await meta_ads.activate_campaign(client, draft["campaign_id"], acct=acct)
+            if draft.get("full"):
+                await meta_ads.activate_full(client, draft["campaign_id"])
+            else:
+                await meta_ads.activate_campaign(client, draft["campaign_id"], acct=acct)
     except meta_ads.MetaError as e:
         await query.message.reply_text(f"Launch failed (campaign stays paused): {e}")
         return
@@ -1281,6 +1377,7 @@ def main() -> None:
     app.add_handler(CommandHandler("call", cmd_call))
     app.add_handler(CommandHandler("research", cmd_research))
     app.add_handler(CommandHandler("draft", cmd_draft))
+    app.add_handler(CommandHandler("campaign", cmd_campaign))
     app.add_handler(CommandHandler("accounts", cmd_accounts))
     app.add_handler(CommandHandler("media", cmd_media))
     app.add_handler(CommandHandler("pause", cmd_pause))
