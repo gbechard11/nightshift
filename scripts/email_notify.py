@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check for new business emails and push Telegram notifications.
+"""Check for new work emails to greg@nightshiftent.ca and push Telegram summaries.
 Runs every 5 minutes via cron. Tracks notified IDs in /data/greg/email_notified.json.
 """
 from __future__ import annotations
@@ -10,6 +10,7 @@ import imaplib
 import json
 import os
 import re
+import subprocess
 import sys
 import urllib.request
 import urllib.parse
@@ -17,6 +18,7 @@ from pathlib import Path
 
 
 SEEN_FILE = Path("/data/greg/email_notified.json")
+WORK_ADDRESS = "greg@nightshiftent.ca"
 
 NOISE_SENDERS = [
     "uber", "hyatt", "hotels.com", "godaddy", "printful", "constantcontact",
@@ -26,7 +28,7 @@ NOISE_SENDERS = [
     "pollstar", "teamsnap", "amazon", "looker", "bootleg blondie",
     "aliexpress", "linkedin", "noreply@email", "newsletter", "unsubscribe",
     "no-reply@", "donotreply", "notification", "louisvuitton", "freshbooks",
-    "docusign", "squareup", "7shifts", "patronscan", "twilio", "showpass",
+    "docusign", "squareup", "7shifts", "patronscan", "twilio",
     "vapi.ai", "trykeep.com", "keep team", "down by the river",
 ]
 
@@ -56,7 +58,6 @@ def load_seen() -> set:
 
 
 def save_seen(seen: set) -> None:
-    # Keep last 500 IDs to avoid unbounded growth
     ids = list(seen)[-500:]
     SEEN_FILE.write_text(json.dumps(ids))
 
@@ -68,13 +69,22 @@ def is_noise(sender: str, subject: str) -> bool:
         return True
     if any(n in subj for n in NOISE_SUBJECTS):
         return True
-    # Auto-replies
     if re.search(r"automatic.?reply|out of office|auto.?reply", subj):
         return True
     return False
 
 
-def decode_header(s: str) -> str:
+def is_work_email(parsed) -> bool:
+    headers = " ".join([
+        parsed.get("To", ""),
+        parsed.get("Cc", ""),
+        parsed.get("Delivered-To", ""),
+        parsed.get("X-Original-To", ""),
+    ]).lower()
+    return WORK_ADDRESS in headers
+
+
+def decode_header_str(s: str) -> str:
     if not s:
         return ""
     try:
@@ -82,6 +92,43 @@ def decode_header(s: str) -> str:
         return str(make_header(decode_header(s)))
     except Exception:
         return s
+
+
+def extract_body(parsed) -> str:
+    body = ""
+    if parsed.is_multipart():
+        for part in parsed.walk():
+            ct = part.get_content_type()
+            cd = str(part.get("Content-Disposition", ""))
+            if ct == "text/plain" and "attachment" not in cd:
+                try:
+                    body = part.get_content()
+                    break
+                except Exception:
+                    pass
+    else:
+        try:
+            body = parsed.get_content()
+        except Exception:
+            pass
+    body = re.sub(r"\r?\n{3,}", "\n\n", body.strip())
+    return body[:800]
+
+
+def summarize_email(sender: str, subject: str, body: str) -> str:
+    prompt = (
+        "Summarize this email in 1-2 sentences. Be direct and factual. "
+        "Note any action required.\n\n"
+        f"From: {sender}\nSubject: {subject}\n\nBody:\n{body[:600]}"
+    )
+    try:
+        result = subprocess.run(
+            ["/usr/bin/claude", "--permission-mode", "bypassPermissions", "-p", prompt],
+            capture_output=True, text=True, timeout=60, cwd="/data/greg"
+        )
+        return result.stdout.strip() or "(no summary)"
+    except Exception as e:
+        return f"(summary unavailable: {e})"
 
 
 def send_telegram(token: str, chat_id: str, text: str) -> None:
@@ -123,12 +170,18 @@ def main() -> None:
                 _, msg_data = m.fetch(msg_id, "(RFC822)")
                 raw = msg_data[0][1]
                 parsed = email_lib.message_from_bytes(raw, policy=email_lib.policy.default)
-                sender = decode_header(parsed.get("From", ""))
-                subject = decode_header(parsed.get("Subject", ""))
+                sender = decode_header_str(parsed.get("From", ""))
+                subject = decode_header_str(parsed.get("Subject", ""))
+
+                if not is_work_email(parsed):
+                    seen.add(mid)
+                    continue
                 if is_noise(sender, subject):
                     seen.add(mid)
                     continue
-                new_msgs.append((mid, sender, subject))
+
+                body = extract_body(parsed)
+                new_msgs.append((mid, sender, subject, body))
                 seen.add(mid)
     except Exception as e:
         print(f"IMAP error: {e}", file=sys.stderr)
@@ -136,18 +189,19 @@ def main() -> None:
 
     save_seen(seen)
 
-    if not new_msgs:
-        sys.exit(0)
-
-    lines = [f"📬 <b>{len(new_msgs)} new email{'s' if len(new_msgs) > 1 else ''}</b>"]
-    for _, sender, subject in new_msgs[:5]:
-        # Trim sender to display name or short address
+    for _, sender, subject, body in new_msgs:
         name = re.sub(r"\s*<.*?>", "", sender).strip() or sender
-        lines.append(f"• <b>{name}</b>: {subject}")
-    if len(new_msgs) > 5:
-        lines.append(f"…and {len(new_msgs) - 5} more")
-
-    send_telegram(token, chat_id, "\n".join(lines))
+        summary = summarize_email(sender, subject, body)
+        text = (
+            f"📬 <b>New work email</b>\n"
+            f"<b>From:</b> {name}\n"
+            f"<b>Subject:</b> {subject}\n\n"
+            f"{summary}"
+        )
+        try:
+            send_telegram(token, chat_id, text)
+        except Exception as e:
+            print(f"Telegram error: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":
