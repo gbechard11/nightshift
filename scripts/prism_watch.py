@@ -45,6 +45,33 @@ CHAT_IDS = [
 ]
 WATCH_DAYS = int(os.environ.get("PRISM_WATCH_DAYS", "180"))
 STATE_FILE = os.environ.get("PRISM_WATCH_STATE", "/data/greg/.prism_watch_state.json")
+# Sentinel so we ping the owner only ONCE when the Prism login expires, not every
+# 4h run. Cleared automatically on the next successful read (i.e. after re-auth).
+REAUTH_SENTINEL = os.environ.get("PRISM_REAUTH_SENTINEL", "/data/greg/.prism_reauth_pinged")
+
+REAUTH_MSG = (
+    "🔑 Prism login expired — Pedro can't read the calendar until you re-auth "
+    "(this is the ~monthly refresh; auto-renew handles the rest).\n\n"
+    "1. Log out of app.prism.fm and log back in.\n"
+    "2. Click your Prism-Token bookmark, then paste it to me here.\n"
+    "Done — good for another ~30 days."
+)
+
+
+async def _notify(client, text: str) -> None:
+    for cid in CHAT_IDS:
+        try:
+            await client.post(
+                f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                data={"chat_id": cid, "text": text[:4000]},
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"notify {cid} failed: {e}")
+
+
+def _looks_like_expired_auth(err: str) -> bool:
+    e = err.lower()
+    return any(s in e for s in ("refresh token", "expired", "revoked", "notauthorized", "not authorized", "no prism_refresh_token"))
 
 
 def _load_state() -> dict:
@@ -110,7 +137,23 @@ async def main() -> int:
             shows = await prism.list_shows(client, today.isoformat(), end.isoformat())
         except prism.PrismError as e:
             print(f"prism_watch: lookup failed: {e}")
+            # If the failure is an expired/rejected token, ping the owner ONCE
+            # (sentinel-gated) with re-auth steps. This is the "queue me when
+            # needed" signal — fires ~monthly when the refresh token lapses.
+            if _looks_like_expired_auth(str(e)) and not os.path.exists(REAUTH_SENTINEL):
+                await _notify(client, REAUTH_MSG)
+                try:
+                    open(REAUTH_SENTINEL, "w").write(datetime.now().isoformat())
+                except OSError:
+                    pass
+                print("prism_watch: pinged owner to re-auth.")
             return 1
+
+        # Healthy read — clear the re-auth sentinel so a future expiry pings again.
+        try:
+            os.path.exists(REAUTH_SENTINEL) and os.remove(REAUTH_SENTINEL)
+        except OSError:
+            pass
 
         prev = _load_state()
         changes, new_state = _diff(prev, shows)
