@@ -63,6 +63,37 @@ def _slug(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")[:24] or "blast"
 
 
+def _parse_send_at(raw: str) -> str | None:
+    """Normalize a time expression to YYYY-MM-DDTHH:MM:SS (local server time).
+
+    Accepts: '3:30 PM', '15:30', '2026-06-11 15:30', '2026-06-11T15:30'.
+    Returns None for blank or unrecognized input.
+    """
+    import datetime
+    s = (raw or "").strip()
+    if not s:
+        return None
+    # Full date+time: 2026-06-11T15:30 or 2026-06-11 15:30
+    m = re.match(r'^(\d{4}-\d{2}-\d{2})[T ](\d{1,2}):(\d{2})(?::\d{2})?$', s)
+    if m:
+        return f"{m.group(1)}T{int(m.group(2)):02d}:{m.group(3)}:00"
+    today = datetime.date.today().strftime("%Y-%m-%d")
+    # 12-hour: 3:30 PM / 3:30PM
+    m = re.match(r'^(\d{1,2}):(\d{2})\s*(AM|PM)$', s, re.IGNORECASE)
+    if m:
+        h, mn = int(m.group(1)), int(m.group(2))
+        if m.group(3).upper() == "PM" and h != 12:
+            h += 12
+        elif m.group(3).upper() == "AM" and h == 12:
+            h = 0
+        return f"{today}T{h:02d}:{mn:02d}:00"
+    # 24-hour: 15:30
+    m = re.match(r'^(\d{1,2}):(\d{2})$', s)
+    if m:
+        return f"{today}T{int(m.group(1)):02d}:{m.group(2)}:00"
+    return None
+
+
 def _run(cmd: list[str], timeout: int = 180) -> tuple[int, str]:
     r = subprocess.run(cmd, capture_output=True, timeout=timeout)
     out = (r.stdout + r.stderr).decode("utf-8", errors="replace").strip()
@@ -80,7 +111,7 @@ def _segment_count(city: str) -> int:
                and (r.get("Email") or "").strip())
 
 
-def draft(rid, requester, city, subject, html, image_drive_ids, gdrive, dl_dir) -> str:
+def draft(rid, requester, city, subject, html, image_drive_ids, gdrive, dl_dir, send_at="") -> str:
     city = (city or "").strip()
     subject = (subject or "").strip()
     if not city or not subject or not html.strip():
@@ -89,6 +120,7 @@ def draft(rid, requester, city, subject, html, image_drive_ids, gdrive, dl_dir) 
         return (f"I couldn't find any contacts for city '{city}'. "
                 f"Check the spelling (e.g. Edmonton, Winnipeg, Calgary).")
 
+    send_at_iso = _parse_send_at(send_at)
     from_addr = _sender_for(rid)
     if not _sender_ready(from_addr):
         return (
@@ -130,10 +162,13 @@ def draft(rid, requester, city, subject, html, image_drive_ids, gdrive, dl_dir) 
         f.write(html)
 
     # 3) queue it (owner-only send later)
-    rc, out = _run([PYTHON, QUEUE, "add", "--id", bid, "--city", city,
-                    "--subject", subject, "--html-file", html_path,
-                    "--list", CONTACTS, "--from", from_addr,
-                    "--created-by", requester, "--created-by-uid", str(rid)])
+    queue_cmd = [PYTHON, QUEUE, "add", "--id", bid, "--city", city,
+                 "--subject", subject, "--html-file", html_path,
+                 "--list", CONTACTS, "--from", from_addr,
+                 "--created-by", requester, "--created-by-uid", str(rid)]
+    if send_at_iso:
+        queue_cmd += ["--send-at", send_at_iso]
+    rc, out = _run(queue_cmd)
     if rc != 0:
         return f"Couldn't queue the blast: {out}"
 
@@ -159,17 +194,34 @@ def draft(rid, requester, city, subject, html, image_drive_ids, gdrive, dl_dir) 
               "--from", from_addr, "--subject", subject, "--html-file", html_path,
               "--campaign", f"{bid}-preview", "--yes"])
         try:
-            employee_notify.notify_blast_approval(
-                rid, bid,
-                f"\U0001F4E3 Your email blast is ready to review:\n"
-                f"\u2022 {subject}\n\u2022 From: {from_addr}\n"
-                f"\u2022 Audience: {city} (~{count:,} contacts)\n"
-                f"\u2022 A preview was just emailed to {reviewer_email}.\n\n"
-                f"Open the preview, then tap Approve & send to blast it to all "
-                f"~{count:,} {city} contacts. Nothing goes out until you tap Approve."
-            )
+            if send_at_iso:
+                employee_notify.notify_blast_scheduled(
+                    rid, bid,
+                    f"\U0001F4E3 Your email blast is scheduled:\n"
+                    f"\u2022 {subject}\n\u2022 From: {from_addr}\n"
+                    f"\u2022 Audience: {city} (~{count:,} contacts)\n"
+                    f"\u2022 Fires automatically at: {send_at_iso}\n"
+                    f"\u2022 A preview was just emailed to {reviewer_email}.\n\n"
+                    f"Tap Cancel if you need to pull it before it fires."
+                )
+            else:
+                employee_notify.notify_blast_approval(
+                    rid, bid,
+                    f"\U0001F4E3 Your email blast is ready to review:\n"
+                    f"\u2022 {subject}\n\u2022 From: {from_addr}\n"
+                    f"\u2022 Audience: {city} (~{count:,} contacts)\n"
+                    f"\u2022 A preview was just emailed to {reviewer_email}.\n\n"
+                    f"Open the preview, then tap Approve & send to blast it to all "
+                    f"~{count:,} {city} contacts. Nothing goes out until you tap Approve."
+                )
         except Exception:
             pass
+        if send_at_iso:
+            return (
+                f"\u2705 Drafted '{subject}' for {city} (~{count:,} contacts) and emailed "
+                f"you a preview at {reviewer_email}. Scheduled to fire at {send_at_iso}. "
+                f"Tap Cancel in Telegram if you need to pull it. Queue id: {bid}."
+            )
         return (
             f"\u2705 Drafted '{subject}' for {city} (~{count:,} contacts) and emailed "
             f"you a preview at {reviewer_email}. I also sent Approve / Cancel buttons here "

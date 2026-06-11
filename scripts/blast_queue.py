@@ -32,6 +32,10 @@ QUEUE_DIR = "/data/greg/blast_queue"
 BLAST = "/home/gregnightshift/nightshift/scripts/blast.py"
 PYTHON = "/home/gregnightshift/nightshift/.venv/bin/python"
 
+# Telegram uids allowed to self-approve (and therefore have their scheduled blasts
+# auto-fired by the cron). Must match BLAST_SELF_APPROVE in .env.
+_SELF_APPROVERS = {"8722742818", "8621126122"}
+
 
 def _spec_path(qid: str) -> str:
     return os.path.join(QUEUE_DIR, f"{qid}.json")
@@ -77,11 +81,13 @@ def cmd_add(a: argparse.Namespace) -> None:
         "created_by_uid": a.created_by_uid or "",
         "status": "queued",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "send_at": a.send_at or None,
     }
     with open(_spec_path(a.id), "w") as f:
         json.dump(spec, f, indent=2)
     print(json.dumps({"ok": True, "queued": a.id, "city": a.city,
-                      "segment_count": count, "subject": a.subject}))
+                      "segment_count": count, "subject": a.subject,
+                      "send_at": a.send_at or None}))
 
 
 def cmd_list(_a: argparse.Namespace) -> None:
@@ -141,6 +147,83 @@ def cmd_cancel(a: argparse.Namespace) -> None:
     print(f"cancelled '{a.id}'")
 
 
+def _tg_notify(uid: str, text: str) -> None:
+    """Send a plain Telegram message via the Employee Bot. Best-effort."""
+    import os as _os, urllib.request as _ur, urllib.parse as _up
+    token = _os.environ.get("EMPLOYEE_BOT_TOKEN", "")
+    if not token or not uid:
+        return
+    try:
+        data = _up.urlencode({"chat_id": uid, "text": text,
+                               "disable_web_page_preview": "true"}).encode()
+        _ur.urlopen(_ur.Request(f"https://api.telegram.org/bot{token}/sendMessage",
+                                data=data), timeout=10).read()
+    except Exception:
+        pass
+
+
+def cmd_fire_scheduled(_a: argparse.Namespace) -> None:
+    """Fire all queued blasts whose send_at <= now (called by cron every minute).
+    Only auto-fires blasts created by self-approvers (Seba/Andrew); others still
+    require explicit owner approval."""
+    now_str = time.strftime("%Y-%m-%dT%H:%M:%S")
+    if not os.path.isdir(QUEUE_DIR):
+        return
+
+    # Load SELF_APPROVERS from env if set, fall back to hardcoded default.
+    raw = os.environ.get("BLAST_SELF_APPROVE", ",".join(_SELF_APPROVERS))
+    self_approvers = {x.strip() for x in raw.replace(";", ",").split(",") if x.strip()}
+
+    fired = 0
+    for p in sorted(Path(QUEUE_DIR).glob("*.json")):
+        try:
+            s = json.load(open(p))
+        except Exception:
+            continue
+        if s.get("status") != "queued":
+            continue
+        send_at = s.get("send_at")
+        if not send_at:
+            continue
+        if str(s.get("created_by_uid", "")) not in self_approvers:
+            continue
+        if send_at > now_str:
+            continue  # Not yet due
+
+        qid = s["id"]
+        print(f"[{now_str}] Firing scheduled blast: {qid} (due {send_at})")
+        cmd = [PYTHON, BLAST, "--list", s["list"], "--channel", "email",
+               "--from", s["from"], "--subject", s["subject"],
+               "--html-file", s["html_file"], "--campaign", qid]
+        if s.get("city"):
+            cmd += ["--city", s["city"]]
+        cmd.append("--yes")
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        success = r.returncode == 0
+        s["status"] = "sent" if success else "failed"
+        s["sent_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        s["sent_method"] = "scheduled"
+        json.dump(s, open(p, "w"), indent=2)
+
+        uid = s.get("created_by_uid", "")
+        city = s.get("city", "")
+        count = s.get("segment_count", "?")
+        subj = s.get("subject", "")
+        if success:
+            print(f"[{now_str}] Sent: {qid}")
+            _tg_notify(uid, f"✅ Scheduled blast sent: \"{subj}\" → "
+                            f"{city} (~{count} contacts). Queue id: {qid}.")
+        else:
+            err = ((r.stdout or "") + (r.stderr or ""))[-300:]
+            print(f"[{now_str}] FAILED: {qid}: {err}")
+            _tg_notify(uid, f"⚠️ Scheduled blast FAILED: \"{subj}\" "
+                            f"(queue id {qid}). Error: {err[:200]}")
+        fired += 1
+
+    if fired:
+        print(f"[{now_str}] fire-scheduled: {fired} blast(s) processed")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Owner-side blast queue")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -154,6 +237,8 @@ def main() -> None:
     pa.add_argument("--from", dest="from_addr", default="info@nightshiftent.ca")
     pa.add_argument("--created-by", default="")
     pa.add_argument("--created-by-uid", dest="created_by_uid", default="")
+    pa.add_argument("--send-at", dest="send_at", default="",
+                    help="ISO datetime (YYYY-MM-DDTHH:MM:SS) to auto-fire this blast")
     pa.set_defaults(func=cmd_add)
 
     sub.add_parser("list").set_defaults(func=cmd_list)
@@ -171,6 +256,10 @@ def main() -> None:
     pc = sub.add_parser("cancel")
     pc.add_argument("id")
     pc.set_defaults(func=cmd_cancel)
+
+    sub.add_parser("fire-scheduled",
+                   help="Fire all due scheduled blasts (run by cron every minute)"
+                   ).set_defaults(func=cmd_fire_scheduled)
 
     a = p.parse_args()
     a.func(a)

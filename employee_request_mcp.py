@@ -308,7 +308,8 @@ def drive_create_text_file(name: str, content: str, parent_id: str = "") -> str:
 
 
 @mcp.tool()
-def draft_blast(city: str, subject: str, html: str, image_drive_ids: str = "") -> str:
+def draft_blast(city: str, subject: str, html: str, image_drive_ids: str = "",
+                send_at: str = "") -> str:
     """Prepare a marketing EMAIL BLAST to a city segment and QUEUE it for Greg's
     approval. Use this whenever an employee asks you to create or send an email
     blast / eblast to customers (e.g. "blast Edmonton about DJ Mina this weekend").
@@ -325,6 +326,10 @@ def draft_blast(city: str, subject: str, html: str, image_drive_ids: str = "") -
       image_drive_ids: OPTIONAL comma-separated NAME=DRIVE_FILE_ID pairs for images
         referenced as cid:NAME (e.g. "hero=1F332...,ev1=1Ygh..."). Each is uploaded
         to S3 and the cid:NAME link is swapped for the hosted URL.
+      send_at: OPTIONAL scheduled send time. Accepts "3:30 PM", "15:30",
+        "2026-06-11 15:30", or "2026-06-11T15:30". When set (and you are a
+        self-approver), the blast fires automatically at that time -- no Approve
+        tap needed. Leave blank to use the normal Approve-button flow.
 
     Does NOT send to the list -- it uploads images, renders the email, QUEUES it,
     emails Greg a PREVIEW, and pings him to approve. Only Greg fires the real send."""
@@ -337,7 +342,8 @@ def draft_blast(city: str, subject: str, html: str, image_drive_ids: str = "") -
         return blast_compose.draft(rid=rid, requester=name, city=city,
                                    subject=subject, html=html,
                                    image_drive_ids=image_drive_ids,
-                                   gdrive=_gdrive, dl_dir=DL_DIR)
+                                   gdrive=_gdrive, dl_dir=DL_DIR,
+                                   send_at=send_at)
     except Exception as e:
         return "Couldn't draft the blast: %s" % e
 

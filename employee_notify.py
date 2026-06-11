@@ -105,3 +105,45 @@ def notify_blast_approval(uid, bid, text) -> None:
             resp.read()
     except Exception as exc:  # noqa: BLE001
         log.warning("blast approval notify failed: %s", exc)
+
+
+def notify_blast_scheduled(uid, bid, text) -> None:
+    """DM the employee that their blast is scheduled \u2014 Cancel button only (no Approve,
+    since the cron fires it automatically at the scheduled time). Best-effort."""
+    token = os.environ.get("EMPLOYEE_BOT_TOKEN") or _TOKEN
+    if not token or not uid:
+        return
+    import json as _json
+    markup = {"inline_keyboard": [[
+        {"text": "\u274C Cancel scheduled blast", "callback_data": f"blastcancel:{bid}"},
+    ]]}
+    try:
+        data = urllib.parse.urlencode(
+            {"chat_id": uid, "text": text, "reply_markup": _json.dumps(markup),
+             "disable_web_page_preview": "true"}
+        ).encode()
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage", data=data
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("blast scheduled notify failed: %s", exc)
+
+
+def send_plain(uid, text, *, use_employee_bot: bool = True) -> None:
+    """Send a plain text message to a Telegram user. Best-effort."""
+    token = (os.environ.get("EMPLOYEE_BOT_TOKEN") if use_employee_bot else None) or _TOKEN
+    if not token or not uid:
+        return
+    try:
+        data = urllib.parse.urlencode(
+            {"chat_id": uid, "text": text, "disable_web_page_preview": "true"}
+        ).encode()
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage", data=data
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("send_plain notify failed: %s", exc)
