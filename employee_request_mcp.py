@@ -452,6 +452,140 @@ def blast_stats(query: str = "") -> str:
     return "\n".join(out)
 
 
+# ---------------------------------------------------------------------------
+# Prism (READ-ONLY) — let the chat agent answer venue availability / show
+# questions instead of punting to Greg. No writes: never creates/changes a
+# booking. Token cache is redirected to the employee-writable dir because
+# prism.py's default (/data/greg/.prism_token.json) isn't writable under this
+# service's sandbox (ProtectSystem=strict; only /data/employees is RW here).
+# Tools are async def so FastMCP awaits them in its own loop (no asyncio.run).
+# ---------------------------------------------------------------------------
+os.environ.setdefault("PRISM_TOKEN_CACHE", "/data/employees/.prism_token.json")
+import datetime as _dt  # noqa: E402
+import httpx  # noqa: E402
+import prism  # noqa: E402
+
+_WEEKDAY_ALIASES = {
+    "mon": 0, "monday": 0, "tue": 1, "tues": 1, "tuesday": 1, "wed": 2, "weds": 2,
+    "wednesday": 2, "thu": 3, "thur": 3, "thurs": 3, "thursday": 3, "fri": 4,
+    "friday": 4, "sat": 5, "saturday": 5, "sun": 6, "sunday": 6,
+}
+_WD_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+@mcp.tool()
+async def prism_list_shows(start: str, end: str) -> str:
+    """List Prism shows and holds between two dates (YYYY-MM-DD inclusive) — i.e.
+    what's booked across the venues. READ-ONLY. Use when an employee asks what's
+    on, what's booked, or wants to see the calendar for a stretch of dates."""
+    if not prism.configured():
+        return "Prism isn't connected yet (no refresh token on the server) — tell Greg."
+    try:
+        _dt.date.fromisoformat(start)
+        _dt.date.fromisoformat(end)
+    except ValueError:
+        return "Dates must be YYYY-MM-DD, e.g. 2026-11-01."
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            shows = await prism.list_shows(client, start, end)
+    except Exception as e:  # noqa: BLE001
+        return "Prism lookup failed: %s" % e
+    return prism.format_shows(shows, limit=60)
+
+
+@mcp.tool()
+async def prism_check_availability(start: str, end: str, weekdays: str = "", venue: str = "") -> str:
+    """Check which dates are OPEN vs BOOKED in Prism between start and end
+    (YYYY-MM-DD inclusive). READ-ONLY. Use for 'what dates are available/open'.
+
+    `weekdays`: optional comma list to narrow days, e.g. 'Fri,Sat' for
+    Friday/Saturday avails. `venue`: optional venue-name filter (substring, e.g.
+    'Union Hall') — pass it whenever the employee asks about a specific room,
+    because a date can be open at one venue and booked at another. With no venue,
+    a date is only OPEN if nothing is booked anywhere that day."""
+    if not prism.configured():
+        return "Prism isn't connected yet (no refresh token on the server) — tell Greg."
+    try:
+        d0 = _dt.date.fromisoformat(start)
+        d1 = _dt.date.fromisoformat(end)
+    except ValueError:
+        return "Dates must be YYYY-MM-DD, e.g. 2026-11-01 and 2026-11-30."
+    if d1 < d0:
+        return "End date is before start date."
+    if (d1 - d0).days > 366:
+        return "Range too wide — keep it within ~12 months."
+
+    wd_filter = set()
+    for w in str(weekdays).replace(";", ",").split(","):
+        w = w.strip().lower()
+        if not w:
+            continue
+        if w not in _WEEKDAY_ALIASES:
+            return "Unknown weekday %r — use names like Fri, Sat, Monday." % w
+        wd_filter.add(_WEEKDAY_ALIASES[w])
+    ven = venue.strip().lower()
+
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            shows = await prism.list_shows(client, start, end)
+    except Exception as e:  # noqa: BLE001
+        return "Prism lookup failed: %s" % e
+
+    by_date: dict[str, list] = {}
+    venues_seen = set()
+    for s in shows:
+        day = s.get("start")
+        if not day:
+            continue
+        day = str(day)[:10]
+        vname = s.get("venue") or ""
+        if vname:
+            venues_seen.add(vname)
+        if ven and ven not in vname.lower():
+            continue
+        by_date.setdefault(day, []).append(s)
+
+    header = "Prism availability %s → %s" % (start, end)
+    if venue:
+        header += " | venue~'%s'" % venue
+    if wd_filter:
+        header += " | " + ",".join(_WD_NAMES[i] for i in sorted(wd_filter))
+    lines = [header, ""]
+
+    cur, one, shown, capped = d0, _dt.timedelta(days=1), 0, False
+    while cur <= d1:
+        if not wd_filter or cur.weekday() in wd_filter:
+            if shown >= 80:
+                capped = True
+                break
+            iso = cur.isoformat()
+            label = "%s %s" % (_WD_NAMES[cur.weekday()], iso)
+            booked = by_date.get(iso, [])
+            if booked:
+                tags = ", ".join(
+                    "%s%s [%s]" % (
+                        b["title"],
+                        (" @ %s" % b["venue"]) if b.get("venue") else "",
+                        b["status_label"],
+                    )
+                    for b in booked
+                )
+                lines.append("• %s — BOOKED: %s" % (label, tags))
+            else:
+                lines.append("• %s — OPEN" % label)
+            shown += 1
+        cur += one
+
+    if capped:
+        lines.append("…(stopped at 80 dates — narrow the range or use weekdays=)")
+    if not venue and venues_seen:
+        lines.append("")
+        lines.append("Note: no venue filter — 'OPEN' means nothing booked at ANY venue. "
+                     "Venues with bookings in range: %s. Re-run with venue= for a specific room."
+                     % ", ".join(sorted(venues_seen)))
+    return "\n".join(lines)
+
+
 if __name__ == "__main__":
     mcp.run()
 
