@@ -11,3 +11,4 @@ backups-*/
 tunnel-url.txt
 .env.bak*
 wire_recipients.json
+envato_cookies.json

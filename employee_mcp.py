@@ -598,6 +598,61 @@ button{{width:100%;padding:12px;font-size:15px;border:0;border-radius:10px;backg
 <button type="submit">Connect</button></form></div></body></html>"""
 
 
+
+# --------------------------------------------------------------------------- #
+# Envato Elements: search the company subscription + download assets to Drive.
+# Shares Greg's seeded session (envato_cookies.json); downloads land in the
+# shared "Envato Assets" Drive folder. SAFE: search + download only. The session
+# is seeded only by Greg via the Telegram bot's /envatologin.
+# --------------------------------------------------------------------------- #
+ENVATO_BIN = os.path.join(HERE, "envato.py")
+ENVATO_TOKEN = os.path.join(HERE, "token.json")  # company Drive token (shared folder)
+ENVATO_ALLOWED = {"search", "download", "status", "suggest"}
+
+
+async def _envato(args, timeout=600):
+    if not args or args[0] not in ENVATO_ALLOWED:
+        raise ValueError("envato subcommand not allowed: %s" % args[:1])
+    env = {**os.environ, "GCAL_TOKEN": ENVATO_TOKEN}
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, ENVATO_BIN, *args, cwd=HERE, env=env,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return "Envato command timed out."
+    return out.decode("utf-8", errors="replace").strip() or "(no output)"
+
+
+@mcp.tool()
+async def envato_search(query: str, item_type: str = "") -> str:
+    """Search the Nightshift Envato Elements subscription (stock video, video
+    templates, fonts, graphics, music, sound effects, photos). Returns matching
+    item ids + links. Optional item_type narrows results: stock-video, fonts,
+    graphics, music, video-templates, sound-effects, photos. Then call
+    envato_download to pull one into the shared Drive."""
+    _uid()
+    if not query.strip():
+        raise ValueError("Provide search terms.")
+    args = ["search", query.strip(), "--json", "--limit", "15"]
+    if item_type.strip():
+        args += ["--type", item_type.strip()]
+    return await _envato(args, timeout=120)
+
+
+@mcp.tool()
+async def envato_download(url_or_id: str) -> str:
+    """Download an Envato Elements asset (item URL or id from envato_search) and
+    save it into the shared 'Envato Assets' Google Drive folder; returns the
+    Drive link. Licensed under the company subscription."""
+    _uid()
+    if not url_or_id.strip():
+        raise ValueError("Provide an Envato item URL or id (from envato_search).")
+    return await _envato(["download", url_or_id.strip(), "--to-drive", "--json"], timeout=900)
+
+
 @mcp.custom_route("/login", methods=["GET"])
 async def login_get(request: Request) -> HTMLResponse:
     lid = request.query_params.get("lid", "")
