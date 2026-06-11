@@ -36,8 +36,11 @@ import base64
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
+import zipfile
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
@@ -426,9 +429,21 @@ def search(query: str, item_type: str = "", page: int = 1, limit: int = 24) -> l
 
 # --- download -----------------------------------------------------------------
 
+# Item types whose download is video: always delivered playable as MP4/H.264.
+VIDEO_TYPES = {"stock-video", "video-templates"}
+VIDEO_EXTS = (".mov", ".mp4", ".m4v", ".avi", ".mkv", ".webm", ".mxf", ".mpg",
+              ".mpeg", ".wmv", ".prores")
+
+
 def download(url_or_id: str, dest_dir: Path | None = None,
-             project_name: str = "Nightshift", item_type: str = "") -> Path:
-    """Download an Elements item to local disk. Returns the saved file path."""
+             project_name: str = "Nightshift", item_type: str = "",
+             as_mp4: bool = True) -> Path:
+    """Download an Elements item to local disk. Returns the saved file path.
+
+    Stock video / video templates arrive as a `source.zip` containing a high-
+    bitrate edit master (e.g. MJPEG .mov) that browsers can't play. When as_mp4
+    is set (default) we extract the clip and transcode it to MP4/H.264 so it's
+    immediately viewable."""
     uuid, itype = resolve_item(url_or_id, item_type)
     if not itype:
         raise EnvatoError("Item type required — pass --type or use the item URL.")
@@ -448,7 +463,75 @@ def download(url_or_id: str, dest_dir: Path | None = None,
     if out.stat().st_size == 0:
         out.unlink(missing_ok=True)
         raise EnvatoError("Downloaded 0 bytes — the asset URL may have expired.")
+    if as_mp4 and itype in VIDEO_TYPES:
+        out = _ensure_mp4(out, dest_dir, uuid)
     return out
+
+
+def _ensure_mp4(downloaded: Path, dest_dir: Path, uuid: str) -> Path:
+    """Turn a video download into a playable MP4/H.264. Unzips if needed, picks
+    the largest video file, transcodes unless it's already H.264 MP4. Falls back
+    to the original file if no video is found (e.g. an After Effects project)."""
+    if not shutil.which("ffmpeg"):
+        return downloaded
+    src = downloaded
+    workdir = dest_dir / ("_ex_" + uuid[:8])
+    if downloaded.suffix.lower() == ".zip":
+        try:
+            vid = _largest_video_in_zip(downloaded, workdir)
+        except Exception:
+            vid = None
+        if not vid:
+            return downloaded  # no playable video inside (project files only)
+        src = vid
+    if src.suffix.lower() not in VIDEO_EXTS:
+        return downloaded
+    stem = re.sub(r"[^A-Za-z0-9._-]", "_", src.stem)
+    out_mp4 = dest_dir / ("%s_%s.mp4" % (uuid[:8], stem))
+    try:
+        if src.suffix.lower() == ".mp4" and _video_codec(src) == "h264":
+            if str(src) != str(out_mp4):
+                shutil.move(str(src), str(out_mp4))
+        else:
+            _transcode_h264(src, out_mp4)
+    finally:
+        if workdir.exists():
+            shutil.rmtree(workdir, ignore_errors=True)
+        if downloaded.exists() and downloaded.resolve() != out_mp4.resolve():
+            downloaded.unlink(missing_ok=True)
+    return out_mp4 if out_mp4.exists() else downloaded
+
+
+def _largest_video_in_zip(zip_path: Path, workdir: Path) -> Path | None:
+    workdir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path) as z:
+        vids = [n for n in z.namelist()
+                if not n.endswith("/") and n.lower().endswith(VIDEO_EXTS)]
+        if not vids:
+            return None
+        name = max(vids, key=lambda x: z.getinfo(x).file_size)
+        z.extract(name, str(workdir))
+    return workdir / name
+
+
+def _video_codec(path: Path) -> str:
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=codec_name", "-of", "default=nw=1:nk=1",
+             str(path)], capture_output=True, text=True, timeout=60).stdout.strip()
+        return out.splitlines()[0].strip() if out else ""
+    except Exception:
+        return ""
+
+
+def _transcode_h264(src: Path, dst: Path) -> None:
+    cmd = ["ffmpeg", "-y", "-i", str(src), "-c:v", "libx264", "-preset", "medium",
+           "-crf", "18", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+           "-c:a", "aac", "-b:a", "192k", str(dst)]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    if r.returncode != 0 or not dst.exists() or dst.stat().st_size == 0:
+        raise EnvatoError("ffmpeg transcode failed: %s" % (r.stderr or "")[-300:])
 
 
 def _request_download_url(c: httpx.Client, params: dict) -> str:
@@ -584,6 +667,7 @@ def main() -> None:
     dl.add_argument("--type", default="", help="item type (if passing a bare uuid)")
     dl.add_argument("--out", default="", help="local dir (default ENVATO_DOWNLOAD_DIR)")
     dl.add_argument("--to-drive", action="store_true")
+    dl.add_argument("--raw", action="store_true", help="keep the original file/zip (skip MP4/H.264 transcode for video)")
     dl.add_argument("--project", default="Nightshift")
     dl.add_argument("--json", action="store_true")
 
@@ -629,7 +713,7 @@ def main() -> None:
                 print("(%d results)" % len(res), file=sys.stderr)
         elif args.cmd == "download":
             out = download(args.item, Path(args.out) if args.out else None,
-                           args.project, args.type)
+                           args.project, args.type, as_mp4=not args.raw)
             result = {"saved": str(out), "bytes": out.stat().st_size}
             if args.to_drive:
                 result["drive"] = upload_to_drive(out)
