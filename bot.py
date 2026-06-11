@@ -27,7 +27,7 @@ import prism
 import vapi_call
 import whatsapp
 import wire
-from pedro_brain import PedroError, run_claude
+from pedro_brain import CLAUDE_TIMEOUT, PedroError, PedroTimeout, run_claude
 import imap_email
 import employee_email
 from imap_email import get_unread_emails
@@ -47,6 +47,23 @@ INBOX_DIR = os.environ.get("PEDRO_INBOX", "/data/greg/inbox")
 SESSION_FILE = os.environ.get("PEDRO_SESSION_FILE", "/data/greg/.pedro_session_id")
 SAFE_DISALLOWED_TOOLS = os.environ.get(
     "PEDRO_SAFE_DISALLOWED_TOOLS", "Bash Edit Write NotebookEdit"
+)
+
+# Long-task continuation: when a claude run is killed at its per-run time cap,
+# we automatically resume the same session ("continue where you left off")
+# instead of stranding half-done work. Chat keeps a short first round so the
+# common case stays snappy; continuation rounds are longer. Approved employee
+# builds (video renders, code changes) get the longest rounds.
+CHAT_CONTINUE_SECONDS = int(os.environ.get("PEDRO_CHAT_CONTINUE_SECONDS", "900"))
+CHAT_CONTINUE_ROUNDS = int(os.environ.get("PEDRO_CHAT_CONTINUE_ROUNDS", "8"))
+BUILD_ROUND_SECONDS = int(os.environ.get("PEDRO_BUILD_ROUND_SECONDS", "1500"))
+BUILD_MAX_ROUNDS = int(os.environ.get("PEDRO_BUILD_MAX_ROUNDS", "6"))
+BUILD_SESSION_DIR = os.environ.get("PEDRO_BUILD_SESSION_DIR", "/data/greg")
+
+CONTINUE_PROMPT = (
+    "SYSTEM: your previous run was killed at its per-run time cap mid-task. "
+    "Resume EXACTLY where you left off and finish the job — do not start over "
+    "and do not redo completed steps. When done, reply as you normally would."
 )
 VAPI_API_KEY = os.environ.get("VAPI_API_KEY", "")
 VAPI_PHONE_NUMBER_ID = os.environ.get("VAPI_PHONE_NUMBER_ID", "")
@@ -120,6 +137,56 @@ def _meta_not_ready(acct) -> str:
 # so only one stateful run may proceed at a time. Restricted runs are one-shot
 # and stateless, so they stay concurrent (no lock passed).
 _claude_lock = asyncio.Lock()
+
+# Serialize approved-request builds: they edit shared code/files, so two
+# concurrent builds could trample each other. Independent of _claude_lock —
+# a build never blocks Greg's chat.
+_build_lock = asyncio.Lock()
+
+
+async def _run_with_continues(
+    prompt: str,
+    *,
+    session_file: str,
+    lock: asyncio.Lock,
+    first_timeout: int,
+    round_timeout: int,
+    max_rounds: int,
+    notify=None,
+    resume_hint: str = "say 'continue'",
+) -> str:
+    """Run a stateful claude task, auto-resuming every time a run is killed at
+    its time cap, so long jobs FINISH instead of stranding half-done work.
+
+    Holds `lock` across all rounds so nothing interleaves mid-task. `notify`
+    (async callable taking the round number) fires after each capped round so
+    the owner knows work is still going. Never raises — errors come back as
+    user-facing text.
+    """
+    async with lock:
+        p, t = prompt, first_timeout
+        for rnd in range(1, max_rounds + 1):
+            try:
+                return await run_claude(
+                    p, workdir=CLAUDE_WORKDIR, session_file=session_file, timeout=t
+                )
+            except PedroTimeout:
+                if rnd == max_rounds:
+                    total_min = (first_timeout + (max_rounds - 1) * round_timeout) // 60
+                    return (
+                        f"⚠️ Still not finished after {max_rounds} continued runs "
+                        f"(~{total_min} min of work). Progress is saved in the "
+                        f"session — {resume_hint} and I'll pick it right back up."
+                    )
+                if notify is not None:
+                    try:
+                        await notify(rnd)
+                    except Exception:  # noqa: BLE001 - progress ping must never kill the run
+                        pass
+                p, t = CONTINUE_PROMPT, round_timeout
+            except PedroError as e:
+                return str(e)
+    return "(empty response)"
 
 
 async def run_pedro(
@@ -214,14 +281,49 @@ async def _call_claude(
         update.effective_user.id,
         prompt[:200],
     )
-    try:
-        out = await run_pedro(prompt, restricted=restricted)
-    except PedroError as e:
-        await update.message.reply_text(str(e))
+    if restricted:
+        try:
+            out = await run_pedro(prompt, restricted=True)
+        except PedroError as e:
+            await update.message.reply_text(str(e))
+            return
+        for i in range(0, len(out), TELEGRAM_MAX_MSG):
+            await update.message.reply_text(out[i:i + TELEGRAM_MAX_MSG])
         return
 
+    # Stateful runs go to the background so a long task never blocks the
+    # update loop (the _claude_lock.locked() check above gives instant
+    # "busy" feedback to anything that arrives meanwhile). On a time-capped
+    # round the task auto-continues instead of dying — see _run_with_continues.
+    ctx.application.create_task(_chat_run(update, ctx, prompt))
+
+
+async def _chat_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE, prompt: str) -> None:
+    async def _notify(rnd: int) -> None:
+        if rnd == 1:  # only the first cap is news; after that, silence until done
+            await update.message.reply_text(
+                "⏳ This one's big — hit my first run limit, continuing in the "
+                "background. I'll post the result here when it's done."
+            )
+
+    try:
+        out = await _run_with_continues(
+            prompt,
+            session_file=SESSION_FILE,
+            lock=_claude_lock,
+            first_timeout=CLAUDE_TIMEOUT,
+            round_timeout=CHAT_CONTINUE_SECONDS,
+            max_rounds=CHAT_CONTINUE_ROUNDS,
+            notify=_notify,
+        )
+    except Exception:  # noqa: BLE001 - background task; surface, never vanish
+        log.exception("chat run failed")
+        out = "⚠️ Something broke mid-run — check the service logs."
     for i in range(0, len(out), TELEGRAM_MAX_MSG):
-        await update.message.reply_text(out[i:i + TELEGRAM_MAX_MSG])
+        try:
+            await update.message.reply_text(out[i:i + TELEGRAM_MAX_MSG])
+        except Exception:  # noqa: BLE001
+            log.exception("failed to deliver chat reply chunk")
 
 
 async def cmd_ask(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -245,6 +347,19 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     text = (update.message.text or "").strip()
     if not text:
         return
+    if _is_owner(update):
+        hit = _match_build_command(text)
+        if hit:
+            verb, req_id, session_file = hit
+            prompt = BUILD_DEPLOY_PROMPT if verb != "continue" else CONTINUE_PROMPT
+            await update.message.reply_text(
+                f"🔧 {'Shipping' if verb != 'continue' else 'Resuming'} build {req_id}…"
+            )
+            ctx.application.create_task(
+                _continue_build(ctx.bot, update.message.chat_id, req_id,
+                                "the requester", session_file, prompt)
+            )
+            return
     await _call_claude(update, ctx, text)
 
 
@@ -1445,12 +1560,79 @@ APPROVED_IMPL_PROMPT = (
     "and self-deploy — actually implement it, don't punt it back.\n\n"
     "Request from {name}:\n{text}\n\n"
     "Diagnose first (read the relevant code/state), then make the change. "
-    "CONFIRM-FIRST before anything reaches production: show Greg a concise summary "
-    "of exactly what you changed (files + what/why) and WAIT for his explicit 'yes' "
-    "in chat before you git commit / push / touch the deploy trigger. If it's only a "
-    "read-only diagnosis, or you can't finish within your run limit, say precisely "
-    "what's done, what's blocking, and the next step. Keep it tight."
+    "Long tasks are fine: if you hit a run limit you will be resumed "
+    "automatically — just keep working, never wrap up early because of time. "
+    "CONFIRM-FIRST before anything reaches production: when done, reply with a "
+    "concise summary of exactly what you changed (files + what/why). If anything "
+    "needs a git commit / push / deploy trigger, do NOT do it yet — end your "
+    "summary with this exact line so Greg can ship it:\n"
+    "Reply 'deploy build {req_id}' to ship it.\n"
+    "If nothing needs deploying (pure content/media work, or read-only "
+    "diagnosis), omit that line and just report what's done and where. "
+    "Keep it tight."
 )
+
+
+async def _run_approved_build(bot, chat_id: int, req_id: str, name: str, text: str) -> None:
+    """Build an approved employee request in the background, in its own session,
+    auto-continuing across run caps. Reports the result (or a clear failure) to
+    the owner chat — an approved build never dies silently."""
+    session_file = os.path.join(BUILD_SESSION_DIR, f".pedro-build-{req_id}.session")
+    prompt = APPROVED_IMPL_PROMPT.format(name=name, text=text, req_id=req_id)
+    await _continue_build(bot, chat_id, req_id, name, session_file, prompt)
+
+
+async def _continue_build(bot, chat_id, req_id, name, session_file, prompt) -> None:
+    async def _notify(rnd: int) -> None:
+        await bot.send_message(
+            chat_id,
+            f"⏳ Still building {name}'s request (run limit {rnd}/{BUILD_MAX_ROUNDS} "
+            "hit — continuing where it left off)…",
+        )
+
+    try:
+        reply = await _run_with_continues(
+            prompt,
+            session_file=session_file,
+            lock=_build_lock,
+            first_timeout=BUILD_ROUND_SECONDS,
+            round_timeout=BUILD_ROUND_SECONDS,
+            max_rounds=BUILD_MAX_ROUNDS,
+            notify=_notify,
+            resume_hint=f"reply 'continue build {req_id}'",
+        )
+    except Exception:  # noqa: BLE001 - background task; surface, never vanish
+        log.exception("approved build failed (req %s)", req_id)
+        reply = f"⚠️ Build for {name}'s request crashed — check the service logs."
+    for i in range(0, len(reply), TELEGRAM_MAX_MSG):
+        try:
+            await bot.send_message(chat_id, reply[i:i + TELEGRAM_MAX_MSG])
+        except Exception:  # noqa: BLE001
+            log.exception("failed to deliver build reply chunk")
+
+
+# Owner chat hooks for background builds: 'deploy build <id>' ships a finished
+# build's pending commit/push/deploy; 'continue build <id>' resumes one that
+# ran out of continuation rounds.
+_BUILD_CMD_RE = re.compile(r"^\s*(deploy|ship|push|continue)\s+build\s+([0-9a-f]{4,16})\s*$", re.I)
+
+BUILD_DEPLOY_PROMPT = (
+    "Greg just approved deployment in chat. Execute the pending commit / push / "
+    "deploy steps now, exactly as you summarized them, then report what shipped."
+)
+
+
+def _match_build_command(text: str):
+    """Return (verb, req_id, session_file) when the owner's message addresses a
+    background build and its session exists; None otherwise."""
+    m = _BUILD_CMD_RE.match(text or "")
+    if not m:
+        return None
+    verb, req_id = m.group(1).lower(), m.group(2)
+    session_file = os.path.join(BUILD_SESSION_DIR, f".pedro-build-{req_id}.session")
+    if not os.path.exists(session_file):
+        return None
+    return verb, req_id, session_file
 
 
 async def on_request_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1504,20 +1686,15 @@ async def on_request_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         pass
     employee_requests.notify_employee(rec["requester_id"], emp_msg)
 
-    # On approval, actually BUILD it: hand the request to the full owner brain
-    # (every tool + self-deploy). Confirm-first is baked into the prompt, so
-    # nothing reaches production without Greg's explicit yes in chat.
+    # On approval, actually BUILD it — in the background, in its own session,
+    # auto-continuing across run caps so big jobs (video renders, code changes)
+    # finish instead of dying at a 5-minute wall. Confirm-first is baked into
+    # the prompt: production deploys wait for Greg's 'deploy build <id>'.
     if status == "approved":
         chat_id = query.message.chat_id if query.message else rec["requester_id"]
-        try:
-            reply = await run_pedro(APPROVED_IMPL_PROMPT.format(name=name, text=text))
-        except PedroError as e:
-            reply = f"⚠️ Couldn't auto-start the build for {name}'s request: {e}"
-        for _i in range(0, len(reply), TELEGRAM_MAX_MSG):
-            try:
-                await ctx.bot.send_message(chat_id, reply[_i:_i + TELEGRAM_MAX_MSG])
-            except Exception:  # noqa: BLE001
-                pass
+        ctx.application.create_task(
+            _run_approved_build(ctx.bot, chat_id, req_id, name, text)
+        )
 
 
 async def _post_shutdown(application: Application) -> None:

@@ -11,9 +11,39 @@
 # requires Pedro to commit+push (see /data/greg/CLAUDE.md).
 set -uo pipefail
 
+# Never restart over a live claude run: pedro_brain flags each in-flight run
+# with a file here (named <pid>-<token>). Wait up to 30 min for the flags to
+# clear; drop flags whose owning process is gone.
+wait_for_idle_runs() {
+    local deadline now busy f base pid ts dir
+    deadline=$(( $(date +%s) + 1800 ))
+    while :; do
+        busy=0
+        now=$(date +%s)
+        for dir in /data/greg/.pedro-running /data/employees/.pedro-running; do
+            [ -d "$dir" ] || continue
+            for f in "$dir"/*; do
+                [ -e "$f" ] || continue
+                base=${f##*/}; pid=${base%%-*}
+                if ! [ -d "/proc/$pid" ]; then rm -f "$f" 2>/dev/null || true; continue; fi
+                ts=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+                if [ $(( now - ts )) -ge 7200 ]; then rm -f "$f" 2>/dev/null || true; continue; fi
+                busy=1
+            done
+        done
+        [ "$busy" -eq 0 ] && return 0
+        [ "$now" -ge "$deadline" ] && { logger -t nightshift-deploy "wait_for_idle_runs: still busy after 30 min - restarting anyway"; return 0; }
+        sleep 15
+    done
+}
+
 SENTINEL=/data/greg/.deploy-now
 MODE="$(head -c 64 "$SENTINEL" 2>/dev/null || true)"
 rm -f "$SENTINEL"   # consume immediately so a fresh touch re-triggers
+
+# A restart kills any in-flight claude run in the target service, losing
+# half-done work - wait for the run flags to clear first.
+wait_for_idle_runs
 
 # Always safe to restart — these are not the process that triggered this.
 systemctl restart nightshift-employees 2>/dev/null || true

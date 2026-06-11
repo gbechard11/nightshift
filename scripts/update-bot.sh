@@ -4,6 +4,36 @@
 
 set -euo pipefail
 
+# Single instance: a 30-min idle-wait must not overlap the next hourly run.
+exec 9>/tmp/update-bot.lock
+flock -n 9 || exit 0
+
+# Never restart over a live claude run: pedro_brain flags each in-flight run
+# with a file here (named <pid>-<token>). Wait up to 30 min for the flags to
+# clear; drop flags whose owning process is gone.
+wait_for_idle_runs() {
+    local deadline now busy f base pid ts dir
+    deadline=$(( $(date +%s) + 1800 ))
+    while :; do
+        busy=0
+        now=$(date +%s)
+        for dir in /data/greg/.pedro-running /data/employees/.pedro-running; do
+            [ -d "$dir" ] || continue
+            for f in "$dir"/*; do
+                [ -e "$f" ] || continue
+                base=${f##*/}; pid=${base%%-*}
+                if ! [ -d "/proc/$pid" ]; then rm -f "$f" 2>/dev/null || true; continue; fi
+                ts=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+                if [ $(( now - ts )) -ge 7200 ]; then rm -f "$f" 2>/dev/null || true; continue; fi
+                busy=1
+            done
+        done
+        [ "$busy" -eq 0 ] && return 0
+        [ "$now" -ge "$deadline" ] && { logger -t nightshift-deploy "wait_for_idle_runs: still busy after 30 min - restarting anyway"; return 0; }
+        sleep 15
+    done
+}
+
 cd /home/gregnightshift/nightshift
 
 LOCAL=$(git rev-parse HEAD)
@@ -15,6 +45,10 @@ if [ "$LOCAL" = "$REMOTE" ]; then
 fi
 
 CHANGED=$(git diff --name-only "$LOCAL" "$REMOTE" || true)
+
+# New code is ready to land - but never yank it out from under a live run.
+wait_for_idle_runs
+
 git reset --hard origin/main --quiet
 
 # If requirements changed, update venv

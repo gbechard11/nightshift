@@ -29,12 +29,21 @@ import asyncio
 import json
 import logging
 import os
+import time
 import uuid
 
 log = logging.getLogger("nightshift.brain")
 
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "/usr/bin/claude")
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT_SECONDS", "300"))
+
+# While any claude subprocess is alive, a flag file lives in this directory.
+# The root deploy/reset scripts wait for it to empty before restarting the
+# bots, so a restart never kills an in-flight run mid-task. Best-effort: a
+# caller that cannot write here (sandboxed employee service) just runs
+# unflagged. Stale flags (holder crashed) are ignored after _RUN_FLAG_MAX_AGE.
+RUN_FLAG_DIR = os.environ.get("PEDRO_RUN_FLAG_DIR", "/data/greg/.pedro-running")
+_RUN_FLAG_MAX_AGE = 7200  # seconds
 
 # Proactively rotate the persistent session before it grows past the standard
 # 200k context window (which would otherwise escalate into the paid 1M-context
@@ -56,6 +65,34 @@ class PedroError(Exception):
     """User-facing failure from a claude run (timeout, nonzero exit, etc.)."""
 
 
+class PedroTimeout(PedroError):
+    """The claude run hit its per-run time cap and was killed. The session (if
+    stateful) still holds the partial work — callers can resume it with a
+    'continue where you left off' prompt instead of stranding the task."""
+
+
+def _claim_run_flag() -> str | None:
+    """Mark a claude run as in-flight (see RUN_FLAG_DIR). Returns the flag
+    path, or None if the directory isn't writable from this service."""
+    try:
+        os.makedirs(RUN_FLAG_DIR, exist_ok=True)
+        flag = os.path.join(RUN_FLAG_DIR, f"{os.getpid()}-{uuid.uuid4().hex[:8]}")
+        with open(flag, "w") as f:
+            f.write(str(int(time.time())))
+        return flag
+    except OSError:
+        return None
+
+
+def _release_run_flag(flag: str | None) -> None:
+    if not flag:
+        return
+    try:
+        os.remove(flag)
+    except OSError:
+        pass
+
+
 async def _run_claude(args: list[str], workdir: str, timeout: int, env: dict | None = None):
     """Run claude; return (returncode, stdout_str, stderr_str).
     returncode is None on timeout or missing binary (message is in stderr_str)."""
@@ -69,12 +106,17 @@ async def _run_claude(args: list[str], workdir: str, timeout: int, env: dict | N
         )
     except FileNotFoundError:
         return None, "", f"claude binary not found at {CLAUDE_BIN}"
+    flag = _claim_run_flag()
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
+        log.warning("claude run killed at %ds cap (args: %s)", timeout,
+                    " ".join(args[:6]))
         return None, "", f"claude timed out after {timeout}s"
+    finally:
+        _release_run_flag(flag)
     return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
 
 
@@ -225,7 +267,9 @@ async def run_claude(
             rc, out, err = await _run_claude(args, workdir, timeout, env=env)
 
         if rc is None:
-            raise PedroError(err)  # timeout / missing-binary message
+            if "timed out" in err:
+                raise PedroTimeout(err)
+            raise PedroError(err)  # missing-binary message
         if rc != 0:
             raise PedroError(
                 f"claude exited {rc}:\n{(err.strip() or '(no stderr)')[:1500]}"
