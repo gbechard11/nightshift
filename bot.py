@@ -1795,6 +1795,15 @@ async def _post_shutdown(application: Application) -> None:
 
 
 # --- Envato Elements: search the subscription + download assets to Drive ------
+_ENVATO_TYPE_ALIASES = {
+    "video": "stock-video", "videos": "stock-video", "stockvideo": "stock-video",
+    "footage": "stock-video", "clip": "stock-video", "template": "video-templates",
+    "templates": "video-templates", "photo": "photos", "photos": "photos",
+    "image": "photos", "images": "photos", "pic": "photos", "font": "fonts",
+    "fonts": "fonts", "music": "music", "track": "music", "song": "music",
+    "sfx": "sound-effects", "sound": "sound-effects", "graphic": "graphics",
+    "graphics": "graphics", "3d": "3d", "presentation": "presentation-templates",
+}
 ENVATO_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "envato.py")
 
 
@@ -1818,18 +1827,27 @@ def _envato_err(proc):
 async def cmd_envato(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorized(update):
         return
-    query = " ".join(ctx.args or []).strip()
-    if not query:
+    args = ctx.args or []
+    if not args:
         await update.message.reply_text(
-            "Usage: /envato <search terms>\n"
-            "Example: /envato neon city skyline\n\n"
-            "I search Envato Elements (stock video, video templates, fonts, "
-            "graphics, music, SFX, photos) and download what you pick to Drive.\n"
+            "Usage: /envato [type] <search terms>\n"
+            "Examples: /envato neon city skyline   ·   /envato video drone city   ·   /envato fonts retro\n\n"
+            "Optional leading type: video, photos, fonts, music, sfx, graphics, templates, 3d.\n"
+            "Without one I search everything (video/photos/graphics first) and you tap a result to download to Drive.\n"
             "/envatostatus checks the session; /envatologin (re)connects it."
         )
         return
+    item_type = ""
+    if len(args) >= 2 and args[0].lower() in _ENVATO_TYPE_ALIASES:
+        item_type = _ENVATO_TYPE_ALIASES[args[0].lower()]
+        query = " ".join(args[1:]).strip()
+    else:
+        query = " ".join(args).strip()
     await ctx.bot.send_chat_action(update.message.chat_id, ChatAction.TYPING)
-    proc = await _run_envato(["search", query, "--json", "--limit", "6"])
+    _cmd = ["search", query, "--json", "--limit", "6"]
+    if item_type:
+        _cmd += ["--type", item_type]
+    proc = await _run_envato(_cmd)
     if proc.returncode != 0:
         await update.message.reply_text("\U0001F3AC Envato: " + _envato_err(proc))
         return

@@ -378,8 +378,20 @@ def _img_url(image) -> str:
     return ""
 
 
+# When no type filter is given, surface visual media before template/code
+# categories — /search/all groups results by type and WordPress/CMS kits would
+# otherwise dominate the top of the list.
+_TYPE_PRIORITY = ["stock-video", "video-templates", "photos", "graphics",
+                  "music", "sound-effects", "fonts", "graphic-templates", "3d",
+                  "presentation-templates", "add-ons", "web-templates",
+                  "cms-templates", "wordpress", "luts"]
+
+
 def search(query: str, item_type: str = "", page: int = 1, limit: int = 24) -> list[dict]:
-    """Search Elements. Returns [{id,title,url,type,thumbnail,author}]."""
+    """Search Elements. Returns [{id,title,url,type,thumbnail,author}].
+
+    With no item_type, results are ranked so video/photo/graphics/music come
+    before WordPress/CMS/template kits (Envato groups all-items by category)."""
     with _client() as c:
         r = c.get(BASE + "/search/all.data", params={"term": query})
         if _looks_logged_out(r):
@@ -405,9 +417,11 @@ def search(query: str, item_type: str = "", page: int = 1, limit: int = 24) -> l
             "thumbnail": _img_url(it.get("image")),
             "url": "%s/search/all/%s/%s" % (BASE, itype or "all", uuid),
         })
-        if len(items) >= limit:
-            break
-    return items
+    if not item_type:
+        # stable sort: keep Envato's within-type order, reorder the groups
+        rank = {t: i for i, t in enumerate(_TYPE_PRIORITY)}
+        items.sort(key=lambda x: rank.get(x["type"], len(_TYPE_PRIORITY)))
+    return items[:limit]
 
 
 # --- download -----------------------------------------------------------------
