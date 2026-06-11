@@ -586,10 +586,6 @@ async def prism_check_availability(start: str, end: str, weekdays: str = "", ven
     return "\n".join(lines)
 
 
-if __name__ == "__main__":
-    mcp.run()
-
-
 # ---------------------------------------------------------------------------
 # Meta ads — let the chat agent draft a campaign conversationally (no slash
 # commands), on ANY configured ad account (@nightshift, @pawnshop, ...). Spend
@@ -720,7 +716,7 @@ def list_ad_media() -> str:
 
 
 @mcp.tool()
-def research_audience(artist: str, genre: str = "", similar: str = "", account: str = "") -> str:
+async def research_audience(artist: str, genre: str = "", similar: str = "", account: str = "") -> str:
     """Find Meta targeting interest ids for an artist (plus optional genre and
     comma-separated similar artists). Read-only. The returned interest ids feed
     straight into draft_ad_campaign's `interest_ids`. `account` picks which ad
@@ -733,13 +729,11 @@ def research_audience(artist: str, genre: str = "", similar: str = "", account: 
         return "Ad account @%s isn't configured yet (no token) — tell Greg." % acct.key
     sims = [s.strip() for s in str(similar).replace(";", ",").split(",") if s.strip()]
 
-    async def _go():
+    try:
         async with httpx.AsyncClient(timeout=60.0) as client:
-            return await meta_ads.research_artist_targeting(
+            res = await meta_ads.research_artist_targeting(
                 client, artist, genre=genre or None, similar_artists=sims or None, acct=acct
             )
-    try:
-        res = asyncio.run(_go())
     except Exception as e:  # noqa: BLE001
         return "Research failed: %s" % e
     ids = res.get("all_ids", [])
@@ -748,9 +742,9 @@ def research_audience(artist: str, genre: str = "", similar: str = "", account: 
 
 
 @mcp.tool()
-def draft_ad_campaign(name: str, daily_cad: float, interest_ids: str = "",
-                      objective: str = "OUTCOME_TRAFFIC", ticket_link: str = "",
-                      caption: str = "", image: str = "", account: str = "") -> str:
+async def draft_ad_campaign(name: str, daily_cad: float, interest_ids: str = "",
+                            objective: str = "OUTCOME_TRAFFIC", ticket_link: str = "",
+                            caption: str = "", image: str = "", account: str = "") -> str:
     """Build a Meta (Facebook/Instagram) ad campaign — created PAUSED (no spend).
 
     Use this WHENEVER an employee asks you to make / build / run / launch / boost a
@@ -795,10 +789,10 @@ def draft_ad_campaign(name: str, daily_cad: float, interest_ids: str = "",
         return "Give the campaign a short name."
     ids = [x.strip() for x in str(interest_ids).replace(";", ",").split(",") if x.strip()]
     try:
-        res = asyncio.run(_build_campaign(
+        res = await _build_campaign(
             acct, str(name).strip(), daily, ids, (objective or "OUTCOME_TRAFFIC").strip(),
             str(ticket_link).strip(), str(caption).strip(), str(image).strip(),
-        ))
+        )
     except Exception as e:  # noqa: BLE001
         return "Draft failed (nothing was launched, no spend started): %s" % e
 
@@ -842,3 +836,9 @@ def draft_ad_campaign(name: str, daily_cad: float, interest_ids: str = "",
     return ("Built and staged on @%s — the campaign is PAUSED (no spend). I've sent the summary to "
             "your Telegram with a Launch button; spend only starts when you tap Launch. Do NOT tell "
             "the user it is already live." % acct.key + extra)
+
+
+# Server entry point — MUST stay at end of file so every @mcp.tool() above is
+# registered before the server starts (mcp.run() blocks). Do not move it up.
+if __name__ == "__main__":
+    mcp.run()
