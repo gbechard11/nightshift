@@ -60,7 +60,7 @@ import imap_email
 import mailer
 import pending_email
 import pending_campaign
-from pedro_brain import PedroError, run_claude
+from pedro_brain import CLAUDE_TIMEOUT, PedroError, PedroTimeout, run_claude
 
 TOKEN = os.environ["EMPLOYEE_BOT_TOKEN"]
 EMPLOYEE_USERS = {
@@ -102,6 +102,19 @@ REQUEST_MCP_CONFIG = os.environ.get(
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_TRANSCRIBE_MODEL = os.environ.get("GROQ_TRANSCRIBE_MODEL", "whisper-large-v3-turbo")
 TELEGRAM_MAX_MSG = 4000
+
+# Long-task continuation, same scheme as the owner bot: a run killed at its
+# per-run time cap is auto-resumed ("continue where you left off") instead of
+# dying with a raw "timed out" at the employee. The employee gets one heads-up
+# ping on the first cap so they don't re-send thinking the bot went idle.
+EMPLOYEE_CONTINUE_SECONDS = int(os.environ.get("EMPLOYEE_CONTINUE_SECONDS", "900"))
+EMPLOYEE_CONTINUE_ROUNDS = int(os.environ.get("EMPLOYEE_CONTINUE_ROUNDS", "6"))
+
+CONTINUE_PROMPT = (
+    "SYSTEM: your previous run was killed at its per-run time cap mid-task. "
+    "Resume EXACTLY where you left off and finish the job — do not start over "
+    "and do not redo completed steps. When done, reply as you normally would."
+)
 
 logging.basicConfig(
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
@@ -182,37 +195,78 @@ def _with_notes(uid: int, prompt: str) -> str:
 
 
 async def _ask(update: Update, ctx: ContextTypes.DEFAULT_TYPE, prompt: str) -> None:
-    """Run a restricted, per-employee, memory-keeping claude turn and reply."""
+    """Run a restricted, per-employee, memory-keeping claude turn and reply.
+
+    The run goes to the background so one employee's long task never blocks the
+    update loop (or the other employees). The per-user lock gives an instant
+    "still working" reply to follow-up messages, and a run killed at its time
+    cap auto-continues instead of dying — so nobody re-sends thinking the bot
+    went idle."""
     uid = update.effective_user.id
     lock = _locks.setdefault(uid, asyncio.Lock())
     if lock.locked():
         await update.message.reply_text(
-            "⏳ Still working on your previous message — one moment."
+            "⏳ Still working on your previous message — I'll reply here when "
+            "it's done, no need to re-send."
         )
         return
     await ctx.bot.send_chat_action(update.message.chat_id, ChatAction.TYPING)
     log.info("claude from %s: %s", uid, prompt[:200])
+    ctx.application.create_task(_ask_run(update, uid, lock, prompt))
+
+
+async def _ask_run(update: Update, uid: int, lock: asyncio.Lock, prompt: str) -> None:
+    kwargs = dict(
+        workdir=WORKDIR,
+        session_file=_session_file(uid),
+        disallowed_tools=EMPLOYEE_DENY_TOOLS,
+        strict_mcp=True,
+        mcp_config=REQUEST_MCP_CONFIG,
+        handoff_prompt=EMPLOYEE_HANDOFF,
+        env={
+            "NS_REQUESTER_ID": str(uid),
+            "NS_REQUESTER_NAME": employee_notify.who(uid),
+        },
+    )
+    out = None
     try:
-        out = await run_claude(
-            _with_notes(uid, prompt),
-            workdir=WORKDIR,
-            session_file=_session_file(uid),
-            disallowed_tools=EMPLOYEE_DENY_TOOLS,
-            strict_mcp=True,
-            mcp_config=REQUEST_MCP_CONFIG,
-            handoff_prompt=EMPLOYEE_HANDOFF,
-            env={
-                "NS_REQUESTER_ID": str(uid),
-                "NS_REQUESTER_NAME": employee_notify.who(uid),
-            },
-            lock=lock,
-        )
+        # Hold the lock across ALL rounds so the employee's follow-ups get the
+        # "still working" reply for the whole job, not just the first 5 min.
+        async with lock:
+            p, t = _with_notes(uid, prompt), CLAUDE_TIMEOUT
+            for rnd in range(1, EMPLOYEE_CONTINUE_ROUNDS + 1):
+                try:
+                    out = await run_claude(p, timeout=t, **kwargs)
+                    break
+                except PedroTimeout:
+                    if rnd == EMPLOYEE_CONTINUE_ROUNDS:
+                        out = (
+                            "⚠️ This job turned out bigger than my time budget "
+                            "and I had to stop. Your progress is saved — send "
+                            "'continue' and I'll pick it right back up."
+                        )
+                        break
+                    if rnd == 1:
+                        try:
+                            await update.message.reply_text(
+                                "⏳ This is a bigger job — I'm still on it in the "
+                                "background. I'll reply here when it's done; no "
+                                "need to re-send."
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                    p, t = CONTINUE_PROMPT, EMPLOYEE_CONTINUE_SECONDS
     except PedroError as e:
-        await update.message.reply_text(str(e))
-        return
+        out = str(e)
+    except Exception:  # noqa: BLE001 - background task; surface, never vanish
+        log.exception("employee run failed (uid %s)", uid)
+        out = "⚠️ Something broke mid-run — flag it to Greg if it keeps happening."
     _log_chat("out", uid, out)
     for i in range(0, len(out), TELEGRAM_MAX_MSG):
-        await update.message.reply_text(out[i:i + TELEGRAM_MAX_MSG])
+        try:
+            await update.message.reply_text(out[i:i + TELEGRAM_MAX_MSG])
+        except Exception:  # noqa: BLE001
+            log.exception("failed to deliver employee reply chunk (uid %s)", uid)
 
 
 async def _ingest_attachment(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
