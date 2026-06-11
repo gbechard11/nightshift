@@ -659,15 +659,27 @@ def _ad_account(account: str):
     return meta_ads.get_profile(account or None)
 
 
+def _is_video_file(path: str) -> bool:
+    """Detect MP4/M4V/QuickTime by the ISO base media file format ftyp box."""
+    try:
+        with open(path, "rb") as f:
+            header = f.read(12)
+        return len(header) >= 8 and header[4:8] == b"ftyp"
+    except OSError:
+        return False
+
+
 async def _resolve_creative_image(client, image: str, acct):
-    """Return (image_hash, image_url, label) for the ad creative image, uploaded to
-    the given account. Accepts http URL, ad-media filename, a chat-inbox image, or
-    a Google Drive file id. (None, None, None) when no image is given."""
+    """Return (image_hash, image_url, video_id, label) for the ad creative media.
+
+    Accepts http URL, ad-media filename, chat-inbox image, or Google Drive file id
+    (including mp4 video files). (None, None, None, None) when no image is given.
+    """
     image = (image or "").strip()
     if not image:
-        return None, None, None
+        return None, None, None, None
     if image.startswith("http"):
-        return None, image, image
+        return None, image, None, image
     _, ext = os.path.splitext(image)
     if ext.lower() in _AD_IMG_EXTS:
         path = None
@@ -680,7 +692,7 @@ async def _resolve_creative_image(client, image: str, acct):
         if not path:
             raise ValueError("image file not found in ad media or inbox: %s" % image)
         h = await meta_ads.upload_ad_image(client, path, acct=acct)
-        return h, None, os.path.basename(path)
+        return h, None, None, os.path.basename(path)
     work = os.path.join(DL_DIR, "adimg_" + secrets.token_hex(6))
     os.makedirs(work, exist_ok=True)
     try:
@@ -688,8 +700,11 @@ async def _resolve_creative_image(client, image: str, acct):
         msg = _gdrive(["download", "--file-id", image, "--out", raw])
         if not os.path.exists(raw):
             raise ValueError("couldn't download image from Drive id %s: %s" % (image, msg))
+        if _is_video_file(raw):
+            vid = await meta_ads.upload_ad_video(client, raw, acct=acct)
+            return None, None, vid, "Drive:" + image
         h = await meta_ads.upload_ad_image(client, raw, acct=acct)
-        return h, None, "Drive:" + image
+        return h, None, None, "Drive:" + image
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -697,7 +712,7 @@ async def _resolve_creative_image(client, image: str, acct):
 async def _build_campaign(acct, name, daily_cad, interest_ids, objective, ticket_link, caption, image):
     daily_cents = int(round(daily_cad * 100))
     targeting = meta_ads.build_targeting(interest_ids, countries=acct.default_countries)
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    async with httpx.AsyncClient(timeout=300.0) as client:
         camp = await meta_ads.create_campaign(client, name, objective=objective, acct=acct)
         campaign_id = camp.get("id")
         if not campaign_id:
@@ -709,11 +724,17 @@ async def _build_campaign(acct, name, daily_cad, interest_ids, objective, ticket
         creative_id = ad_id = image_label = creative_error = None
         if ticket_link and caption and adset_id:
             try:
-                image_hash, image_url, image_label = await _resolve_creative_image(client, image, acct)
-                creative = await meta_ads.create_adcreative(
-                    client, f"{name} — creative", ticket_link, caption,
-                    image_hash=image_hash, image_url=image_url, acct=acct,
-                )
+                image_hash, image_url, video_id, image_label = await _resolve_creative_image(client, image, acct)
+                if video_id:
+                    creative = await meta_ads.create_adcreative_video(
+                        client, f"{name} — creative", ticket_link, caption,
+                        video_id=video_id, acct=acct,
+                    )
+                else:
+                    creative = await meta_ads.create_adcreative(
+                        client, f"{name} — creative", ticket_link, caption,
+                        image_hash=image_hash, image_url=image_url, acct=acct,
+                    )
                 creative_id = creative.get("id")
                 if creative_id:
                     ad = await meta_ads.create_ad(client, adset_id, f"{name} — ad", creative_id, acct=acct)

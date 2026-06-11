@@ -127,3 +127,44 @@ def add_optout(email: str) -> bool:
         with open(OPTOUT_EMAIL, "a") as f:
             f.write(email + "\n")
     return True
+
+
+def load_optout_set() -> set:
+    """All opted-out addresses as a lowercased set."""
+    s = set()
+    if os.path.exists(OPTOUT_EMAIL):
+        with open(OPTOUT_EMAIL) as f:
+            for line in f:
+                v = line.strip().lower()
+                if v and not v.startswith("#"):
+                    s.add(v)
+    return s
+
+
+def scrub_csv(path: str) -> int:
+    """Remove rows containing any opted-out address from a customer CSV.
+
+    Field-exact (a whole cell must equal an opt-out address) so a suffix like
+    'im@x.com' never accidentally removes 'tim@x.com'. Only rewrites the file
+    when something is actually removed. Returns the row count removed.
+    """
+    import csv as _csv
+    opt = load_optout_set()
+    if not opt or not os.path.exists(path):
+        return 0
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        rows = list(_csv.reader(f))
+    if not rows:
+        return 0
+    header, body = rows[0], rows[1:]
+    kept = [r for r in body
+            if not any((c or "").strip().lower() in opt for c in r)]
+    removed = len(body) - len(kept)
+    if removed:
+        tmp = path + ".tmp"
+        with open(tmp, "w", newline="", encoding="utf-8-sig") as f:
+            w = _csv.writer(f)
+            w.writerow(header)
+            w.writerows(kept)
+        os.replace(tmp, path)
+    return removed
