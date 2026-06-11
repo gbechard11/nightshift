@@ -536,15 +536,24 @@ async def cmd_draft(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 try:
                     # If image_url looks like a filename (not http), treat it as a
                     # local media file — resolve it, upload to Meta, use the hash.
+                    video_id = None
                     if image_url and not image_url.startswith("http"):
                         file_path = meta_ads.resolve_media_path(image_url)
-                        image_hash = await meta_ads.upload_ad_image(client, file_path, acct=acct)
+                        if meta_ads.is_video(file_path):
+                            video_id = await meta_ads.upload_ad_video(client, file_path, acct=acct)
+                        else:
+                            image_hash = await meta_ads.upload_ad_image(client, file_path, acct=acct)
                         image_label = image_url  # show the original filename in confirmation
                         image_url = None  # clear so create_adcreative uses hash path
-                    creative = await meta_ads.create_adcreative(
-                        client, f"{name} — creative", ticket_link, caption,
-                        image_hash=image_hash, image_url=image_url, acct=acct,
-                    )
+                    if video_id:
+                        creative = await meta_ads.create_adcreative_video(
+                            client, f"{name} — creative", ticket_link, caption, video_id, acct=acct,
+                        )
+                    else:
+                        creative = await meta_ads.create_adcreative(
+                            client, f"{name} — creative", ticket_link, caption,
+                            image_hash=image_hash, image_url=image_url, acct=acct,
+                        )
                     creative_id = creative.get("id")
                     if creative_id:
                         ad = await meta_ads.create_ad(
@@ -646,17 +655,21 @@ async def cmd_campaign(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             image_hash = None
             image_url = None
             image_label = None
+            video_id = None
             if image:
                 if image.startswith("http"):
                     image_url = image
                     image_label = image
                 else:
                     file_path = meta_ads.resolve_media_path(image)
-                    image_hash = await meta_ads.upload_ad_image(client, file_path)
+                    if meta_ads.is_video(file_path):
+                        video_id = await meta_ads.upload_ad_video(client, file_path)
+                    else:
+                        image_hash = await meta_ads.upload_ad_image(client, file_path)
                     image_label = image
             res = await meta_ads.build_show_campaign(
                 client, name, daily_cad, ticket_link, caption,
-                interest_ids=interest_ids, image_hash=image_hash, image_url=image_url,
+                interest_ids=interest_ids, image_hash=image_hash, image_url=image_url, video_id=video_id,
             )
     except meta_ads.MetaError as e:
         await update.message.reply_text(f"Campaign build failed (nothing launched): {e}")

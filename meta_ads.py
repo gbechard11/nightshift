@@ -619,6 +619,115 @@ async def upload_ad_image(
     return h
 
 
+async def upload_ad_video(
+    client: httpx.AsyncClient, file_path: str, acct: "AdProfile | None" = None
+) -> str:
+    """Upload a local video file to Meta's ad video library.
+
+    Returns the video id string for use in create_adcreative_video() as `video_id`.
+    Meta processes the video asynchronously; the id is available immediately for
+    creative creation even before processing completes.
+    """
+    import pathlib
+    a = _resolve(acct)
+    _require_account(a)
+    path = pathlib.Path(file_path)
+    raw = path.read_bytes()
+    resp = await client.post(
+        f"{_base()}/{a.ad_account_id}/advideos",
+        data={"access_token": a.token},
+        files={"source": (path.name or "ad_video.mp4", raw, "video/mp4")},
+    )
+    body = _handle(resp)
+    vid = body.get("id")
+    if not vid:
+        raise MetaError(f"Meta video upload returned no id: {body}")
+    log.info("Uploaded video %s → id %s (@%s)", path.name, vid, a.key)
+    return vid
+
+
+def is_video(filename: str) -> bool:
+    """True if a filename looks like a video (so callers route to the video path)."""
+    return str(filename).lower().rsplit(".", 1)[-1] in {"mp4", "mov", "m4v", "webm", "avi"}
+
+
+async def wait_for_video(client, video_id, acct=None, timeout=180, interval=5):
+    """Poll until Meta finishes processing an uploaded video. Returns True if ready,
+    False on timeout (caller may still proceed). Raises on processing error."""
+    import asyncio
+    a = _resolve(acct)
+    waited = 0
+    while waited < timeout:
+        resp = await client.get(f"{_base()}/{video_id}", params={"access_token": a.token, "fields": "status"})
+        st = (_handle(resp).get("status") or {})
+        vs = st.get("video_status")
+        if vs == "ready":
+            return True
+        if vs == "error":
+            raise MetaError(f"Video {video_id} processing failed: {st}")
+        await asyncio.sleep(interval)
+        waited += interval
+    return False
+
+
+async def get_video_thumbnail(client, video_id, acct=None):
+    """Return a thumbnail URI for a processed video (Meta's preferred frame if any)."""
+    a = _resolve(acct)
+    resp = await client.get(f"{_base()}/{video_id}/thumbnails", params={"access_token": a.token, "fields": "uri,is_preferred"})
+    data = _handle(resp).get("data", []) or []
+    if not data:
+        return None
+    pref = [t for t in data if t.get("is_preferred")]
+    return (pref[0] if pref else data[0]).get("uri")
+
+
+async def create_adcreative_video(
+    client: httpx.AsyncClient,
+    name: str,
+    link: str,
+    caption: str,
+    video_id: str,
+    call_to_action_type: str = "GET_EVENT_TICKETS",
+    url_tags: str | None = None,
+    image_hash: str | None = None,
+    image_url: str | None = None,
+    acct: "AdProfile | None" = None,
+) -> dict:
+    """Create a video ad creative. Returns {'id': ...}.
+
+    Video ads REQUIRE a thumbnail. If image_hash/image_url aren't supplied, this
+    waits for Meta to finish processing the video and uses its auto-generated
+    poster frame. video_id comes from upload_ad_video(). Works for 9x16 Stories
+    and 3x4 Feed — Meta crops per placement.
+    """
+    import json
+    a = _resolve(acct)
+    _require_account(a)
+    _require_page(a)
+    if not image_hash and not image_url:
+        await wait_for_video(client, video_id, acct=a)
+        image_url = await get_video_thumbnail(client, video_id, acct=a)
+    video_data = {
+        "video_id": video_id,
+        "message": caption,
+        "call_to_action": {"type": call_to_action_type, "value": {"link": link}},
+    }
+    if image_hash:
+        video_data["image_hash"] = image_hash
+    elif image_url:
+        video_data["image_url"] = image_url
+    story_spec = {"page_id": a.page_id, "video_data": video_data}
+    data = {"name": name, "object_story_spec": json.dumps(story_spec)}
+    if url_tags is None:
+        url_tags = (
+            "utm_source=facebook&utm_medium=paid_social"
+            "&utm_campaign={{campaign.name}}&utm_term={{adset.name}}"
+            "&utm_content={{ad.name}}&utm_id={{ad.id}}"
+        )
+    data["url_tags"] = url_tags
+    return await _post(client, f"{a.ad_account_id}/adcreatives", data, token=a.token)
+
+
 async def create_adcreative(
     client: httpx.AsyncClient,
     name: str,
@@ -780,6 +889,7 @@ async def build_show_campaign(
     interest_ids: list[str] | None = None,
     image_hash: str | None = None,
     image_url: str | None = None,
+    video_id: str | None = None,
     countries: list[str] | None = None,
     acct: "AdProfile | None" = None,
 ) -> dict:
@@ -812,8 +922,12 @@ async def build_show_campaign(
         "Cold": build_targeting(interest_ids=interest_ids, excluded_custom_audiences=retarget_ids + lal_ids, countries=countries),
     }
 
-    creative = await create_adcreative(client, f"{name} — creative", ticket_link, caption,
-                                       image_hash=image_hash, image_url=image_url, acct=a)
+    if video_id:
+        creative = await create_adcreative_video(client, f"{name} — creative", ticket_link, caption,
+                                                 video_id, image_hash=image_hash, image_url=image_url, acct=a)
+    else:
+        creative = await create_adcreative(client, f"{name} — creative", ticket_link, caption,
+                                           image_hash=image_hash, image_url=image_url, acct=a)
     creative_id = creative["id"]
 
     adsets = []
