@@ -86,3 +86,10 @@ if ! crontab -l 2>/dev/null | grep -qF "seba_briefing.py"; then
     (crontab -l 2>/dev/null; echo "$SEBA_CRON") | crontab -
     logger -t nightshift-update "Installed seba_briefing cron"
 fi
+
+# Ensure scheduled-blast fire cron is installed (idempotent)
+FIRE_CRON="* * * * * /home/gregnightshift/nightshift/.venv/bin/python /home/gregnightshift/nightshift/scripts/blast_queue.py fire-scheduled >> /data/greg/blast_queue/scheduled_fire.log 2>&1"
+if ! crontab -l 2>/dev/null | grep -qF "fire-scheduled"; then
+    (crontab -l 2>/dev/null; echo "$FIRE_CRON") | crontab -
+    logger -t nightshift-update "Installed blast fire-scheduled cron"
+fi
