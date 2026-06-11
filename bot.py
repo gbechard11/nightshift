@@ -186,7 +186,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "mail, deal-critical first (read-only; default 90 days)\n"
             "/wire <recipient> <amount_usd> - prep an Agility Forex wire "
             "(info only, never sends money)\n"
-            "/wire list - known wire recipients"
+            "/wire list - known wire recipients\n"
+            "/prismtoken <token> - refresh the Prism access token (click the "
+            "Prism-Token bookmarklet on app.prism.fm, then paste here)"
         )
 
 
@@ -979,6 +981,95 @@ WIRE_NOT_CONFIGURED = (
 )
 
 
+PRISM_ENV_PATH = os.environ.get("PRISM_ENV_PATH", "/home/gregnightshift/nightshift/.env")
+
+
+def _set_env_key(key: str, val: str) -> None:
+    """Update (or append) KEY=val in the .env file, backing it up first."""
+    try:
+        shutil.copy(PRISM_ENV_PATH, "%s.bak.%d" % (PRISM_ENV_PATH, int(datetime.now().timestamp())))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        lines = open(PRISM_ENV_PATH).read().splitlines()
+    except FileNotFoundError:
+        lines = []
+    out, found = [], False
+    for ln in lines:
+        if ln.startswith(key + "="):
+            out.append("%s=%s" % (key, val)); found = True
+        else:
+            out.append(ln)
+    if not found:
+        out.append("%s=%s" % (key, val))
+    open(PRISM_ENV_PATH, "w").write("\n".join(out) + "\n")
+
+
+async def cmd_prismtoken(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: refresh Prism's browser access token (the ~daily chore, as one paste).
+
+    Prism can't auto-mint tokens (Cognito needs a secret), and its long-lived
+    Developer/SDK token is license-barred from AI use — so we ride the browser
+    token. Paste a fresh one here; it's written to .env + the running module, and
+    both the owner bot and the per-turn employee MCP pick it up with no restart.
+    """
+    if not authorized(update) or not _is_owner(update):
+        return
+    raw = (update.message.text or "").partition(" ")[2].strip()
+    token = raw.split()[0].strip() if raw else ""
+    if not token:
+        await update.message.reply_text(
+            "Usage: /prismtoken <token>\n\n"
+            "Grab it from a logged-in app.prism.fm tab: click the Prism-Token bookmarklet "
+            "(copies it to your clipboard), then send /prismtoken and paste. Or in the browser "
+            "console run  copy(localStorage.getItem('token'))."
+        )
+        return
+    if token.count(".") != 2 or len(token) < 100:
+        await update.message.reply_text(
+            "That doesn't look like a Prism JWT. Paste the value of localStorage.getItem('token')."
+        )
+        return
+    exp = prism._jwt_exp(token)
+    now = int(datetime.now().timestamp())
+    if exp <= now:
+        await update.message.reply_text("That token is already expired — grab a fresh one and resend.")
+        return
+    hrs = round((exp - now) / 3600, 1)
+
+    # Persist + live-update the running owner module (employee MCP re-reads .env per turn).
+    _set_env_key("PRISM_ACCESS_TOKEN", token)
+    prism.ACCESS_TOKEN_ENV = token
+    # Best-effort: delete the message so the raw token doesn't linger in chat history.
+    try:
+        await ctx.bot.delete_message(update.effective_chat.id, update.message.message_id)
+    except Exception:  # noqa: BLE001
+        pass
+
+    today = datetime.now().date()
+    start, end = today.isoformat(), (today + timedelta(days=120)).isoformat()
+    result = "✅ Prism token saved (valid ~%sh)." % hrs
+    for attempt in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=40.0) as client:
+                shows = await prism.list_shows(client, start, end)
+            result = ("✅ Prism token updated — valid ~%sh. Live read OK (%d shows visible). "
+                      "Both bots can read Prism now." % (hrs, len(shows)))
+            break
+        except prism.PrismError as e:
+            m = re.search(r"(\d+\.\d+\.\d+)", str(e))
+            if "App-Version" in str(e) and attempt == 0 and m:
+                _set_env_key("PRISM_APP_VERSION", m.group(1))
+                prism.APP_VERSION = m.group(1)
+                continue
+            result = "⚠️ Token saved, but the live read failed: %s" % (str(e)[:300])
+            break
+        except Exception as e:  # noqa: BLE001
+            result = "⚠️ Token saved, but the live read failed: %s: %s" % (type(e).__name__, str(e)[:200])
+            break
+    await update.message.reply_text(result)
+
+
 async def cmd_wire(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # Owner-only: this surfaces banking details. Never moves money.
     if not _is_owner(update):
@@ -1425,6 +1516,7 @@ def main() -> None:
     app.add_handler(CommandHandler("show", cmd_show))
     app.add_handler(CommandHandler("settlement", cmd_settlement))
     app.add_handler(CommandHandler("wire", cmd_wire))
+    app.add_handler(CommandHandler("prismtoken", cmd_prismtoken))
     app.add_handler(CommandHandler("triage", cmd_triage))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("status", cmd_status))

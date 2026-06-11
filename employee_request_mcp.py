@@ -31,6 +31,14 @@ try:
             if line and not line.startswith("#") and "=" in line:
                 k, v = line.split("=", 1)
                 os.environ.setdefault(k.strip(), v.strip())
+                # The Prism browser token is refreshed in .env out-of-band (via
+                # Pedro's owner-only /prismtoken). The inherited service env can
+                # hold a STALE one, and setdefault won't replace it, so OVERRIDE
+                # just these PRISM keys from the freshest .env on every spawn.
+                # SCOPED to PRISM_* only — a blanket override would re-introduce
+                # greg's IMAP/SMTP creds that the service deliberately strips.
+                if k.strip() in ("PRISM_ACCESS_TOKEN", "PRISM_APP_VERSION"):
+                    os.environ[k.strip()] = v.strip()
 except FileNotFoundError:
     pass
 
