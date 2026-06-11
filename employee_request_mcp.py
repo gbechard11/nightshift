@@ -954,6 +954,203 @@ async def showpass_event(slug: str) -> str:
     return showpass.format_event_detail(ev)
 
 
+# ---------------------------------------------------------------------------
+# fetch_url — browse a URL and return readable text / event info.
+# Ticketmaster and TicketWeb block headless browsers and raw HTTP fetches, so
+# we parse their URLs directly (venue/city are embedded in the slug). For all
+# other URLs we use httpx with a realistic UA.
+# ---------------------------------------------------------------------------
+import re as _re  # noqa: E402
+import urllib.parse as _up  # noqa: E402
+
+
+def _titlecase_slug(s: str) -> str:
+    """'burton-cummings-theatre' → 'Burton Cummings Theatre'"""
+    return " ".join(w.capitalize() for w in s.split("-"))
+
+
+def _parse_ticketweb(url: str) -> str:
+    """Extract event info from a TicketWeb URL.
+
+    TicketWeb slug format: {event-name}-{YEAR}-{venue-name}-tickets/{id}
+    The venue name is reliably embedded in the slug after the year.
+    """
+    try:
+        path = _up.urlparse(url).path.rstrip("/")
+        parts = path.split("/")
+        # /event/{slug}/{id}  OR  /event/{slug}
+        slug = parts[-2] if parts[-1].isdigit() else parts[-1]
+        event_id = parts[-1] if parts[-1].isdigit() else ""
+        slug_clean = _re.sub(r"-tickets?$", "", slug, flags=_re.IGNORECASE)
+        m = _re.search(r"-(\d{4})-(.+)$", slug_clean)
+        if m:
+            year = m.group(1)
+            venue_slug = m.group(2)
+            # Strip state/province suffix if it looks like a 2-letter abbrev
+            venue_parts = venue_slug.split("-")
+            if len(venue_parts) > 1 and len(venue_parts[-1]) == 2 and venue_parts[-1].isalpha():
+                venue_slug = "-".join(venue_parts[:-1])
+            venue = _titlecase_slug(venue_slug)
+            event_name_slug = slug_clean[: slug_clean.index("-%s-" % year)]
+            event_name = _titlecase_slug(event_name_slug)
+            lines = [
+                "TicketWeb event info (parsed from URL):",
+                "Event: %s" % event_name,
+                "Year: %s" % year,
+                "Venue: %s" % venue,
+            ]
+            if event_id:
+                lines.append("Event ID: %s" % event_id)
+            lines.append("Ticket link: %s" % url)
+            return "\n".join(lines)
+    except Exception:  # noqa: BLE001
+        pass
+    return "Could not parse TicketWeb URL: %s" % url
+
+
+def _parse_ticketmaster(url: str) -> str:
+    """Extract event info from a Ticketmaster URL.
+
+    Ticketmaster slug format: {artist}-{city}-{province}-{MM-DD-YYYY}/event/{id}
+    City and province are embedded in the slug after the year token.
+    Venue is NOT in the URL (look it up via the Ticketmaster Discovery API
+    if TICKETMASTER_API_KEY is set in .env, otherwise return city/province).
+    """
+    try:
+        path = _up.urlparse(url).path.rstrip("/")
+        m_id = _re.search(r"/event/([A-Z0-9]+)$", path, _re.IGNORECASE)
+        event_id = m_id.group(1) if m_id else ""
+        slug = path.split("/event/")[0].rstrip("/").split("/")[-1] if "/event/" in path else path.split("/")[-1]
+
+        # Date at end: MM-DD-YYYY
+        m_date = _re.search(r"(\d{2}-\d{2}-\d{4})$", slug)
+        date_str = ""
+        if m_date:
+            date_str = m_date.group(1)
+            slug_no_date = slug[: slug.rfind(date_str)].rstrip("-")
+        else:
+            slug_no_date = slug
+
+        # Year token in slug: find the YYYY
+        m_year = _re.search(r"-(\d{4})-", slug_no_date)
+        city = province = ""
+        event_name = ""
+        if m_year:
+            year_token = m_year.group(1)
+            year_pos = slug_no_date.rindex("-%s-" % year_token)
+            event_name_slug = slug_no_date[:year_pos]
+            after_year = slug_no_date[year_pos + len("-%s-" % year_token):]
+            loc_parts = after_year.split("-")
+            if len(loc_parts) >= 2:
+                city = _titlecase_slug("-".join(loc_parts[:-1]))
+                province = loc_parts[-1].upper()
+            elif loc_parts:
+                city = _titlecase_slug(loc_parts[0])
+            event_name = _titlecase_slug(event_name_slug) + " %s" % year_token
+        else:
+            event_name = _titlecase_slug(slug_no_date)
+
+        # Try Discovery API if key available
+        tm_key = os.environ.get("TICKETMASTER_API_KEY", "")
+        venue = ""
+        if tm_key and event_id:
+            try:
+                r = httpx.get(
+                    "https://app.ticketmaster.com/discovery/v2/events/%s" % event_id,
+                    params={"apikey": tm_key},
+                    timeout=8,
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    venues = (data.get("_embedded") or {}).get("venues") or []
+                    if venues:
+                        venue = venues[0].get("name", "")
+            except Exception:  # noqa: BLE001
+                pass
+
+        lines = ["Ticketmaster event info (parsed from URL):"]
+        lines.append("Event: %s" % event_name)
+        if date_str:
+            lines.append("Date: %s" % date_str)
+        if city:
+            lines.append("City: %s" % city)
+        if province:
+            lines.append("Province/State: %s" % province)
+        if venue:
+            lines.append("Venue: %s" % venue)
+        else:
+            lines.append(
+                "Venue: not available from URL"
+                + (" (set TICKETMASTER_API_KEY in .env to enable lookup)" if not tm_key else "")
+            )
+        if event_id:
+            lines.append("Event ID: %s" % event_id)
+        lines.append("Ticket link: %s" % url)
+        return "\n".join(lines)
+    except Exception:  # noqa: BLE001
+        pass
+    return "Could not parse Ticketmaster URL: %s" % url
+
+
+@mcp.tool()
+async def fetch_url(url: str) -> str:
+    """Fetch a URL and return its readable text content.
+
+    Works on most normal websites. Has special handling for ticketing sites
+    that block bots:
+    - ticketweb.ca / ticketweb.com: extracts venue, event name, and year
+      directly from the URL slug (no network call needed).
+    - ticketmaster.ca / ticketmaster.com / livenation.com: extracts city,
+      province/state, and date from the URL slug; fetches the venue name from
+      the Ticketmaster Discovery API if TICKETMASTER_API_KEY is set in .env.
+
+    Use this whenever you need to read a web page — a ticket link, an event
+    page, a news article, etc. — and the built-in WebFetch returns empty or
+    blocked content.
+    """
+    url = url.strip()
+    if not url:
+        raise ValueError("Provide a URL.")
+    host = _up.urlparse(url).netloc.lower().lstrip("www.")
+
+    # Known ticketing sites: parse from URL (bot-blocked, no plain-fetch fallback)
+    if any(h in host for h in ("ticketweb.ca", "ticketweb.com")):
+        return _parse_ticketweb(url)
+    if any(h in host for h in ("ticketmaster.ca", "ticketmaster.com", "livenation.com")):
+        return _parse_ticketmaster(url)
+
+    # Generic fetch
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/130.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-CA,en;q=0.9",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True, headers=headers) as client:
+            r = await client.get(url)
+        if r.status_code >= 400:
+            return "HTTP %d fetching %s" % (r.status_code, url)
+        ct = r.headers.get("content-type", "")
+        if "json" in ct:
+            return r.text[:8000]
+        # Strip HTML tags for readability
+        text = _re.sub(r"<[^>]+>", " ", r.text)
+        text = _re.sub(r"\s{3,}", "\n\n", text).strip()
+        if not text or len(text) < 100:
+            return (
+                "The page at %s appears to be JavaScript-rendered and "
+                "returned no readable text. For event details, ask Greg to "
+                "look it up and paste the venue name directly." % url
+            )
+        return text[:8000]
+    except Exception as e:  # noqa: BLE001
+        return "Could not fetch %s: %s" % (url, e)
+
+
 # Server entry point — MUST stay at end of file so every @mcp.tool() above is
 # registered before the server starts (mcp.run() blocks). Do not move it up.
 if __name__ == "__main__":
