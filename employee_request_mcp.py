@@ -911,6 +911,43 @@ async def draft_ad_campaign(name: str, daily_cad: float, interest_ids: str = "",
             "the user it is already live." % acct.key + extra)
 
 
+
+# ---------------------------------------------------------------------------
+# Showpass (ticketing) — read-only lookups against the public Discovery API.
+# Both brands (Nightshift + Pawn Shop) are one Showpass org (ID 41). These use
+# no credentials, so they are safe for employees; anything write-shaped
+# (discounts, tracking links) stays Greg/Pedro-side in showpass.py.
+# ---------------------------------------------------------------------------
+import showpass  # noqa: E402
+
+
+@mcp.tool()
+async def showpass_events(query: str = "", days: int = 0) -> str:
+    """List our upcoming Showpass events (Nightshift + Pawn Shop ticketing) with
+    on-sale links. READ-ONLY. Use when an employee asks what's on sale, wants a
+    ticket link, or needs an event's Showpass slug. `query` filters by event or
+    venue name; `days` (optional) caps how far ahead to look."""
+    try:
+        evs = await asyncio.to_thread(
+            showpass.list_events, query, days if days > 0 else None
+        )
+    except Exception as e:  # noqa: BLE001
+        return "Showpass lookup failed: %s" % e
+    return showpass.format_events(evs)
+
+
+@mcp.tool()
+async def showpass_event(slug: str) -> str:
+    """Full public detail for one Showpass event: dates, venue, ticket types,
+    prices, sold-out status. READ-ONLY. `slug` is the part after showpass.com/
+    in the event URL (get it from showpass_events)."""
+    try:
+        ev = await asyncio.to_thread(showpass.get_event, slug)
+    except Exception as e:  # noqa: BLE001
+        return "Showpass lookup failed: %s" % e
+    return showpass.format_event_detail(ev)
+
+
 # Server entry point — MUST stay at end of file so every @mcp.tool() above is
 # registered before the server starts (mcp.run() blocks). Do not move it up.
 if __name__ == "__main__":
