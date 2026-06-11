@@ -50,11 +50,10 @@ STATE_FILE = os.environ.get("PRISM_WATCH_STATE", "/data/greg/.prism_watch_state.
 REAUTH_SENTINEL = os.environ.get("PRISM_REAUTH_SENTINEL", "/data/greg/.prism_reauth_pinged")
 
 REAUTH_MSG = (
-    "🔑 Prism login expired — Pedro can't read the calendar until you re-auth "
-    "(this is the ~monthly refresh; auto-renew handles the rest).\n\n"
-    "1. Log out of app.prism.fm and log back in.\n"
-    "2. Click your Prism-Token bookmark, then paste it to me here.\n"
-    "Done — good for another ~30 days."
+    "🔑 Prism token expired — Pedro can't read the calendar right now.\n\n"
+    "Quick fix (~10 sec): on a logged-in app.prism.fm tab, click your Prism-Token "
+    "bookmark, then paste it to me here. Good for another ~24h.\n"
+    "(If Prism shows you logged out, log in first — that part's only ~monthly.)"
 )
 
 
@@ -71,7 +70,10 @@ async def _notify(client, text: str) -> None:
 
 def _looks_like_expired_auth(err: str) -> bool:
     e = err.lower()
-    return any(s in e for s in ("refresh token", "expired", "revoked", "notauthorized", "not authorized", "no prism_refresh_token"))
+    return any(s in e for s in (
+        "refresh token", "expired", "revoked", "notauthorized", "not authorized",
+        "no prism_refresh_token", "secret", "401", "unauthorized",
+    ))
 
 
 def _load_state() -> dict:
