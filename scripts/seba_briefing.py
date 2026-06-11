@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Daily 8am briefing emailer for Seba (seba@nightshiftent.ca).
+Daily 8am briefing for Seba — delivered via Telegram chat (employee bot).
 Cron: 0 14 * * *  (8am MDT = 14:00 UTC)
 
 Parts:
@@ -20,8 +20,7 @@ from pathlib import Path
 
 ENV_FILE = Path('/home/gregnightshift/nightshift/.env')
 BRAIN_FILE = Path('/data/greg/brain/BRAIN.md')
-EMAIL_SEND = Path('/home/gregnightshift/nightshift/scripts/email_send.py')
-RECIPIENT = 'seba@nightshiftent.ca'
+TELEGRAM_SEND = Path('/home/gregnightshift/nightshift/scripts/telegram_send.py')
 
 
 def load_env():
@@ -157,14 +156,10 @@ def main():
     inbox = fetch_seba_inbox()
     body = build_body(items, inbox)
 
-    today = datetime.now().strftime('%a %b %-d')
-    subject = f'Daily Briefing — {today}'
-
     result = subprocess.run(
-        [sys.executable, str(EMAIL_SEND),
-         '--to', RECIPIENT,
-         '--subject', subject,
-         '--body', body],
+        [sys.executable, str(TELEGRAM_SEND),
+         '--to', 'seba',
+         '--msg', body[:4000]],
         capture_output=True, text=True
     )
 
@@ -173,7 +168,7 @@ def main():
         sys.exit(result.returncode)
 
     inbox_count = len(inbox) if isinstance(inbox, list) else 'n/a'
-    print(f'Sent. Items: {len(items)}, Inbox entries: {inbox_count}')
+    print(f'Sent to chat. Items: {len(items)}, Inbox entries: {inbox_count}')
 
 
 if __name__ == '__main__':

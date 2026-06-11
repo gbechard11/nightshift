@@ -45,3 +45,10 @@ sudo systemctl restart nightshift-employees 2>/dev/null || true
 sudo systemctl restart nightshift-mcp 2>/dev/null || true
 
 logger -t nightshift-update "Deployed $LOCAL -> $REMOTE. Changed: $(echo "$CHANGED" | tr '\n' ' ')"
+
+# Ensure seba daily briefing cron is installed (idempotent)
+SEBA_CRON="0 14 * * * /home/gregnightshift/nightshift/scripts/seba_briefing.py >> /tmp/seba_briefing.log 2>&1"
+if ! crontab -l 2>/dev/null | grep -qF "seba_briefing.py"; then
+    (crontab -l 2>/dev/null; echo "$SEBA_CRON") | crontab -
+    logger -t nightshift-update "Installed seba_briefing cron"
+fi
