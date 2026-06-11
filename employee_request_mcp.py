@@ -481,6 +481,19 @@ _WEEKDAY_ALIASES = {
 _WD_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 
+def _ord(n) -> str:
+    """1 -> '1st', 2 -> '2nd', 11 -> '11th', etc. (for hold positions)."""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return "?"
+    if 10 <= n % 100 <= 20:
+        suf = "th"
+    else:
+        suf = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return "%d%s" % (n, suf)
+
+
 @mcp.tool()
 async def prism_list_shows(start: str, end: str) -> str:
     """List Prism shows and holds between two dates (YYYY-MM-DD inclusive) — i.e.
@@ -503,14 +516,18 @@ async def prism_list_shows(start: str, end: str) -> str:
 
 @mcp.tool()
 async def prism_check_availability(start: str, end: str, weekdays: str = "", venue: str = "") -> str:
-    """Check which dates are OPEN vs BOOKED in Prism between start and end
-    (YYYY-MM-DD inclusive). READ-ONLY. Use for 'what dates are available/open'.
+    """Check which dates are OPEN, HELD, or BOOKED in Prism between start and end
+    (YYYY-MM-DD inclusive). READ-ONLY. Use for 'what dates are available/open' and
+    hold-position questions. Factors in BOTH confirmed shows AND holds — a date
+    with no confirmed show can still carry a 1st/2nd/… hold, so OPEN here means no
+    confirmed show AND no live hold. For HELD dates it shows the hold positions and
+    the next available position.
 
     `weekdays`: optional comma list to narrow days, e.g. 'Fri,Sat' for
     Friday/Saturday avails. `venue`: optional venue-name filter (substring, e.g.
-    'Union Hall') — pass it whenever the employee asks about a specific room,
-    because a date can be open at one venue and booked at another. With no venue,
-    a date is only OPEN if nothing is booked anywhere that day."""
+    'Union Hall' or 'Pawn Shop') — pass it whenever the employee asks about a
+    specific room, because a date can be open at one venue and held/booked at
+    another."""
     if not prism.configured():
         return "Prism isn't connected yet (no refresh token on the server) — tell Greg."
     try:
@@ -536,10 +553,12 @@ async def prism_check_availability(start: str, end: str, weekdays: str = "", ven
     try:
         async with httpx.AsyncClient(timeout=45.0) as client:
             shows = await prism.list_shows(client, start, end)
+            holds = await prism.list_holds(client, start, end)
     except Exception as e:  # noqa: BLE001
         return "Prism lookup failed: %s" % e
 
     by_date: dict[str, list] = {}
+    holds_by_date: dict[str, list] = {}
     venues_seen = set()
     for s in shows:
         day = s.get("start")
@@ -552,6 +571,18 @@ async def prism_check_availability(start: str, end: str, weekdays: str = "", ven
         if ven and ven not in vname.lower():
             continue
         by_date.setdefault(day, []).append(s)
+    for h in holds:
+        if h.get("cleared"):
+            continue
+        day = h.get("date")
+        if not day:
+            continue
+        vname = h.get("venue") or ""
+        if vname:
+            venues_seen.add(vname)
+        if ven and ven not in vname.lower():
+            continue
+        holds_by_date.setdefault(day, []).append(h)
 
     header = "Prism availability %s → %s" % (start, end)
     if venue:
@@ -569,6 +600,7 @@ async def prism_check_availability(start: str, end: str, weekdays: str = "", ven
             iso = cur.isoformat()
             label = "%s %s" % (_WD_NAMES[cur.weekday()], iso)
             booked = by_date.get(iso, [])
+            held = sorted(holds_by_date.get(iso, []), key=lambda h: h.get("level") or 0)
             if booked:
                 tags = ", ".join(
                     "%s%s [%s]" % (
@@ -578,7 +610,19 @@ async def prism_check_availability(start: str, end: str, weekdays: str = "", ven
                     )
                     for b in booked
                 )
-                lines.append("• %s — BOOKED: %s" % (label, tags))
+                extra = "  (+%d hold%s)" % (len(held), "" if len(held) == 1 else "s") if held else ""
+                lines.append("• %s — BOOKED: %s%s" % (label, tags, extra))
+            elif held:
+                nextpos = max((h.get("level") or 0) for h in held) + 1
+                hs = ", ".join(
+                    "%s%s (%s)" % (
+                        h["artist"],
+                        (" @ %s" % h["venue"]) if h.get("venue") else "",
+                        _ord(h.get("level")),
+                    )
+                    for h in held
+                )
+                lines.append("• %s — HELD: %s → next open position %s" % (label, hs, _ord(nextpos)))
             else:
                 lines.append("• %s — OPEN" % label)
             shown += 1
@@ -588,8 +632,8 @@ async def prism_check_availability(start: str, end: str, weekdays: str = "", ven
         lines.append("…(stopped at 80 dates — narrow the range or use weekdays=)")
     if not venue and venues_seen:
         lines.append("")
-        lines.append("Note: no venue filter — 'OPEN' means nothing booked at ANY venue. "
-                     "Venues with bookings in range: %s. Re-run with venue= for a specific room."
+        lines.append("Note: no venue filter — OPEN means nothing confirmed or held at ANY venue. "
+                     "Venues with activity in range: %s. Re-run with venue= for a specific room."
                      % ", ".join(sorted(venues_seen)))
     return "\n".join(lines)
 

@@ -290,6 +290,57 @@ async def get_show(client: httpx.AsyncClient, event_id: int | str) -> dict | Non
     return None
 
 
+# --- Holds ------------------------------------------------------------------
+# The calendar's /confirmed-and-meta-dates does NOT include holds — the app loads
+# those from a separate endpoint. Availability questions MUST factor holds in: a
+# date with no confirmed show can still carry a 1st/2nd/… hold. Each row exposes
+# hold_level (1=1st/lead, 2=2nd…), cleared, is_pending, the date at date.date
+# (nested), the artist at event.name, and the venue at stage[0].venue.name.
+def _normalize_hold(row: dict) -> dict:
+    d = row.get("date") or {}
+    stage = row.get("stage") or []
+    venue = None
+    if isinstance(stage, list) and stage:
+        v = (stage[0] or {}).get("venue") or {}
+        venue = v.get("name")
+    ev = row.get("event") or {}
+    return {
+        "date": str(d.get("date") or "")[:10],
+        "venue": venue,
+        "artist": (ev.get("name") or "").strip() or "(untitled)",
+        "level": row.get("hold_level"),
+        "cleared": bool(row.get("cleared")),
+        "pending": bool(row.get("is_pending")),
+    }
+
+
+async def list_holds(
+    client: httpx.AsyncClient, start: str, end: str, include_cleared: bool = False
+) -> list[dict]:
+    """Return holds between `start` and `end` (YYYY-MM-DD), normalized.
+
+    Hits /api/holds. By default excludes cleared holds (so the result is the set
+    of LIVE holds that affect availability) but includes pending ones.
+    """
+    params = {
+        "start": start,
+        "end": end,
+        "includeClearedHolds": "true" if include_cleared else "false",
+        "includePendingHolds": "true",
+    }
+    data = await _get(client, "holds", params)
+    rows = data if isinstance(data, list) else (data.get("data") or [])
+    holds = [_normalize_hold(r) for r in rows]
+    holds.sort(key=lambda h: (h.get("date") or "", h.get("level") or 0))
+    return holds
+
+
+def next_hold_position(holds: list[dict]) -> int:
+    """Next available hold position = highest uncleared hold_level + 1 (1 if none)."""
+    levels = [h.get("level") or 0 for h in holds if not h.get("cleared")]
+    return (max(levels) + 1) if levels else 1
+
+
 # --- Settlement / financials -----------------------------------------------
 # The single endpoint /api/events/{id}/build returns the COMPLETE event record at
 # its top level (not the small `data` sub-object): tickets[], cost_groups[].costs[],
