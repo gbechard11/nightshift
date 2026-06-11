@@ -187,8 +187,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "/wire <recipient> <amount_usd> - prep an Agility Forex wire "
             "(info only, never sends money)\n"
             "/wire list - known wire recipients\n"
-            "/prismtoken <token> - refresh the Prism access token (click the "
-            "Prism-Token bookmarklet on app.prism.fm, then paste here)"
+            "/prismtoken <token> - update Prism auth (click the Prism-Token "
+            "bookmarklet on app.prism.fm, then paste here). Paste the refresh "
+            "token and Pedro auto-renews for ~30 days."
         )
 
 
@@ -1006,12 +1007,18 @@ def _set_env_key(key: str, val: str) -> None:
 
 
 async def cmd_prismtoken(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Owner-only: refresh Prism's browser access token (the ~daily chore, as one paste).
+    """Owner-only: update Prism auth. Accepts EITHER token from a logged-in
+    app.prism.fm tab:
 
-    Prism can't auto-mint tokens (Cognito needs a secret), and its long-lived
-    Developer/SDK token is license-barred from AI use — so we ride the browser
-    token. Paste a fresh one here; it's written to .env + the running module, and
-    both the owner bot and the per-turn employee MCP pick it up with no restart.
+      • the REFRESH token (localStorage 'refreshToken', not a JWT) — DURABLE: Pedro
+        then auto-mints its own ~1h access tokens via Cognito for ~30 days, so you
+        only do this about once a month. PREFERRED.
+      • the access token (localStorage 'token', a JWT) — one-off, lasts ~1h.
+
+    Prism's Cognito app client is public (no secret), so REFRESH_TOKEN_AUTH works
+    headless — the old 'needs a secret' belief was a misdiagnosis; it only ever
+    failed on an expired refresh token. Written to .env + the running module; the
+    per-turn employee MCP re-reads .env, so both bots pick it up with no restart.
     """
     if not authorized(update) or not _is_owner(update):
         return
@@ -1020,41 +1027,54 @@ async def cmd_prismtoken(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     if not token:
         await update.message.reply_text(
             "Usage: /prismtoken <token>\n\n"
-            "Grab it from a logged-in app.prism.fm tab: click the Prism-Token bookmarklet "
-            "(copies it to your clipboard), then send /prismtoken and paste. Or in the browser "
-            "console run  copy(localStorage.getItem('token'))."
+            "Best: paste the DURABLE refresh token — click the Prism-Token bookmarklet on a "
+            "logged-in app.prism.fm tab (it copies the right one), then send /prismtoken and paste. "
+            "Pedro then auto-refreshes itself for ~30 days."
         )
         return
-    if token.count(".") != 2 or len(token) < 100:
-        await update.message.reply_text(
-            "That doesn't look like a Prism JWT. Paste the value of localStorage.getItem('token')."
-        )
-        return
-    exp = prism._jwt_exp(token)
-    now = int(datetime.now().timestamp())
-    if exp <= now:
-        await update.message.reply_text("That token is already expired — grab a fresh one and resend.")
-        return
-    hrs = round((exp - now) / 3600, 1)
 
-    # Persist + live-update the running owner module (employee MCP re-reads .env per turn).
-    _set_env_key("PRISM_ACCESS_TOKEN", token)
-    prism.ACCESS_TOKEN_ENV = token
-    # Best-effort: delete the message so the raw token doesn't linger in chat history.
+    is_jwt = token.count(".") == 2 and len(token) > 100
+    # Delete the message first so the raw credential doesn't linger in chat.
     try:
         await ctx.bot.delete_message(update.effective_chat.id, update.message.message_id)
     except Exception:  # noqa: BLE001
         pass
 
+    if is_jwt:
+        # One-off access token (~1h).
+        exp = prism._jwt_exp(token)
+        now = int(datetime.now().timestamp())
+        if exp <= now:
+            await update.message.reply_text("That access token is already expired — grab a fresh one.")
+            return
+        hrs = round((exp - now) / 3600, 1)
+        _set_env_key("PRISM_ACCESS_TOKEN", token)
+        prism.ACCESS_TOKEN_ENV = token
+        ok_msg = ("✅ Prism access token updated — valid ~%sh. Live read OK (%%d shows). "
+                  "Tip: paste the *refresh* token instead and Pedro auto-renews for ~30 days." % hrs)
+    else:
+        # Durable refresh token (~30d) — Pedro mints access tokens itself.
+        if len(token) < 100:
+            await update.message.reply_text(
+                "That doesn't look like a Prism token. Use the Prism-Token bookmarklet, "
+                "or paste localStorage.getItem('refreshToken')."
+            )
+            return
+        _set_env_key("PRISM_REFRESH_TOKEN", token)
+        _set_env_key("PRISM_ACCESS_TOKEN", "")  # drop any stale pinned token so refresh-mint is used
+        prism.REFRESH_TOKEN = token
+        prism.ACCESS_TOKEN_ENV = ""
+        ok_msg = ("✅ Prism refresh token saved — Pedro now auto-mints its own access tokens for "
+                  "~30 days (no more hourly pasting). Live read OK (%d shows).")
+
     today = datetime.now().date()
     start, end = today.isoformat(), (today + timedelta(days=120)).isoformat()
-    result = "✅ Prism token saved (valid ~%sh)." % hrs
+    result = ok_msg.replace("%d", "?") if "%d" not in ok_msg else None
     for attempt in range(2):
         try:
             async with httpx.AsyncClient(timeout=40.0) as client:
                 shows = await prism.list_shows(client, start, end)
-            result = ("✅ Prism token updated — valid ~%sh. Live read OK (%d shows visible). "
-                      "Both bots can read Prism now." % (hrs, len(shows)))
+            result = ok_msg % len(shows)
             break
         except prism.PrismError as e:
             m = re.search(r"(\d+\.\d+\.\d+)", str(e))
@@ -1062,10 +1082,10 @@ async def cmd_prismtoken(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
                 _set_env_key("PRISM_APP_VERSION", m.group(1))
                 prism.APP_VERSION = m.group(1)
                 continue
-            result = "⚠️ Token saved, but the live read failed: %s" % (str(e)[:300])
+            result = "⚠️ Saved, but the live read failed: %s" % (str(e)[:300])
             break
         except Exception as e:  # noqa: BLE001
-            result = "⚠️ Token saved, but the live read failed: %s: %s" % (type(e).__name__, str(e)[:200])
+            result = "⚠️ Saved, but the live read failed: %s: %s" % (type(e).__name__, str(e)[:200])
             break
     await update.message.reply_text(result)
 

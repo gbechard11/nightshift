@@ -37,7 +37,7 @@ try:
                 # just these PRISM keys from the freshest .env on every spawn.
                 # SCOPED to PRISM_* only — a blanket override would re-introduce
                 # greg's IMAP/SMTP creds that the service deliberately strips.
-                if k.strip() in ("PRISM_ACCESS_TOKEN", "PRISM_APP_VERSION"):
+                if k.strip() in ("PRISM_ACCESS_TOKEN", "PRISM_REFRESH_TOKEN", "PRISM_APP_VERSION"):
                     os.environ[k.strip()] = v.strip()
 except FileNotFoundError:
     pass

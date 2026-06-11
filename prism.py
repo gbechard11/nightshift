@@ -141,10 +141,11 @@ async def _refresh_access_token(client: httpx.AsyncClient) -> str:
             body = {}
         kind = body.get("__type", "")
         msg = body.get("message", resp.text[:300])
-        # Prism's Cognito app client is CONFIDENTIAL (has a client secret), so a
-        # browser/headless REFRESH_TOKEN_AUTH call is rejected for missing
-        # SECRET_HASH. We don't hold the secret, so automatic refresh isn't
-        # possible — fall back to a pasted short-lived access token.
+        # NOTE (corrected 2026-06-11): Prism's Cognito app client is actually
+        # PUBLIC (no secret) — verified live, REFRESH_TOKEN_AUTH succeeds with just
+        # ClientId. Earlier "needs a secret" failures were a MISDIAGNOSIS of an
+        # expired/revoked refresh token. This branch is kept only as a defensive
+        # guard in case Prism ever switches to a confidential client.
         if "SECRET_HASH" in msg or "secret" in msg.lower():
             raise PrismError(
                 "Prism's Cognito client requires a secret we don't have, so Pedro "
