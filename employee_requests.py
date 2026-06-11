@@ -56,6 +56,49 @@ def set_status(req_id, status):
     return rec
 
 
+def mark_auto_approved(req_id, category):
+    """Green-light a request without the owner's button tap (e.g. Seba's media
+    lane). The owner-bot watcher picks it up and builds it."""
+    rec = load(req_id)
+    if not rec:
+        return None
+    rec["status"] = "approved"
+    rec["auto"] = True
+    rec["category"] = category
+    rec["decided"] = int(time.time())
+    with open(_path(req_id), "w", encoding="utf-8") as f:
+        json.dump(rec, f)
+    return rec
+
+
+def list_auto_pending():
+    """Auto-approved requests whose build hasn't been started yet."""
+    out = []
+    try:
+        names = os.listdir(REQ_DIR)
+    except FileNotFoundError:
+        return out
+    for n in names:
+        if not n.endswith(".json"):
+            continue
+        rec = load(n[:-5])
+        if rec and rec.get("auto") and rec.get("status") == "approved" \
+                and not rec.get("build_started"):
+            out.append(rec)
+    out.sort(key=lambda r: r.get("created", 0))
+    return out
+
+
+def mark_build_started(req_id):
+    rec = load(req_id)
+    if not rec:
+        return None
+    rec["build_started"] = int(time.time())
+    with open(_path(req_id), "w", encoding="utf-8") as f:
+        json.dump(rec, f)
+    return rec
+
+
 def notify_employee(chat_id, text):
     """Message an employee via the employee bot token. Best-effort, never raises."""
     if not _EMPLOYEE_TOKEN:

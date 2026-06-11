@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 import os
 import platform
@@ -7,7 +6,6 @@ import re
 import secrets
 import shutil
 import subprocess
-import sys
 from datetime import datetime, timedelta
 
 import httpx
@@ -84,8 +82,6 @@ PENDING_CALLS: dict[str, dict] = {}
 # The campaign already exists (PAUSED, no spend); the button only flips it ACTIVE.
 PENDING_CAMPAIGNS: dict[str, dict] = {}
 PENDING_WIRES: dict[str, dict] = {}
-# Envato search results awaiting a download tap, keyed by token.
-PENDING_ENVATO: dict[str, dict] = {}
 
 META_NOT_CONFIGURED = (
     "📣 Meta Ads isn't configured yet. Set META_ACCESS_TOKEN (a System User token "
@@ -245,8 +241,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/shows [days|all] - upcoming Prism shows (default: next 60 days)\n"
         "/show <event_id>  - details for one Prism show\n"
         "/settlement <event_id> - ticket revenue, taxes, expenses for a show\n"
-        "/envato <terms> - search Envato Elements (stock video, fonts, graphics, music) + download to Drive\n"
-        "/envatostatus - check the Envato Elements session\n"
         "/new           - clear conversation memory, start fresh\n"
         "/status        - VPS health\n"
         "/whoami        - your Telegram user ID\n\n"
@@ -262,9 +256,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "/wire list - known wire recipients\n"
             "/prismtoken <token> - update Prism auth (click the Prism-Token "
             "bookmarklet on app.prism.fm, then paste here). Paste the refresh "
-            "token and Pedro auto-renews for ~30 days.\n"
-            "/envatologin - connect/refresh the Envato Elements session "
-            "(paste a 'Copy as cURL' from a logged-in elements.envato.com browser)."
+            "token and Pedro auto-renews for ~30 days."
         )
 
 
@@ -354,9 +346,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     text = (update.message.text or "").strip()
     if not text:
-        return
-    if ctx.user_data.get("awaiting_envato_cookie"):
-        await _handle_envato_cookie(update, ctx, text)
         return
     if _is_owner(update):
         hit = _match_build_command(text)
@@ -1487,8 +1476,9 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _post_init(application: Application) -> None:
-    """Start the Twilio WhatsApp webhook server on the bot's event loop,
-    alongside Telegram long-polling. No-op if Twilio isn't configured."""
+    """Start the auto-build watcher and the Twilio WhatsApp webhook server on
+    the bot's event loop, alongside Telegram long-polling."""
+    application.create_task(_auto_build_watcher(application))
     if not whatsapp.configured():
         log.info("WhatsApp not configured (Twilio env vars unset) — webhook skipped")
         return
@@ -1622,6 +1612,84 @@ async def _continue_build(bot, chat_id, req_id, name, session_file, prompt) -> N
             log.exception("failed to deliver build reply chunk")
 
 
+MEDIA_IMPL_PROMPT = (
+    "A media/content request from {name} was AUTO-APPROVED — Greg has given "
+    "{name} a standing green light for media work, so do NOT ask Greg for "
+    "approval and do NOT wait for sign-off. Build it now.\n\n"
+    "Request:\n{text}\n\n"
+    "Scope guardrail — this lane is CONTENT PRODUCTION ONLY: creating/revising "
+    "videos, graphics, copy, ad creatives, Drive assets. Any campaign you touch "
+    "stays PAUSED, zero spend. If the task turns out to need code changes, a "
+    "deploy, money movement, or a mass send, STOP that part and say it needs "
+    "Greg's normal approval.\n"
+    "Long tasks are fine: you are auto-resumed at run limits — never wrap up "
+    "early because of time. Deliver the assets (save under /data/greg and "
+    "upload to Drive where it makes sense), then reply with a tight summary: "
+    "what you made, where it lives (Drive links/paths), and anything {name} "
+    "should check."
+)
+
+
+async def _run_media_build(bot, rec: dict) -> None:
+    """Build an auto-approved media request and deliver the result to the
+    requesting employee (their lane), with an FYI copy to Greg."""
+    req_id = rec["id"]
+    name = rec.get("requester_name", "employee")
+    session_file = os.path.join(BUILD_SESSION_DIR, f".pedro-build-{req_id}.session")
+    prompt = MEDIA_IMPL_PROMPT.format(name=name, text=rec.get("text", ""))
+
+    async def _notify(rnd: int) -> None:
+        if rnd == 1:
+            employee_requests.notify_employee(
+                rec["requester_id"],
+                "⏳ Your media request is a bigger job — still on it, I'll "
+                "message you here when it's ready.",
+            )
+
+    try:
+        reply = await _run_with_continues(
+            prompt,
+            session_file=session_file,
+            lock=_build_lock,
+            first_timeout=BUILD_ROUND_SECONDS,
+            round_timeout=BUILD_ROUND_SECONDS,
+            max_rounds=BUILD_MAX_ROUNDS,
+            notify=_notify,
+            resume_hint=f"reply 'continue build {req_id}'",
+        )
+    except Exception:  # noqa: BLE001 - background task; surface, never vanish
+        log.exception("media build failed (req %s)", req_id)
+        reply = "⚠️ The build crashed — flag it to Greg."
+    employee_requests.set_status(req_id, "done")
+    employee_requests.notify_employee(
+        rec["requester_id"], ("✅ Your media request is done:\n\n" + reply)[:4000]
+    )
+    fyi = f"🎨 [auto-approved media] {name}'s request {req_id} finished:\n\n{reply}"
+    for i in range(0, len(fyi), TELEGRAM_MAX_MSG):
+        try:
+            await bot.send_message(OWNER_ID, fyi[i:i + TELEGRAM_MAX_MSG])
+        except Exception:  # noqa: BLE001
+            log.exception("failed to deliver media build FYI chunk")
+
+
+AUTO_BUILD_POLL_SECONDS = int(os.environ.get("PEDRO_AUTO_BUILD_POLL_SECONDS", "20"))
+
+
+async def _auto_build_watcher(application: Application) -> None:
+    """Pick up auto-approved (green-light) requests written by the employee MCP
+    and build them — the MCP runs in another process, so disk is the handoff."""
+    while True:
+        try:
+            for rec in employee_requests.list_auto_pending():
+                employee_requests.mark_build_started(rec["id"])
+                log.info("auto-build pickup: %s from %s", rec["id"],
+                         rec.get("requester_name"))
+                application.create_task(_run_media_build(application.bot, rec))
+        except Exception:  # noqa: BLE001 - the watcher must never die
+            log.exception("auto-build watcher tick failed")
+        await asyncio.sleep(AUTO_BUILD_POLL_SECONDS)
+
+
 # Owner chat hooks for background builds: 'deploy build <id>' ships a finished
 # build's pending commit/push/deploy; 'continue build <id>' resumes one that
 # ran out of continuation rounds.
@@ -1714,170 +1782,6 @@ async def _post_shutdown(application: Application) -> None:
         await runner.cleanup()
 
 
-
-# --- Envato Elements: search the subscription + download assets to Drive ------
-ENVATO_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "envato.py")
-
-
-async def _run_envato(args, timeout=300, stdin_text=None):
-    """Run the envato.py CLI in a worker thread; return the CompletedProcess."""
-    cmd = [sys.executable, ENVATO_PY, *args]
-    return await asyncio.to_thread(
-        subprocess.run, cmd, capture_output=True, text=True, timeout=timeout,
-        input=stdin_text, cwd=os.path.dirname(ENVATO_PY),
-    )
-
-
-def _envato_err(proc):
-    blob = (proc.stderr or proc.stdout or "").strip()
-    try:
-        return (json.loads(blob).get("error") or blob)[:300]
-    except Exception:  # noqa: BLE001
-        return (blob or "unknown error")[:300]
-
-
-async def cmd_envato(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not authorized(update):
-        return
-    query = " ".join(ctx.args or []).strip()
-    if not query:
-        await update.message.reply_text(
-            "Usage: /envato <search terms>\n"
-            "Example: /envato neon city skyline\n\n"
-            "I search Envato Elements (stock video, video templates, fonts, "
-            "graphics, music, SFX, photos) and download what you pick to Drive.\n"
-            "/envatostatus checks the session; /envatologin (re)connects it."
-        )
-        return
-    await ctx.bot.send_chat_action(update.message.chat_id, ChatAction.TYPING)
-    proc = await _run_envato(["search", query, "--json", "--limit", "6"])
-    if proc.returncode != 0:
-        await update.message.reply_text("\U0001F3AC Envato: " + _envato_err(proc))
-        return
-    try:
-        results = json.loads(proc.stdout or "[]")
-    except Exception:  # noqa: BLE001
-        results = []
-    if not results:
-        await update.message.reply_text("No Envato results for \u201c%s\u201d." % query)
-        return
-    rows, lines = [], []
-    for it in results[:6]:
-        tok = secrets.token_urlsafe(6)
-        PENDING_ENVATO[tok] = {"url": it.get("url", ""), "id": it.get("id", ""),
-                               "type": it.get("type", "")}
-        label = (it.get("title") or it.get("type") or it.get("id") or "asset")[:40]
-        lines.append("\u2022 %s \u2014 %s" % (it.get("type") or "asset", it.get("url")))
-        rows.append([InlineKeyboardButton("\u2B07\uFE0F " + label, callback_data="env:dl:" + tok)])
-    await update.message.reply_text(
-        "\U0001F3AC Envato results for \u201c%s\u201d \u2014 tap to download to Drive:\n\n%s"
-        % (query, "\n".join(lines)),
-        reply_markup=InlineKeyboardMarkup(rows),
-    )
-
-
-async def on_envato_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    q = update.callback_query
-    await q.answer()
-    if not authorized(update):
-        return
-    try:
-        _, _action, tok = q.data.split(":", 2)
-    except ValueError:
-        return
-    item = PENDING_ENVATO.pop(tok, None)
-    if not item:
-        await q.edit_message_text("That Envato result expired \u2014 search again with /envato.")
-        return
-    await q.edit_message_text("\u2B07\uFE0F Downloading %s and saving to Drive\u2026"
-                              % (item.get("type") or "asset"))
-    ctx.application.create_task(_envato_download_task(q, item))
-
-
-async def _envato_download_task(q, item) -> None:
-    try:
-        proc = await _run_envato(
-            ["download", item.get("url") or item.get("id"), "--to-drive", "--json"],
-            timeout=900)
-    except Exception:  # noqa: BLE001
-        log.exception("envato download failed")
-        await q.message.reply_text("\U0001F3AC Envato download crashed \u2014 check service logs.")
-        return
-    if proc.returncode != 0:
-        await q.message.reply_text("\U0001F3AC Envato download failed: " + _envato_err(proc))
-        return
-    try:
-        res = json.loads(proc.stdout or "{}")
-    except Exception:  # noqa: BLE001
-        res = {}
-    link = (res.get("drive") or {}).get("link", "")
-    size = res.get("bytes", 0)
-    if link:
-        await q.message.reply_text("\u2705 Saved to Drive (%s bytes)\n%s" % (format(size, ","), link))
-    else:
-        await q.message.reply_text("\u2705 Downloaded (%s bytes): %s" % (format(size, ","), res.get("saved", "")))
-
-
-async def cmd_envatostatus(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not authorized(update):
-        return
-    proc = await _run_envato(["status", "--json"])
-    try:
-        s = json.loads(proc.stdout or proc.stderr or "{}")
-    except Exception:  # noqa: BLE001
-        s = {}
-    if not s.get("configured"):
-        await update.message.reply_text(
-            "\U0001F3AC Envato isn't connected yet. Use /envatologin to seed the session.")
-        return
-    ok = s.get("valid")
-    await update.message.reply_text(
-        "\U0001F3AC Envato session: %s \u00b7 account %s \u00b7 age %sd \u00b7 %s cookies%s"
-        % ("\u2705 valid" if ok else "\u26a0\uFE0F invalid/expired",
-           s.get("account") or "?", s.get("age_days"), s.get("cookie_count"),
-           "" if ok else "\nRe-seed with /envatologin."))
-
-
-async def cmd_envatologin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_owner(update):
-        await update.message.reply_text("Only Greg can connect the Envato session.")
-        return
-    ctx.user_data["awaiting_envato_cookie"] = True
-    await update.message.reply_text(
-        "\U0001F3AC Connect Envato Elements (one-time, ~2 min):\n\n"
-        "1. Log into elements.envato.com in Chrome.\n"
-        "2. Press F12 \u2192 Network tab.\n"
-        "3. Reload the page (Ctrl+R).\n"
-        "4. Click the top request (named elements.envato.com, type 'document').\n"
-        "5. Right-click \u2192 Copy \u2192 Copy as cURL (bash).\n"
-        "6. Paste it here as your next message.\n\n"
-        "Send /cancel to abort.")
-
-
-async def _handle_envato_cookie(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text) -> None:
-    ctx.user_data.pop("awaiting_envato_cookie", None)
-    if text.strip().lower() in ("/cancel", "cancel"):
-        await update.message.reply_text("Cancelled \u2014 Envato not changed.")
-        return
-    await update.message.reply_text("\U0001F3AC Seeding the Envato session\u2026")
-    proc = await _run_envato(["login", "--auto", "-"], stdin_text=text)
-    if proc.returncode != 0:
-        await update.message.reply_text(
-            "Couldn't read those cookies: " + _envato_err(proc)
-            + "\n\nTry /envatologin again and paste the full 'Copy as cURL'.")
-        return
-    st = await _run_envato(["status", "--json"])
-    try:
-        s = json.loads(st.stdout or "{}")
-    except Exception:  # noqa: BLE001
-        s = {}
-    await update.message.reply_text(
-        "\u2705 Envato connected \u2014 session "
-        + ("valid" if s.get("valid") else "seeded (validates on first search)")
-        + ((", account %s" % s.get("account")) if s.get("account") else "")
-        + ".\n\nTry it: /envato neon city skyline")
-
-
 def main() -> None:
     app = (
         Application.builder()
@@ -1908,14 +1812,10 @@ def main() -> None:
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("sebamail", cmd_sebamail))
     app.add_handler(CommandHandler("andrewmail", cmd_andrewmail))
-    app.add_handler(CommandHandler("envato", cmd_envato))
-    app.add_handler(CommandHandler("envatologin", cmd_envatologin))
-    app.add_handler(CommandHandler("envatostatus", cmd_envatostatus))
     app.add_handler(CallbackQueryHandler(on_call_button, pattern=r"^call:"))
     app.add_handler(CallbackQueryHandler(on_campaign_button, pattern=r"^camp:"))
     app.add_handler(CallbackQueryHandler(on_wire_button, pattern=r"^wire:"))
     app.add_handler(CallbackQueryHandler(on_request_button, pattern=r"^req:"))
-    app.add_handler(CallbackQueryHandler(on_envato_button, pattern=r"^env:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, on_attachment))

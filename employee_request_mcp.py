@@ -89,19 +89,46 @@ def _gdrive(args, timeout=120):
     return out or "(no output)"
 
 
+# Employees whose MEDIA/CONTENT requests are pre-approved by Greg (no button
+# tap) — "he has green light to cook whatever he needs on the media side".
+# Code changes, money, and mass sends still go through normal approval.
+MEDIA_GREENLIGHT_UIDS = {
+    int(x) for x in os.environ.get("MEDIA_GREENLIGHT_UIDS", "8722742818").split(",")
+    if x.strip()
+}
+
+
 @mcp.tool()
-def submit_request(text: str) -> str:
+def submit_request(text: str, category: str = "") -> str:
     """Forward a feature request, idea, or task to Greg (the owner) for approval.
 
     Use this only for things you genuinely CANNOT do yourself with your other
     tools -- a brand-new capability, money/wire actions, or anything that needs
     Greg's sign-off. `text` is the full request in the employee's words.
+
+    Set category="media" when the request is media/content CREATION or REVISION
+    work -- video edits, graphics, ad creatives, social content, Drive assets.
+    For pre-approved media specialists (Seba) that lane is green-lit
+    automatically and the build starts immediately, no waiting on Greg. Never
+    use category="media" for code changes, money/spend, or mass sends -- those
+    always need Greg's sign-off.
     """
     rid = _uid()
     if not rid:
         return "I couldn't identify who's asking. Ask them to use the /request command instead."
     name = os.environ.get("NS_REQUESTER_NAME") or employee_notify.who(rid)
     rec = employee_requests.submit(int(rid), name, text)
+    if category.strip().lower() == "media" and int(rid) in MEDIA_GREENLIGHT_UIDS:
+        employee_requests.mark_auto_approved(rec["id"], "media")
+        employee_notify.notify_owner(
+            "🎨 Auto-approved %s's media request %s (green-light lane) — building "
+            "now, no action needed:\n\n%s" % (name, rec["id"], text[:600])
+        )
+        return (
+            "Green-lit automatically (media lane, request %s) -- the build is "
+            "starting now. You'll get the result here when it's ready, usually "
+            "without waiting on Greg." % rec["id"]
+        )
     employee_notify.notify_owner_request(rec)
     return (
         "Done -- sent to Greg for approval (request %s). "
