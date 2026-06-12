@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/home/gregnightshift/nightshift/.venv/bin/python
 """
 Daily 8am briefing for Seba — delivered via Telegram chat (employee bot).
 Cron: 0 14 * * *  (8am MDT = 14:00 UTC)
