@@ -63,15 +63,35 @@ def load_env(path: str) -> None:
             os.environ.setdefault(k.strip(), v.strip())
 
 
-def load_seen() -> set:
-    if SEEN_FILE.exists():
-        return set(json.loads(SEEN_FILE.read_text()))
-    return set()
+def load_seen() -> tuple[set, bool]:
+    """Return (seen_uids, ok). ok=False means the state file is missing or
+    corrupt — the caller MUST treat that as a first run (re-seed and notify
+    nothing), never as an empty seen-set, or it would notify on every UID in
+    the recent window (~16k unread → a notification blast)."""
+    if not SEEN_FILE.exists():
+        return set(), False
+    try:
+        return set(json.loads(SEEN_FILE.read_text())), True
+    except (ValueError, OSError) as e:
+        print(f"WARNING: {SEEN_FILE} unreadable ({e}); reseeding instead of "
+              "notifying on the whole window.")
+        return set(), False
 
 
-def save_seen(seen: set) -> None:
-    ids = list(seen)[-SEEN_CAP:]
-    SEEN_FILE.write_text(json.dumps(ids))
+def save_seen(seen) -> None:
+    # IMAP UIDs only ever increase, so keep the NUMERICALLY-largest SEEN_CAP
+    # (the newest) rather than an arbitrary slice of an unordered set — a UID
+    # that's still in the window must not get dropped and re-notified. Atomic
+    # write so a kill mid-write can't leave half-JSON that bricks every run.
+    def _key(u):
+        try:
+            return int(u)
+        except (TypeError, ValueError):
+            return -1
+    ids = sorted(seen, key=_key)[-SEEN_CAP:]
+    tmp = SEEN_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(ids))
+    os.replace(tmp, SEEN_FILE)
 
 
 def is_noise(sender: str, subject: str) -> bool:
@@ -166,8 +186,10 @@ def main() -> None:
     if not imap_user or not imap_pass:
         sys.exit(0)
 
-    first_run = not SEEN_FILE.exists()
-    seen = load_seen()
+    seen, loaded_ok = load_seen()
+    # A missing OR corrupt state file is a first run: reseed the window and
+    # notify nothing. Treating corrupt-as-empty would blast the whole window.
+    first_run = not loaded_ok
     new_msgs = []
     since = (datetime.now() - timedelta(days=WINDOW_DAYS)).strftime("%d-%b-%Y")
 

@@ -105,8 +105,15 @@ def _save_cache(token: str) -> None:
     global _token_cache
     _token_cache = {"token": token, "exp": _jwt_exp(token)}
     try:
-        with open(TOKEN_CACHE, "w") as f:
+        # Bearer token — keep it owner-only (the employee-service copy lives in
+        # the shared /data/employees tree). Create with 0600 from the start.
+        fd = os.open(TOKEN_CACHE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
             json.dump(_token_cache, f)
+        try:
+            os.chmod(TOKEN_CACHE, 0o600)
+        except OSError:
+            pass
     except OSError as e:
         log.warning("could not write Prism token cache %s: %s", TOKEN_CACHE, e)
 

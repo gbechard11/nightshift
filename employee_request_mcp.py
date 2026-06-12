@@ -989,6 +989,38 @@ async def showpass_event(slug: str) -> str:
 # ---------------------------------------------------------------------------
 import re as _re  # noqa: E402
 import urllib.parse as _up  # noqa: E402
+import ipaddress as _ipaddress  # noqa: E402
+import socket as _socket  # noqa: E402
+
+
+def _is_public_http_url(url: str) -> tuple[bool, str]:
+    """Guard fetch_url against SSRF: only http(s) to a PUBLIC host.
+
+    The chat agent is otherwise sandboxed (no shell/file tools), so fetch_url
+    is the one place a crafted employee prompt could reach internal services
+    (cloud metadata at 169.254.169.254, localhost daemons, Tailscale peers).
+    Reject non-http(s) schemes and any host that resolves to a loopback,
+    link-local, private, or otherwise non-global address. Returns (ok, reason).
+    """
+    parts = _up.urlparse(url)
+    if parts.scheme not in ("http", "https"):
+        return False, "only http/https URLs are allowed"
+    host = parts.hostname
+    if not host:
+        return False, "no host in URL"
+    try:
+        infos = _socket.getaddrinfo(host, parts.port or 80, proto=_socket.IPPROTO_TCP)
+    except OSError as e:
+        return False, f"could not resolve host ({e})"
+    for info in infos:
+        ip = info[4][0]
+        try:
+            addr = _ipaddress.ip_address(ip)
+        except ValueError:
+            return False, "unresolvable address"
+        if not addr.is_global or addr.is_reserved:
+            return False, "host resolves to a non-public address"
+    return True, ""
 
 
 def _titlecase_slug(s: str) -> str:
@@ -1146,7 +1178,11 @@ async def fetch_url(url: str) -> str:
     if any(h in host for h in ("ticketmaster.ca", "ticketmaster.com", "livenation.com")):
         return _parse_ticketmaster(url)
 
-    # Generic fetch
+    # Generic fetch — SSRF guard: public http(s) host only.
+    ok, why = _is_public_http_url(url)
+    if not ok:
+        return "Refusing to fetch %s: %s." % (url, why)
+
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -1157,8 +1193,17 @@ async def fetch_url(url: str) -> str:
         "Accept-Language": "en-CA,en;q=0.9",
     }
     try:
-        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True, headers=headers) as client:
+        # follow_redirects=False so a public URL can't 302 into an internal
+        # one past the guard above. We re-validate and follow ONE hop manually.
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=False, headers=headers) as client:
             r = await client.get(url)
+            if r.status_code in (301, 302, 303, 307, 308):
+                loc = r.headers.get("location", "")
+                nxt = _up.urljoin(url, loc)
+                ok2, why2 = _is_public_http_url(nxt)
+                if not ok2:
+                    return "Refusing to follow redirect to %s: %s." % (nxt, why2)
+                r = await client.get(nxt)
         if r.status_code >= 400:
             return "HTTP %d fetching %s" % (r.status_code, url)
         ct = r.headers.get("content-type", "")

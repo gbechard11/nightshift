@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import fcntl
 import json
 import os
 import shutil
@@ -29,6 +30,7 @@ import time
 from pathlib import Path
 
 QUEUE_DIR = "/data/greg/blast_queue"
+_FIRE_LOCK = "/data/greg/blast_queue/.fire-scheduled.lock"
 BLAST = "/home/gregnightshift/nightshift/scripts/blast.py"
 PYTHON = "/home/gregnightshift/nightshift/.venv/bin/python"
 
@@ -119,8 +121,13 @@ def cmd_send(a: argparse.Namespace) -> None:
     if not os.path.exists(p):
         sys.exit(f"no queued blast '{a.id}'")
     s = json.load(open(p))
-    if s.get("status") == "sent" and not a.force:
-        sys.exit(f"'{a.id}' already sent ({s.get('sent_at')}). Use --force to resend.")
+    st = s.get("status")
+    if st in ("sent", "sending", "cancelled") and not a.force:
+        sys.exit(
+            f"'{a.id}' is '{st}'"
+            + (f" ({s.get('sent_at')})" if st == "sent" else "")
+            + ". Use --force to send anyway."
+        )
     cmd = [PYTHON, BLAST, "--list", s["list"], "--channel", "email",
            "--from", s["from"], "--subject", s["subject"],
            "--html-file", s["html_file"], "--campaign", s["id"]]
@@ -165,63 +172,91 @@ def _tg_notify(uid: str, text: str) -> None:
 def cmd_fire_scheduled(_a: argparse.Namespace) -> None:
     """Fire all queued blasts whose send_at <= now (called by cron every minute).
     Only auto-fires blasts created by self-approvers (Seba/Andrew); others still
-    require explicit owner approval."""
+    require explicit owner approval.
+
+    A real send takes minutes-to-hours, far longer than the 1-minute cron
+    cadence. Two guards stop the same blast firing more than once:
+      1. an exclusive flock held for the whole run, so overlapping cron ticks
+         don't both enter the loop; and
+      2. each spec is flipped to status="sending" on disk BEFORE the blast.py
+         subprocess starts, so even a future code path that skips the lock
+         won't re-pick a blast that's already in flight.
+    """
     now_str = time.strftime("%Y-%m-%dT%H:%M:%S")
     if not os.path.isdir(QUEUE_DIR):
         return
 
-    # Load SELF_APPROVERS from env if set, fall back to hardcoded default.
-    raw = os.environ.get("BLAST_SELF_APPROVE", ",".join(_SELF_APPROVERS))
-    self_approvers = {x.strip() for x in raw.replace(";", ",").split(",") if x.strip()}
+    # Non-blocking exclusive lock: if a previous tick's send is still running,
+    # this tick exits immediately rather than firing anything in parallel.
+    lock_fd = os.open(_FIRE_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(lock_fd)
+        return
 
-    fired = 0
-    for p in sorted(Path(QUEUE_DIR).glob("*.json")):
-        try:
-            s = json.load(open(p))
-        except Exception:
-            continue
-        if s.get("status") != "queued":
-            continue
-        send_at = s.get("send_at")
-        if not send_at:
-            continue
-        if str(s.get("created_by_uid", "")) not in self_approvers:
-            continue
-        if send_at > now_str:
-            continue  # Not yet due
+    try:
+        # Load SELF_APPROVERS from env if set, fall back to hardcoded default.
+        raw = os.environ.get("BLAST_SELF_APPROVE", ",".join(_SELF_APPROVERS))
+        self_approvers = {x.strip() for x in raw.replace(";", ",").split(",") if x.strip()}
 
-        qid = s["id"]
-        print(f"[{now_str}] Firing scheduled blast: {qid} (due {send_at})")
-        cmd = [PYTHON, BLAST, "--list", s["list"], "--channel", "email",
-               "--from", s["from"], "--subject", s["subject"],
-               "--html-file", s["html_file"], "--campaign", qid]
-        if s.get("city"):
-            cmd += ["--city", s["city"]]
-        cmd.append("--yes")
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        success = r.returncode == 0
-        s["status"] = "sent" if success else "failed"
-        s["sent_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-        s["sent_method"] = "scheduled"
-        json.dump(s, open(p, "w"), indent=2)
+        fired = 0
+        for p in sorted(Path(QUEUE_DIR).glob("*.json")):
+            try:
+                s = json.load(open(p))
+            except Exception:
+                continue
+            if s.get("status") != "queued":
+                continue
+            send_at = s.get("send_at")
+            if not send_at:
+                continue
+            if str(s.get("created_by_uid", "")) not in self_approvers:
+                continue
+            if send_at > now_str:
+                continue  # Not yet due
 
-        uid = s.get("created_by_uid", "")
-        city = s.get("city", "")
-        count = s.get("segment_count", "?")
-        subj = s.get("subject", "")
-        if success:
-            print(f"[{now_str}] Sent: {qid}")
-            _tg_notify(uid, f"✅ Scheduled blast sent: \"{subj}\" → "
-                            f"{city} (~{count} contacts). Queue id: {qid}.")
-        else:
-            err = ((r.stdout or "") + (r.stderr or ""))[-300:]
-            print(f"[{now_str}] FAILED: {qid}: {err}")
-            _tg_notify(uid, f"⚠️ Scheduled blast FAILED: \"{subj}\" "
-                            f"(queue id {qid}). Error: {err[:200]}")
-        fired += 1
+            qid = s["id"]
+            # Claim it on disk before the (long) send starts — closes the
+            # re-fire window even against a caller that bypassed the lock.
+            s["status"] = "sending"
+            s["send_started_at"] = now_str
+            json.dump(s, open(p, "w"), indent=2)
 
-    if fired:
-        print(f"[{now_str}] fire-scheduled: {fired} blast(s) processed")
+            print(f"[{now_str}] Firing scheduled blast: {qid} (due {send_at})")
+            cmd = [PYTHON, BLAST, "--list", s["list"], "--channel", "email",
+                   "--from", s["from"], "--subject", s["subject"],
+                   "--html-file", s["html_file"], "--campaign", qid]
+            if s.get("city"):
+                cmd += ["--city", s["city"]]
+            cmd.append("--yes")
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            success = r.returncode == 0
+            s["status"] = "sent" if success else "failed"
+            s["sent_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+            s["sent_method"] = "scheduled"
+            json.dump(s, open(p, "w"), indent=2)
+
+            uid = s.get("created_by_uid", "")
+            city = s.get("city", "")
+            count = s.get("segment_count", "?")
+            subj = s.get("subject", "")
+            if success:
+                print(f"[{now_str}] Sent: {qid}")
+                _tg_notify(uid, f"✅ Scheduled blast sent: \"{subj}\" → "
+                                f"{city} (~{count} contacts). Queue id: {qid}.")
+            else:
+                err = ((r.stdout or "") + (r.stderr or ""))[-300:]
+                print(f"[{now_str}] FAILED: {qid}: {err}")
+                _tg_notify(uid, f"⚠️ Scheduled blast FAILED: \"{subj}\" "
+                                f"(queue id {qid}). Error: {err[:200]}")
+            fired += 1
+
+        if fired:
+            print(f"[{now_str}] fire-scheduled: {fired} blast(s) processed")
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
 
 
 def main() -> None:

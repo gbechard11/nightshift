@@ -45,26 +45,38 @@ def get_unread_emails(creds, since_hours=12):
     since = (datetime.now() - timedelta(hours=since_hours)).strftime("%d-%b-%Y")
     _, ids = conn.search(None, f'(UNSEEN SINCE "{since}")')
     emails = []
-    for mid in ids[0].split():
-        # BODY.PEEK[] so reading does NOT mark the mail as read.
-        _, data = conn.fetch(mid, "(BODY.PEEK[])")
-        msg = email.message_from_bytes(data[0][1])
-        body = ""
-        if msg.is_multipart():
-            for part in msg.walk():
-                if part.get_content_type() == "text/plain":
-                    body = part.get_payload(decode=True).decode("utf-8", errors="replace")
-                    break
-        else:
-            body = msg.get_payload(decode=True).decode("utf-8", errors="replace")
-        emails.append({
-            "id": mid.decode(),
-            "subject": _decode(msg.get("Subject", "(no subject)")),
-            "from": _decode(msg.get("From", "")),
-            "date": msg.get("Date", ""),
-            "body": body[:400],
-        })
-    conn.logout()
+    try:
+        for mid in ids[0].split():
+            # BODY.PEEK[] so reading does NOT mark the mail as read.
+            _, data = conn.fetch(mid, "(BODY.PEEK[])")
+            # A FETCH can return a bare flags line (not a (header, bytes) tuple);
+            # skip anything that isn't the literal we asked for.
+            if not data or not isinstance(data[0], tuple) or len(data[0]) < 2:
+                continue
+            msg = email.message_from_bytes(data[0][1])
+            body = ""
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() == "text/plain":
+                        # get_payload(decode=True) is None for an empty/bad part.
+                        body = (part.get_payload(decode=True) or b"").decode(
+                            "utf-8", errors="replace")
+                        break
+            else:
+                body = (msg.get_payload(decode=True) or b"").decode(
+                    "utf-8", errors="replace")
+            emails.append({
+                "id": mid.decode(),
+                "subject": _decode(msg.get("Subject", "(no subject)")),
+                "from": _decode(msg.get("From", "")),
+                "date": msg.get("Date", ""),
+                "body": body[:400],
+            })
+    finally:
+        try:
+            conn.logout()
+        except Exception:
+            pass
     return emails
 
 

@@ -137,6 +137,36 @@ def _load_optout(path: str) -> set[str]:
     return out
 
 
+class _OptOutWatcher:
+    """Opt-out set that re-reads the file when it changes on disk.
+
+    A large blast runs for hours; someone who unsubscribes mid-run must be
+    skipped for the rest of the send, not just at plan-build. The unsub
+    daemons append to this file live, so we re-load it (cheaply, only when its
+    mtime moves) and check membership right before each send."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self._mtime = -1.0
+        self._set: set[str] = set()
+        self._refresh()
+
+    def _refresh(self) -> None:
+        try:
+            m = os.path.getmtime(self.path)
+        except OSError:
+            self._set = set()
+            self._mtime = -1.0
+            return
+        if m != self._mtime:
+            self._set = _load_optout(self.path)
+            self._mtime = m
+
+    def __contains__(self, addr: str) -> bool:
+        self._refresh()
+        return addr in self._set
+
+
 def _load_ledger(campaign: str) -> set[str]:
     """Return set of '<channel>:<recipient>' already sent for this campaign."""
     path = os.path.join(LEDGER_DIR, f"{campaign}.jsonl")
@@ -495,31 +525,39 @@ def main() -> None:
     # Build the work plan
     plan = []  # (channel, recipient, subject, body, row)
     skipped = {"no_addr": 0, "optout": 0, "already_sent": 0, "bad_number": 0}
+    # `done` is the on-disk ledger of prior runs; `planned` dedupes WITHIN this
+    # run so a list that contains the same address twice (common after merging
+    # the exported TicketWeb pulls) doesn't message that person twice.
+    planned = set()
     for row in rows:
         if want_email:
             addr = row.get("email", "").lower()
+            ekey = f"email:{addr}"
             if not addr:
                 skipped["no_addr"] += 1
             elif addr in optout_email:
                 skipped["optout"] += 1
-            elif f"email:{addr}" in done:
+            elif ekey in done or ekey in planned:
                 skipped["already_sent"] += 1
             else:
+                planned.add(ekey)
                 subj = args.subject.format_map(_Safe(row))
                 body = email_tmpl.format_map(_Safe(row)) if email_tmpl else ""
                 html_body = _render(html_tmpl, row) if html_tmpl else ""
                 plan.append(("email", row["email"], subj, body, row, html_body))
         if want_wa:
             num = _norm_wa(row.get("whatsapp", ""))
+            wkey = f"whatsapp:{num.lower()}" if num else None
             if not row.get("whatsapp"):
                 skipped["no_addr"] += 1
             elif num is None:
                 skipped["bad_number"] += 1
             elif num.lower() in optout_wa:
                 skipped["optout"] += 1
-            elif f"whatsapp:{num.lower()}" in done:
+            elif wkey in done or wkey in planned:
                 skipped["already_sent"] += 1
             else:
+                planned.add(wkey)
                 body = wa_tmpl.format_map(_Safe(row))
                 plan.append(("whatsapp", num, None, body, row, ""))
 
@@ -567,9 +605,19 @@ def main() -> None:
     # ----- Real send -----
     sent = {"email": 0, "whatsapp": 0}
     failed = {"email": 0, "whatsapp": 0}
+    skipped["optout_midrun"] = 0
+    # Live opt-out re-check: someone who unsubscribes during a multi-hour run
+    # must be skipped for the rest of it, not just at plan time.
+    live_optout_email = _OptOutWatcher(OPTOUT_EMAIL)
+    live_optout_wa = _OptOutWatcher(OPTOUT_WA)
     smtp = None
     last = 0.0
     for ch, rcpt, subj, body, row, html_body in plan:
+        rl = rcpt.lower()
+        if (ch == "email" and rl in live_optout_email) or \
+           (ch == "whatsapp" and rl in live_optout_wa):
+            skipped["optout_midrun"] += 1
+            continue
         if delay:
             wait = delay - (time.time() - last)
             if wait > 0:
