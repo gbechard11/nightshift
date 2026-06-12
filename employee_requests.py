@@ -71,8 +71,17 @@ def mark_auto_approved(req_id, category):
     return rec
 
 
-def list_auto_pending():
-    """Auto-approved requests whose build hasn't been started yet."""
+def list_buildable():
+    """Approved requests the owner-bot watcher should (re)start a build for:
+
+    - auto-approved (green-light lane) never started, AND
+    - ANY approved build that started but never finished — i.e. the bot
+      restarted mid-build and the asyncio task was destroyed. The watcher
+      requeues these on startup so an Approve tap can never be lost.
+
+    Old approve-button records (pre build-tracking) have neither flag and are
+    deliberately excluded — we don't want to resurrect ancient requests.
+    """
     out = []
     try:
         names = os.listdir(REQ_DIR)
@@ -82,8 +91,9 @@ def list_auto_pending():
         if not n.endswith(".json"):
             continue
         rec = load(n[:-5])
-        if rec and rec.get("auto") and rec.get("status") == "approved" \
-                and not rec.get("build_started"):
+        if not rec or rec.get("status") != "approved" or rec.get("build_done"):
+            continue
+        if (rec.get("auto") and not rec.get("build_started")) or rec.get("build_started"):
             out.append(rec)
     out.sort(key=lambda r: r.get("created", 0))
     return out
@@ -94,6 +104,16 @@ def mark_build_started(req_id):
     if not rec:
         return None
     rec["build_started"] = int(time.time())
+    with open(_path(req_id), "w", encoding="utf-8") as f:
+        json.dump(rec, f)
+    return rec
+
+
+def mark_build_done(req_id):
+    rec = load(req_id)
+    if not rec:
+        return None
+    rec["build_done"] = int(time.time())
     with open(_path(req_id), "w", encoding="utf-8") as f:
         json.dump(rec, f)
     return rec

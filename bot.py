@@ -366,6 +366,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text(
                 f"🔧 {'Shipping' if verb != 'continue' else 'Resuming'} build {req_id}…"
             )
+            _active_builds.add(req_id)
             ctx.application.create_task(
                 _continue_build(ctx.bot, update.message.chat_id, req_id,
                                 "the requester", session_file, prompt)
@@ -1489,7 +1490,12 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def _post_init(application: Application) -> None:
     """Start the auto-build watcher and the Twilio WhatsApp webhook server on
     the bot's event loop, alongside Telegram long-polling."""
-    application.create_task(_auto_build_watcher(application))
+    # Plain asyncio task (not Application.create_task): post_init runs before
+    # the app is "running", where PTB neither tracks nor awaits such tasks.
+    # Keep our own reference so it can't be garbage-collected.
+    application.bot_data["_auto_build_task"] = asyncio.create_task(
+        _auto_build_watcher(application)
+    )
     if not whatsapp.configured():
         log.info("WhatsApp not configured (Twilio env vars unset) — webhook skipped")
         return
@@ -1585,12 +1591,23 @@ APPROVED_IMPL_PROMPT = (
 )
 
 
+# Builds currently running IN THIS PROCESS. The watcher requeues approved
+# builds that are started-but-not-done on disk (restart recovery), and this
+# set stops it re-picking one that's still alive here.
+_active_builds: set[str] = set()
+
+
 async def _run_approved_build(bot, chat_id: int, req_id: str, name: str, text: str) -> None:
     """Build an approved employee request in the background, in its own session,
     auto-continuing across run caps. Reports the result (or a clear failure) to
     the owner chat — an approved build never dies silently."""
     session_file = os.path.join(BUILD_SESSION_DIR, f".pedro-build-{req_id}.session")
-    prompt = APPROVED_IMPL_PROMPT.format(name=name, text=text, req_id=req_id)
+    if os.path.exists(session_file):
+        # A previous attempt was interrupted (bot restart) — resume it rather
+        # than replaying the request from scratch.
+        prompt = CONTINUE_PROMPT
+    else:
+        prompt = APPROVED_IMPL_PROMPT.format(name=name, text=text, req_id=req_id)
     await _continue_build(bot, chat_id, req_id, name, session_file, prompt)
 
 
@@ -1616,6 +1633,9 @@ async def _continue_build(bot, chat_id, req_id, name, session_file, prompt) -> N
     except Exception:  # noqa: BLE001 - background task; surface, never vanish
         log.exception("approved build failed (req %s)", req_id)
         reply = f"⚠️ Build for {name}'s request crashed — check the service logs."
+    finally:
+        employee_requests.mark_build_done(req_id)
+        _active_builds.discard(req_id)
     for i in range(0, len(reply), TELEGRAM_MAX_MSG):
         try:
             await bot.send_message(chat_id, reply[i:i + TELEGRAM_MAX_MSG])
@@ -1671,7 +1691,9 @@ async def _run_media_build(bot, rec: dict) -> None:
     except Exception:  # noqa: BLE001 - background task; surface, never vanish
         log.exception("media build failed (req %s)", req_id)
         reply = "⚠️ The build crashed — flag it to Greg."
-    employee_requests.set_status(req_id, "done")
+    finally:
+        employee_requests.mark_build_done(req_id)
+        _active_builds.discard(req_id)
     employee_requests.notify_employee(
         rec["requester_id"], ("✅ Your media request is done:\n\n" + reply)[:4000]
     )
@@ -1687,15 +1709,32 @@ AUTO_BUILD_POLL_SECONDS = int(os.environ.get("PEDRO_AUTO_BUILD_POLL_SECONDS", "2
 
 
 async def _auto_build_watcher(application: Application) -> None:
-    """Pick up auto-approved (green-light) requests written by the employee MCP
-    and build them — the MCP runs in another process, so disk is the handoff."""
+    """Pick up buildable requests from disk and run them. Covers two cases:
+
+    - fresh auto-approved (green-light media) requests written by the employee
+      MCP, which runs in another process — disk is the handoff;
+    - approved builds whose asyncio task was destroyed by a bot restart
+      (started-but-not-done on disk, not active in this process) — these are
+      resumed so an Approve tap can never be silently lost again."""
+    log.info("auto-build watcher started (poll %ss)", AUTO_BUILD_POLL_SECONDS)
     while True:
         try:
-            for rec in employee_requests.list_auto_pending():
-                employee_requests.mark_build_started(rec["id"])
-                log.info("auto-build pickup: %s from %s", rec["id"],
+            for rec in employee_requests.list_buildable():
+                req_id = rec["id"]
+                if req_id in _active_builds:
+                    continue
+                _active_builds.add(req_id)
+                employee_requests.mark_build_started(req_id)
+                resumed = " (resumed after restart)" if rec.get("build_started") else ""
+                log.info("auto-build pickup%s: %s from %s", resumed, req_id,
                          rec.get("requester_name"))
-                application.create_task(_run_media_build(application.bot, rec))
+                if rec.get("category") == "media":
+                    application.create_task(_run_media_build(application.bot, rec))
+                else:
+                    application.create_task(_run_approved_build(
+                        application.bot, OWNER_ID, req_id,
+                        rec.get("requester_name", "employee"), rec.get("text", ""),
+                    ))
         except Exception:  # noqa: BLE001 - the watcher must never die
             log.exception("auto-build watcher tick failed")
         await asyncio.sleep(AUTO_BUILD_POLL_SECONDS)
@@ -1782,6 +1821,10 @@ async def on_request_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     # the prompt: production deploys wait for Greg's 'deploy build <id>'.
     if status == "approved":
         chat_id = query.message.chat_id if query.message else rec["requester_id"]
+        # Mark started on disk BEFORE spawning: if a restart destroys the task,
+        # the watcher finds started-but-not-done and resumes it.
+        _active_builds.add(req_id)
+        employee_requests.mark_build_started(req_id)
         ctx.application.create_task(
             _run_approved_build(ctx.bot, chat_id, req_id, name, text)
         )

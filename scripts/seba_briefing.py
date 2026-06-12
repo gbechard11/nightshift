@@ -36,43 +36,83 @@ def load_env():
 
 
 def extract_open_items() -> list[str]:
-    """Pull numbered open items from the latest brain log handoff entry."""
+    """Pull open/pending items from the newest brain entries.
+
+    Brain style varies ([handoff]/[fix]/[issue] entries, bullet or numbered
+    lists), so collect from the 10 newest entries:
+      - bullets inside any "### ...OPEN/PENDING/NEXT/TO-DO..." section
+      - any "**Next action:** ..." line
+      - legacy "1. **headline**" numbered items in [handoff] entries
+    """
     text = BRAIN_FILE.read_text()
     items = []
-    collecting = False
-    seen_first_entry = False
+    entries = 0
+    in_handoff = False
+    in_open_section = False
+
+    def clean(s: str) -> str:
+        s = re.sub(r'\*\*(.+?)\*\*', r'\1', s)
+        return re.sub(r'\s+', ' ', s).strip()
 
     for line in text.split('\n'):
         if line.startswith('## '):
-            if seen_first_entry:
-                break  # stop at second top-level entry
-            seen_first_entry = True
-            collecting = True
+            entries += 1
+            if entries > 10 or len(items) >= 12:
+                break
+            in_handoff = '[handoff]' in line
+            in_open_section = False
             continue
-
-        if not collecting:
+        if entries == 0:
             continue
-
         stripped = line.strip()
-        if not stripped:
+        if line.startswith('### '):
+            in_open_section = bool(
+                re.search(r'open|pending|next|to[- ]?do|blocked', line, re.I))
             continue
-
-        # Match numbered items: "1. **headline** — ..."
-        m = re.match(r'^(\d+)\.\s+\*\*(.+?)\*\*', stripped)
+        m = re.match(r'^\*\*Next action:?\*\*\s*(.+)', stripped)
         if m:
-            items.append(f"{m.group(1)}. {m.group(2)}")
+            items.append(clean(m.group(1)))
+            continue
+        if in_open_section and stripped.startswith('- '):
+            items.append(clean(stripped[2:]))
+            continue
+        m = re.match(r'^\d+\.\s+\*\*(.+?)\*\*', stripped)
+        if m and in_handoff:
+            items.append(clean(m.group(1)))
 
-    return items
-
+    # Dedupe, keep order, cap the list so the briefing stays readable.
+    seen = set()
+    out = []
+    for it in items:
+        if it and it.lower() not in seen:
+            seen.add(it.lower())
+            out.append(it)
+    return out[:12]
 
 def fetch_seba_inbox() -> list[dict] | str:
     """Fetch unread + recent emails from Seba's inbox via IMAP."""
-    host = os.environ.get('SEBA_IMAP_HOST', 'imap.gmail.com')
+    host = os.environ.get('SEBA_IMAP_HOST', '')
     user = os.environ.get('SEBA_IMAP_USER', '')
     password = os.environ.get('SEBA_IMAP_PASS', '')
 
     if not user or not password:
+        # Fall back to the inbox Seba connected via /setupinbox in the team
+        # bot -- same creds /sebamail uses, no separate .env entry needed.
+        sys.path.insert(0, '/home/gregnightshift/nightshift')
+        try:
+            import employee_email
+            creds = employee_email.inbox_for(8722742818)
+        except Exception:
+            creds = None
+        if creds:
+            host = creds.get('imap_host') or host
+            user = creds.get('email', '')
+            password = creds.get('password', '')
+
+    if not user or not password:
         return 'NOT_CONFIGURED'
+    if not host:
+        host = 'imap.gmail.com'
 
     messages = []
     try:
