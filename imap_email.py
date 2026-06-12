@@ -80,6 +80,56 @@ def get_unread_emails(creds, since_hours=12):
     return emails
 
 
+def search_emails(creds, query="", since_days=30, max_results=20):
+    """Search all mail (read + unread) by subject/sender/body text.
+
+    Uses BODY.PEEK so nothing is marked as read. Returns newest-first, capped
+    at max_results. `query` is matched via IMAP TEXT (subject + headers + body).
+    """
+    conn = imaplib.IMAP4_SSL(creds["imap_host"], int(creds.get("imap_port", 993)))
+    conn.login(creds["email"], creds["password"])
+    conn.select("INBOX")
+    since = (datetime.now() - timedelta(days=since_days)).strftime("%d-%b-%Y")
+    criteria = ['SINCE "%s"' % since]
+    if query.strip():
+        safe_q = query.strip().replace('"', "")
+        criteria.append('TEXT "%s"' % safe_q)
+    _, ids = conn.search(None, "(%s)" % " ".join(criteria))
+    all_ids = ids[0].split()
+    # Newest first, capped
+    all_ids = all_ids[-max_results:][::-1]
+    emails = []
+    try:
+        for mid in all_ids:
+            _, data = conn.fetch(mid, "(BODY.PEEK[])")
+            if not data or not isinstance(data[0], tuple) or len(data[0]) < 2:
+                continue
+            msg = email.message_from_bytes(data[0][1])
+            body = ""
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() == "text/plain":
+                        body = (part.get_payload(decode=True) or b"").decode(
+                            "utf-8", errors="replace")
+                        break
+            else:
+                body = (msg.get_payload(decode=True) or b"").decode(
+                    "utf-8", errors="replace")
+            emails.append({
+                "id": mid.decode(),
+                "subject": _decode(msg.get("Subject", "(no subject)")),
+                "from": _decode(msg.get("From", "")),
+                "date": msg.get("Date", ""),
+                "body": body[:600],
+            })
+    finally:
+        try:
+            conn.logout()
+        except Exception:
+            pass
+    return emails
+
+
 def send_reply(creds, to, subject, body, reply_to_msg_id=None):
     msg = MIMEMultipart()
     msg["From"] = creds["email"]

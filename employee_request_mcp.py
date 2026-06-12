@@ -230,6 +230,44 @@ def email_unread(since_hours: int = 24) -> str:
 
 
 @mcp.tool()
+def email_search(query: str = "", since_days: int = 30) -> str:
+    """Search the employee's inbox for emails matching a keyword or phrase —
+    covers BOTH read and unread messages. `query` is matched against subject,
+    sender, and body text (leave blank to list recent mail). `since_days` limits
+    how far back to look (default 30, max 365). Read-only: uses BODY.PEEK so
+    nothing is marked read. Use this when email_unread comes up empty because
+    the message was already opened."""
+    rid = _uid()
+    if not rid:
+        return "I couldn't identify who's asking. Ask them to run /setupinbox in this bot."
+    creds = employee_email.inbox_for(int(rid))
+    if not creds:
+        return (
+            "Your inbox isn't connected yet. Run /setupinbox here in the Telegram "
+            "bot (~1 min) and then I can search your mail."
+        )
+    try:
+        days = max(1, min(int(since_days), 365))
+    except (TypeError, ValueError):
+        days = 30
+    try:
+        emails = imap_email.search_emails(creds, query=query, since_days=days, max_results=20)
+    except Exception as e:  # noqa: BLE001
+        return "Couldn't search your inbox: %s" % e
+    if not emails:
+        label = ("matching '%s' " % query) if query.strip() else ""
+        return "No messages %sin the last %d days." % (label, days)
+    label = ("matching '%s' " % query) if query.strip() else ""
+    lines = ["%d message(s) %sin the last %d days (newest first):" % (len(emails), label, days), ""]
+    for e in emails:
+        lines.append("From: %s\nDate: %s\nSubject: %s\nPreview: %s" % (
+            e.get("from", ""), e.get("date", ""), e.get("subject", ""),
+            (e.get("body") or "")[:300]))
+        lines.append("--")
+    return "\n".join(lines)
+
+
+@mcp.tool()
 def remember(note: str) -> str:
     """Save a short, durable note about this employee or how they like things done
     (e.g. 'wants a daily briefing at 8am, point form'). Saved notes are shown to
