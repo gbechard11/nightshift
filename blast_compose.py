@@ -197,12 +197,13 @@ def draft(rid, requester, city, subject, html, image_drive_ids, gdrive, dl_dir, 
             if send_at_iso:
                 employee_notify.notify_blast_scheduled(
                     rid, bid,
-                    f"\U0001F4E3 Your email blast is scheduled:\n"
+                    f"\U0001F4E3 Your email blast is drafted for {send_at_iso}:\n"
                     f"\u2022 {subject}\n\u2022 From: {from_addr}\n"
                     f"\u2022 Audience: {city} (~{count:,} contacts)\n"
-                    f"\u2022 Fires automatically at: {send_at_iso}\n"
                     f"\u2022 A preview was just emailed to {reviewer_email}.\n\n"
-                    f"Tap Cancel if you need to pull it before it fires."
+                    f"Open the preview, then tap Approve & schedule to arm it. "
+                    f"It will NOT send until you do \u2014 then it fires automatically "
+                    f"at {send_at_iso}."
                 )
             else:
                 employee_notify.notify_blast_approval(
@@ -219,8 +220,9 @@ def draft(rid, requester, city, subject, html, image_drive_ids, gdrive, dl_dir, 
         if send_at_iso:
             return (
                 f"\u2705 Drafted '{subject}' for {city} (~{count:,} contacts) and emailed "
-                f"you a preview at {reviewer_email}. Scheduled to fire at {send_at_iso}. "
-                f"Tap Cancel in Telegram if you need to pull it. Queue id: {bid}."
+                f"you a preview at {reviewer_email}. I sent Approve & schedule / Cancel "
+                f"buttons here \u2014 review the preview, then tap Approve & schedule to arm "
+                f"it for {send_at_iso}. Nothing sends until you approve. Queue id: {bid}."
             )
         return (
             f"\u2705 Drafted '{subject}' for {city} (~{count:,} contacts) and emailed "

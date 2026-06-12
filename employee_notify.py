@@ -108,14 +108,16 @@ def notify_blast_approval(uid, bid, text) -> None:
 
 
 def notify_blast_scheduled(uid, bid, text) -> None:
-    """DM the employee that their blast is scheduled \u2014 Cancel button only (no Approve,
-    since the cron fires it automatically at the scheduled time). Best-effort."""
+    """DM the employee their scheduled blast with Approve & Cancel buttons. It will
+    NOT fire on its timer until the employee taps Approve (which arms it) \u2014 a
+    scheduled mass-send still needs an explicit human go. Best-effort."""
     token = os.environ.get("EMPLOYEE_BOT_TOKEN") or _TOKEN
     if not token or not uid:
         return
     import json as _json
     markup = {"inline_keyboard": [[
-        {"text": "\u274C Cancel scheduled blast", "callback_data": f"blastcancel:{bid}"},
+        {"text": "\u2705 Approve & schedule", "callback_data": f"blastarm:{bid}"},
+        {"text": "\u274C Cancel", "callback_data": f"blastcancel:{bid}"},
     ]]}
     try:
         data = urllib.parse.urlencode(

@@ -84,6 +84,11 @@ def cmd_add(a: argparse.Namespace) -> None:
         "status": "queued",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "send_at": a.send_at or None,
+        # A scheduled blast is NOT eligible to auto-fire until a human taps
+        # Approve (which calls `arm`). This prevents a mass-send going out on a
+        # timer with only a Cancel window. Immediate (non-scheduled) blasts
+        # don't use the fire-scheduled lane at all, so armed is irrelevant there.
+        "armed": False if a.send_at else None,
     }
     with open(_spec_path(a.id), "w") as f:
         json.dump(spec, f, indent=2)
@@ -142,6 +147,23 @@ def cmd_send(a: argparse.Namespace) -> None:
         s["sent_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
         json.dump(s, open(p, "w"), indent=2)
         print(f"\n[queue] marked '{a.id}' as sent.")
+
+
+def cmd_arm(a: argparse.Namespace) -> None:
+    """Arm a scheduled blast so fire-scheduled may auto-fire it at its send_at.
+    Called only on an explicit human Approve tap (employee_bot on_blast_button)."""
+    p = _spec_path(a.id)
+    if not os.path.exists(p):
+        sys.exit(f"no queued blast '{a.id}'")
+    s = json.load(open(p))
+    if s.get("status") != "queued":
+        sys.exit(f"'{a.id}' is '{s.get('status')}', cannot arm.")
+    if not s.get("send_at"):
+        sys.exit(f"'{a.id}' has no send_at — nothing to schedule.")
+    s["armed"] = True
+    s["armed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    json.dump(s, open(p, "w"), indent=2)
+    print(json.dumps({"ok": True, "armed": a.id, "send_at": s.get("send_at")}))
 
 
 def cmd_cancel(a: argparse.Namespace) -> None:
@@ -207,6 +229,10 @@ def cmd_fire_scheduled(_a: argparse.Namespace) -> None:
             except Exception:
                 continue
             if s.get("status") != "queued":
+                continue
+            # Must be explicitly armed by a human Approve tap — never auto-fire
+            # a scheduled blast on a timer alone.
+            if not s.get("armed"):
                 continue
             send_at = s.get("send_at")
             if not send_at:
@@ -287,6 +313,10 @@ def main() -> None:
     pse.add_argument("--yes", action="store_true", help="actually send (omit to preview)")
     pse.add_argument("--force", action="store_true", help="resend even if already sent")
     pse.set_defaults(func=cmd_send)
+
+    par = sub.add_parser("arm")
+    par.add_argument("id")
+    par.set_defaults(func=cmd_arm)
 
     pc = sub.add_parser("cancel")
     pc.add_argument("id")

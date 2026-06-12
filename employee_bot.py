@@ -1258,6 +1258,38 @@ async def on_blast_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         except Exception:  # noqa: BLE001
             pass
         return
+    if action == "blastarm":
+        # Approve a SCHEDULED blast: arm it so the cron fires it at send_at.
+        # Nothing goes out now; this is the human go-ahead the schedule needs.
+        res = await asyncio.to_thread(
+            subprocess.run, [py, qbin, "arm", bid], capture_output=True, text=True)
+        when = spec.get("send_at", "the scheduled time")
+        city = spec.get("city", "")
+        count = spec.get("segment_count", "?")
+        if res.returncode == 0:
+            try:
+                await query.edit_message_text(
+                    "\u2705 Approved \u2014 your blast to ~%s %s contacts will fire "
+                    "automatically at %s. Tap nothing else; I'll confirm here when "
+                    "it sends." % (count, city, when))
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                employee_notify.notify_owner(
+                    "\U0001F4E3 %s approved a SCHEDULED blast (FYI, no action needed):\n"
+                    "\u2022 %s\n\u2022 From: %s\n\u2022 Audience: %s (~%s contacts)\n"
+                    "\u2022 Fires at: %s\nQueue id: %s." % (
+                        employee_notify.who(uid), spec.get("subject", ""),
+                        spec.get("from", ""), city, count, when, bid))
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            try:
+                await query.edit_message_text(
+                    "\u26A0\uFE0F Couldn't arm the scheduled blast: %s" % (res.stderr or res.stdout)[:200])
+            except Exception:  # noqa: BLE001
+                pass
+        return
     city = spec.get("city", "")
     count = spec.get("segment_count", "?")
     try:
@@ -1320,7 +1352,7 @@ def main() -> None:
     app.add_handler(CommandHandler("request", cmd_request))
     app.add_handler(CallbackQueryHandler(on_campaign_button, pattern=r"^camp:"))
     app.add_handler(CallbackQueryHandler(on_email_confirm, pattern=r"^emailsend:"))
-    app.add_handler(CallbackQueryHandler(on_blast_button, pattern=r"^blast(send|cancel):"))
+    app.add_handler(CallbackQueryHandler(on_blast_button, pattern=r"^blast(send|cancel|arm):"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
