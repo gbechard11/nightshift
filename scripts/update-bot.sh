@@ -93,3 +93,19 @@ if ! crontab -l 2>/dev/null | grep -qF "fire-scheduled"; then
     (crontab -l 2>/dev/null; echo "$FIRE_CRON") | crontab -
     logger -t nightshift-update "Installed blast fire-scheduled cron"
 fi
+
+# Ensure social media daily brief cron is installed (idempotent)
+# 9am MDT = 15:00 UTC (summer). Sends today's posts to Greg via Telegram.
+SOCIAL_BRIEF_CRON="0 15 * * * /home/gregnightshift/nightshift/scripts/social_brief.sh >> /tmp/social-brief.log 2>&1"
+if ! crontab -l 2>/dev/null | grep -qF "social_brief.sh"; then
+    (crontab -l 2>/dev/null; echo "$SOCIAL_BRIEF_CRON") | crontab -
+    logger -t nightshift-update "Installed social_brief cron"
+fi
+
+# Ensure social media auto-poster cron is installed (idempotent)
+# Runs every hour at :30. Posts due calendar entries when token has posting perms.
+SOCIAL_POST_CRON="30 * * * * /home/gregnightshift/nightshift/scripts/social_auto_post.sh >> /tmp/social-auto-post.log 2>&1"
+if ! crontab -l 2>/dev/null | grep -qF "social_auto_post.sh"; then
+    (crontab -l 2>/dev/null; echo "$SOCIAL_POST_CRON") | crontab -
+    logger -t nightshift-update "Installed social_auto_post cron"
+fi
