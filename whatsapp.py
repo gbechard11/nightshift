@@ -23,6 +23,11 @@ from aiohttp import web
 
 log = logging.getLogger("nightshift.whatsapp")
 
+# Hold strong refs to in-flight reply tasks: asyncio keeps only a weak
+# reference, so without this the GC can kill a reply mid-send and the WhatsApp
+# user silently never hears back.
+_BG_TASKS: set = set()
+
 ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 # Sandbox sender is whatsapp:+14155238886; a registered sender is your own number.
@@ -236,7 +241,10 @@ def build_webhook_app(run_pedro) -> web.Application:
             body[:200] if body else f"<audio {media_type}>",
         )
         # Ack now; reply asynchronously so we don't hit Twilio's ~15s timeout.
-        asyncio.create_task(_process_and_reply(sender, body, media_url, media_type, is_guest))
+        task = asyncio.create_task(
+            _process_and_reply(sender, body, media_url, media_type, is_guest))
+        _BG_TASKS.add(task)
+        task.add_done_callback(_BG_TASKS.discard)
         return _twiml()
 
     app = web.Application()

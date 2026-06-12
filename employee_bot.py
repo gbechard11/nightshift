@@ -138,6 +138,9 @@ def _log_chat(direction: str, uid: int, text: str) -> None:
 # can't --resume the same session concurrently), but different employees run in
 # parallel. Distinct from the owner bot's single global lock.
 _locks: dict[int, asyncio.Lock] = {}
+# uids with a chat run queued/in-flight — set synchronously to close the
+# check-then-acquire gap on _locks (see _ask).
+_inflight: set[int] = set()
 
 # Per-user in-progress email setup (uid -> {step, email, host, port}).
 EMAIL_SETUP: dict[int, dict] = {}
@@ -204,12 +207,16 @@ async def _ask(update: Update, ctx: ContextTypes.DEFAULT_TYPE, prompt: str) -> N
     went idle."""
     uid = update.effective_user.id
     lock = _locks.setdefault(uid, asyncio.Lock())
-    if lock.locked():
+    # _inflight is set synchronously (before any await) so a second message in
+    # the same event-loop tick gets the busy reply instead of queueing silently
+    # behind the first — the async lock alone has a check-then-acquire gap.
+    if uid in _inflight or lock.locked():
         await update.message.reply_text(
             "⏳ Still working on your previous message — I'll reply here when "
             "it's done, no need to re-send."
         )
         return
+    _inflight.add(uid)
     await ctx.bot.send_chat_action(update.message.chat_id, ChatAction.TYPING)
     log.info("claude from %s: %s", uid, prompt[:200])
     ctx.application.create_task(_ask_run(update, uid, lock, prompt))
@@ -261,6 +268,8 @@ async def _ask_run(update: Update, uid: int, lock: asyncio.Lock, prompt: str) ->
     except Exception:  # noqa: BLE001 - background task; surface, never vanish
         log.exception("employee run failed (uid %s)", uid)
         out = "⚠️ Something broke mid-run — flag it to Greg if it keeps happening."
+    finally:
+        _inflight.discard(uid)
     _log_chat("out", uid, out)
     for i in range(0, len(out), TELEGRAM_MAX_MSG):
         try:

@@ -142,6 +142,12 @@ def _meta_not_ready(acct) -> str:
 # and stateless, so they stay concurrent (no lock passed).
 _claude_lock = asyncio.Lock()
 
+# Set synchronously the instant a stateful chat run is queued, so a second
+# message arriving in the SAME event-loop tick gets the "still working" reply
+# instead of silently queueing behind the first (the async lock alone has a
+# check-then-acquire gap — both messages would see it unlocked).
+_owner_run_active = False
+
 # Serialize approved-request builds: they edit shared code/files, so two
 # concurrent builds could trample each other. Independent of _claude_lock —
 # a build never blocks Greg's chat.
@@ -274,8 +280,9 @@ async def _call_claude(
     prompt: str,
     restricted: bool = False,
 ) -> None:
+    global _owner_run_active
     # Fast "busy" feedback for stateful runs (restricted is stateless, never blocks).
-    if not restricted and _claude_lock.locked():
+    if not restricted and (_owner_run_active or _claude_lock.locked()):
         await update.message.reply_text(
             "⏳ Pedro is still working on your previous request. Try again in a moment, "
             "or use /safe <prompt> for an independent one-shot."
@@ -300,13 +307,16 @@ async def _call_claude(
         return
 
     # Stateful runs go to the background so a long task never blocks the
-    # update loop (the _claude_lock.locked() check above gives instant
-    # "busy" feedback to anything that arrives meanwhile). On a time-capped
-    # round the task auto-continues instead of dying — see _run_with_continues.
+    # update loop. Mark active synchronously (before any await) so a same-tick
+    # second message gets the busy reply. On a time-capped round the task
+    # auto-continues instead of dying — see _run_with_continues.
+    _owner_run_active = True
     ctx.application.create_task(_chat_run(update, ctx, prompt))
 
 
 async def _chat_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE, prompt: str) -> None:
+    global _owner_run_active
+
     async def _notify(rnd: int) -> None:
         if rnd == 1:  # only the first cap is news; after that, silence until done
             await update.message.reply_text(
@@ -327,6 +337,8 @@ async def _chat_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE, prompt: str)
     except Exception:  # noqa: BLE001 - background task; surface, never vanish
         log.exception("chat run failed")
         out = "⚠️ Something broke mid-run — check the service logs."
+    finally:
+        _owner_run_active = False
     for i in range(0, len(out), TELEGRAM_MAX_MSG):
         try:
             await update.message.reply_text(out[i:i + TELEGRAM_MAX_MSG])
@@ -1458,13 +1470,11 @@ async def cmd_whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not authorized(update):
-        return
+def _collect_status() -> dict:
+    """Gather host stats. Blocking (subprocess + /proc read), so callers must
+    run it off the event loop via asyncio.to_thread."""
     uptime = subprocess.check_output(["uptime", "-p"], text=True).strip()
     disk = shutil.disk_usage("/")
-    disk_pct = disk.used / disk.total * 100
-
     meminfo: dict[str, int] = {}
     with open("/proc/meminfo") as f:
         for line in f:
@@ -1472,14 +1482,27 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             meminfo[k.strip()] = int(rest.split()[0]) * 1024
     mem_total = meminfo["MemTotal"]
     mem_avail = meminfo.get("MemAvailable", meminfo["MemFree"])
+    return {
+        "uptime": uptime,
+        "disk_pct": disk.used / disk.total * 100,
+        "disk_free": disk.free, "disk_total": disk.total,
+        "mem_total": mem_total, "mem_avail": mem_avail,
+    }
+
+
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not authorized(update):
+        return
+    s = await asyncio.to_thread(_collect_status)
+    mem_total, mem_avail = s["mem_total"], s["mem_avail"]
     mem_used_pct = (mem_total - mem_avail) / mem_total * 100
 
     wa = "on" if whatsapp.configured() else "off"
     await update.message.reply_text(
         f"Host: {platform.node()}\n"
-        f"Uptime: {uptime}\n"
-        f"Disk /: {disk_pct:.1f}% used "
-        f"({disk.free / 1e9:.1f} GB free of {disk.total / 1e9:.1f} GB)\n"
+        f"Uptime: {s['uptime']}\n"
+        f"Disk /: {s['disk_pct']:.1f}% used "
+        f"({s['disk_free'] / 1e9:.1f} GB free of {s['disk_total'] / 1e9:.1f} GB)\n"
         f"Memory: {mem_used_pct:.1f}% used "
         f"({(mem_total - mem_avail) / 1e9:.2f} / {mem_total / 1e9:.2f} GB)\n"
         f"WhatsApp: {wa}\n"
