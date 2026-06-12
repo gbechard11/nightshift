@@ -81,6 +81,16 @@ SMTP_USER = os.environ.get("REPORT_SMTP_USER") or os.environ.get("SMTP_USER", ""
 SMTP_PASSWORD = os.environ.get("REPORT_SMTP_PASSWORD") or os.environ.get("SMTP_PASSWORD", "")
 MAIL_FROM = os.environ.get("MAIL_FROM", "") or SMTP_USER
 
+# Plain SMTP_* env, un-merged — the fallback identity when the REPORT_SMTP_*
+# defaults fail to authenticate, so one dead report account can't silently
+# break every caller that relies on the shared env config. (.env uses
+# SMTP_PASS; employee services strip SMTP_* entirely via UnsetEnvironment, in
+# which case there is no fallback and the original error surfaces.)
+_FALLBACK_HOST = os.environ.get("SMTP_HOST", "")
+_FALLBACK_PORT = int(os.environ.get("SMTP_PORT") or "587")
+_FALLBACK_USER = os.environ.get("SMTP_USER", "")
+_FALLBACK_PASSWORD = os.environ.get("SMTP_PASSWORD", "") or os.environ.get("SMTP_PASS", "")
+
 
 class MailError(Exception):
     """User-facing failure from an email send."""
@@ -173,6 +183,20 @@ def _save_to_sent(msg: EmailMessage, host: str, user: str, password: str,
         log.warning("sent-folder save failed (mail still sent): %s", e)
 
 
+def _smtp_send(msg: EmailMessage, host: str, port: int, user: str, password: str) -> None:
+    """One SMTP delivery attempt with the given creds. Raises smtplib errors raw."""
+    ctx = ssl.create_default_context()
+    if port == 465:
+        with smtplib.SMTP_SSL(host, port, timeout=30, context=ctx) as srv:
+            srv.login(user, password)
+            srv.send_message(msg)
+    else:
+        with smtplib.SMTP(host, port, timeout=30) as srv:
+            srv.starttls(context=ctx)
+            srv.login(user, password)
+            srv.send_message(msg)
+
+
 def send(subject: str, body: str, recipients: list[str], sender: dict | None = None,
          attachments: list[str] | None = None, html: str | None = None) -> None:
     """Send an email. Blocking - call via asyncio.to_thread() from async code.
@@ -224,17 +248,33 @@ def send(subject: str, body: str, recipients: list[str], sender: dict | None = N
         msg.add_attachment(_data, maintype=_main, subtype=_sub or "octet-stream",
                            filename=os.path.basename(_path))
 
-    ctx = ssl.create_default_context()
     try:
-        if port == 465:
-            with smtplib.SMTP_SSL(host, port, timeout=30, context=ctx) as srv:
-                srv.login(user, password)
-                srv.send_message(msg)
-        else:
-            with smtplib.SMTP(host, port, timeout=30) as srv:
-                srv.starttls(context=ctx)
-                srv.login(user, password)
-                srv.send_message(msg)
+        _smtp_send(msg, host, port, user, password)
+    except smtplib.SMTPAuthenticationError as e:
+        # The shared REPORT_SMTP_* creds can die (revoked app password) without
+        # anyone noticing. When the env defaults are in use, retry once with the
+        # plain SMTP_* identity instead of failing the send. Employee sender
+        # dicts never fall back — their auth failures must surface to them.
+        can_fall_back = (
+            sender is None
+            and _FALLBACK_HOST and _FALLBACK_USER and _FALLBACK_PASSWORD
+            and (_FALLBACK_USER != user or _FALLBACK_HOST != host)
+        )
+        if not can_fall_back:
+            raise MailError(f"{type(e).__name__}: {e}") from e
+        log.warning(
+            "SMTP login failed as %s (%s); falling back to SMTP_* as %s",
+            user, e, _FALLBACK_USER,
+        )
+        host, port, user, password = (
+            _FALLBACK_HOST, _FALLBACK_PORT, _FALLBACK_USER, _FALLBACK_PASSWORD
+        )
+        from_addr = _FALLBACK_USER
+        msg.replace_header("From", from_addr)
+        try:
+            _smtp_send(msg, host, port, user, password)
+        except Exception as e2:  # noqa: BLE001
+            raise MailError(f"{type(e2).__name__}: {e2}") from e2
     except MailError:
         raise
     except Exception as e:  # noqa: BLE001 - surface a clean message to the caller
