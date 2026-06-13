@@ -697,7 +697,7 @@ async def login_post(request: Request):
 # Guest List — DJ Mina @ Pawn Shop, June 13 2026
 # Form closes at 8:30 PM MDT; submissions go to /data/greg/guestlist_mina_20260613.json
 # --------------------------------------------------------------------------- #
-_GL_FILE = "/data/greg/guestlist_mina_20260613.json"
+_GL_FILE = "/data/greg/blast_queue/guestlist_mina_20260613.json"
 _GL_CLOSE_EPOCH = 1781404200  # 2026-06-13 20:30 MDT = 2026-06-14 02:30 UTC
 _EMAIL_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "email_send.py")
 
