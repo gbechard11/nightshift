@@ -655,6 +655,98 @@ async def envato_download(url_or_id: str) -> str:
     return await _envato(["download", url_or_id.strip(), "--to-drive", "--json"], timeout=900)
 
 
+# --------------------------------------------------------------------------- #
+# ROSTR (rostr.cc) — music-industry intelligence for offer creation.
+# Read-only. Search is public (Typesense); profile/team/tours/company need the
+# session Greg seeds via the bot's /rostrlogin. Same subprocess pattern as Envato.
+# --------------------------------------------------------------------------- #
+ROSTR_BIN = os.path.join(HERE, "rostr.py")
+ROSTR_ALLOWED = {"search", "artist", "team", "tours", "company", "brief", "status"}
+
+
+async def _rostr(args, timeout=120):
+    if not args or args[0] not in ROSTR_ALLOWED:
+        raise ValueError("rostr subcommand not allowed: %s" % args[:1])
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, ROSTR_BIN, *args, cwd=HERE, env={**os.environ},
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return "ROSTR command timed out."
+    return out.decode("utf-8", errors="replace").strip() or "(no output)"
+
+
+@mcp.tool()
+async def rostr_offer_brief(artist: str) -> str:
+    """ROSTR offer brief for an artist — the one-stop pull for building an offer.
+    Resolves the artist by name and returns: who to reach out to (booking AGENT and
+    MANAGER, with names, emails and territories), audience/market metrics (Spotify,
+    Instagram, YouTube, TikTok), touring status, and recent show history. Use this
+    first when Seba or staff want to make an offer to an artist."""
+    _uid()
+    if not artist.strip():
+        raise ValueError("Provide an artist name.")
+    return await _rostr(["brief", artist.strip()], timeout=150)
+
+
+@mcp.tool()
+async def rostr_search(query: str, kind: str = "") -> str:
+    """Search ROSTR for an artist, company (agency/label/management) or person.
+    Returns names + ROSTR slugs to use with the other tools. kind: artist|company|
+    person (optional). Public data — works without a seeded session."""
+    _uid()
+    if not query.strip():
+        raise ValueError("Provide search terms.")
+    args = ["search", query.strip()]
+    if kind.strip():
+        args += ["--type", kind.strip()]
+    return await _rostr(args)
+
+
+@mcp.tool()
+async def rostr_team(artist: str) -> str:
+    """ROSTR booking AGENT + MANAGER for an artist: company, the specific people,
+    their emails and territories — i.e. exactly who an offer is sent to. Resolves
+    the artist by name or slug."""
+    _uid()
+    if not artist.strip():
+        raise ValueError("Provide an artist name or slug.")
+    return await _rostr(["team", artist.strip()])
+
+
+@mcp.tool()
+async def rostr_artist(artist: str) -> str:
+    """ROSTR artist profile: audience metrics (Spotify/Instagram/YouTube/TikTok),
+    genres, type, origin, touring status and bio. Resolves by name or slug."""
+    _uid()
+    if not artist.strip():
+        raise ValueError("Provide an artist name or slug.")
+    return await _rostr(["artist", artist.strip()])
+
+
+@mcp.tool()
+async def rostr_tours(artist: str) -> str:
+    """ROSTR tour / show history for an artist: dates, venues, cities, countries —
+    useful for routing and gauging draw. Resolves by name or slug."""
+    _uid()
+    if not artist.strip():
+        raise ValueError("Provide an artist name or slug.")
+    return await _rostr(["tours", artist.strip()])
+
+
+@mcp.tool()
+async def rostr_company(company: str) -> str:
+    """ROSTR company profile (agency / label / management): locations, website and
+    staff roster (agents/managers who work there). Resolves by name or slug."""
+    _uid()
+    if not company.strip():
+        raise ValueError("Provide a company name or slug.")
+    return await _rostr(["company", company.strip()])
+
+
 @mcp.custom_route("/login", methods=["GET"])
 async def login_get(request: Request) -> HTMLResponse:
     lid = request.query_params.get("lid", "")
