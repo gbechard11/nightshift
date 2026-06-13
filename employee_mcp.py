@@ -695,10 +695,10 @@ async def login_post(request: Request):
 
 # --------------------------------------------------------------------------- #
 # Guest List — DJ Mina @ Pawn Shop, June 13 2026
-# Form closes at 8:30 PM MDT; submissions go to /data/greg/guestlist_mina_20260613.json
+# Form closes at 9:00 PM MDT; submissions go to /data/greg/guestlist_mina_20260613.json
 # --------------------------------------------------------------------------- #
 _GL_FILE = "/data/greg/blast_queue/guestlist_mina_20260613.json"
-_GL_CLOSE_EPOCH = 1781404200  # 2026-06-13 20:30 MDT = 2026-06-14 02:30 UTC
+_GL_CLOSE_EPOCH = 1781406000  # 2026-06-13 21:00 MDT = 2026-06-14 03:00 UTC
 _EMAIL_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "email_send.py")
 
 _GL_FORM = """<!doctype html><html lang=en><head>
@@ -748,7 +748,7 @@ button:hover{{opacity:.85}}
   event announcements, promotions, and exclusive offers. You may unsubscribe at any time.</div>
   <button type=submit>Add Me to the Guest List</button>
 </form>
-<div class=note>Guest list closes at 8:30 PM · Doors at 9 PM</div>
+<div class=note>Guest list closes at 9:00 PM · Doors at 9 PM</div>
 </div></body></html>"""
 
 _GL_THANKS = """<!doctype html><html lang=en><head>
