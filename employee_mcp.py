@@ -45,7 +45,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, RedirectResponse
+from starlette.responses import HTMLResponse, RedirectResponse, Response
 
 import asyncio
 
@@ -730,6 +730,7 @@ button:hover{{opacity:.85}}
   background:#1a0a0a;border-radius:8px;border:1px solid #4a1a1a}}
 </style></head>
 <body><div class=wrap>
+<img src=/guestlist/img alt="DJ Mina" style="width:100%;border-radius:12px;margin-bottom:20px;display:block">
 <div class=brand>Pawn Shop Live · Edmonton</div>
 <h1>DJ Mina<br>Guest List</h1>
 <div class=sub>Tonight — June 13, 2026</div>
@@ -826,6 +827,12 @@ def _gl_send_confirmation(name: str, email: str) -> None:
         )
     except Exception:
         pass
+
+
+@mcp.custom_route("/guestlist/img", methods=["GET"])
+async def guestlist_img(request: Request) -> Response:
+    with open("/data/greg/mina_promo/mina_edmonton_9x16.png", "rb") as f:
+        return Response(f.read(), media_type="image/png")
 
 
 @mcp.custom_route("/guestlist", methods=["GET"])
