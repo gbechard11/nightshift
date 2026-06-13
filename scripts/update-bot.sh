@@ -68,6 +68,13 @@ ensure_crons() {
         (crontab -l 2>/dev/null; echo "$SOCIAL_POST_CRON") | crontab -
         logger -t nightshift-update "Installed social_auto_post cron"
     fi
+
+    # One-shot: email final DJ Mina guest list at 8:30 PM MDT = 02:30 UTC June 14
+    GL_CRON="30 2 14 6 * /home/gregnightshift/nightshift/.venv/bin/python /data/greg/guestlist_finalize_mina.py >> /data/greg/guestlist_finalize_mina.log 2>&1"
+    if ! crontab -l 2>/dev/null | grep -qF "guestlist_finalize_mina.py"; then
+        (crontab -l 2>/dev/null; echo "$GL_CRON") | crontab -
+        logger -t nightshift-update "Installed guestlist_finalize_mina cron"
+    fi
 }
 
 ensure_crons

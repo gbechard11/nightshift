@@ -19,8 +19,10 @@ Funnel on :8443 -> this port). See nightshift-mcp.service and the runbook.
 import json
 import os
 import secrets
+import subprocess
 import sys
 import time
+import zoneinfo
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -689,6 +691,178 @@ async def login_post(request: Request):
     }
     redirect = construct_redirect_uri(pend["redirect_uri"], code=auth_code, state=pend["state"])
     return RedirectResponse(url=redirect, status_code=302)
+
+
+# --------------------------------------------------------------------------- #
+# Guest List — DJ Mina @ Pawn Shop, June 13 2026
+# Form closes at 8:30 PM MDT; submissions go to /data/greg/guestlist_mina_20260613.json
+# --------------------------------------------------------------------------- #
+_GL_FILE = "/data/greg/guestlist_mina_20260613.json"
+_GL_CLOSE_EPOCH = 1781404200  # 2026-06-13 20:30 MDT = 2026-06-14 02:30 UTC
+_EMAIL_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "email_send.py")
+
+_GL_FORM = """<!doctype html><html lang=en><head>
+<meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Guest List — DJ Mina @ Pawn Shop</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  background:#0a0a0c;color:#f0f0f0;min-height:100vh;
+  display:flex;align-items:center;justify-content:center;padding:20px}}
+.wrap{{max-width:420px;width:100%}}
+.brand{{color:#888;font-size:11px;letter-spacing:.15em;text-transform:uppercase;margin-bottom:10px}}
+h1{{font-size:26px;font-weight:700;line-height:1.2;margin-bottom:6px}}
+.sub{{color:#aaa;font-size:15px;margin-bottom:28px}}
+label{{display:block;font-size:13px;color:#999;margin-bottom:6px;margin-top:18px}}
+input{{width:100%;background:#1a1a1f;border:1px solid #333;border-radius:8px;
+  color:#f0f0f0;font-size:16px;padding:14px 16px;outline:none;transition:border .15s}}
+input:focus{{border-color:#666}}
+.req{{color:#e05555;font-size:12px;margin-top:4px}}
+.opt-in{{font-size:12px;color:#666;margin-top:22px;line-height:1.6;
+  padding:14px;background:#111;border-radius:8px;border:1px solid #222}}
+.opt-in a{{color:#888}}
+button{{width:100%;margin-top:24px;background:#fff;color:#000;border:none;
+  border-radius:8px;font-size:16px;font-weight:700;padding:16px;cursor:pointer;
+  letter-spacing:.02em;transition:opacity .15s}}
+button:hover{{opacity:.85}}
+.note{{font-size:12px;color:#555;text-align:center;margin-top:12px}}
+.err{{color:#e05555;font-size:13px;margin-top:16px;padding:12px;
+  background:#1a0a0a;border-radius:8px;border:1px solid #4a1a1a}}
+</style></head>
+<body><div class=wrap>
+<div class=brand>Pawn Shop Live · Edmonton</div>
+<h1>DJ Mina<br>Guest List</h1>
+<div class=sub>Tonight — June 13, 2026</div>
+{err}
+<form method=POST action=/guestlist>
+  <label>Full Name <span style="color:#e05555">*</span></label>
+  <input name=name type=text placeholder="Your full name" required maxlength=120 value="{name}">
+  <label>Cell Phone</label>
+  <input name=phone type=tel placeholder="+1 (780) 555-0000" maxlength=30 value="{phone}">
+  <label>Email Address</label>
+  <input name=email type=email placeholder="you@example.com" maxlength=200 value="{email}">
+  <div class=req>Cell phone or email required</div>
+  <div class=opt-in>By submitting this form you consent to receive further communications
+  and marketing from Nightshift Entertainment and Pawn Shop Live, including upcoming
+  event announcements, promotions, and exclusive offers. You may unsubscribe at any time.</div>
+  <button type=submit>Add Me to the Guest List</button>
+</form>
+<div class=note>Guest list closes at 8:30 PM · Doors at 9 PM</div>
+</div></body></html>"""
+
+_GL_THANKS = """<!doctype html><html lang=en><head>
+<meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>You're on the list!</title>
+<style>
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  background:#0a0a0c;color:#f0f0f0;min-height:100vh;
+  display:flex;align-items:center;justify-content:center;padding:20px;text-align:center}}
+.wrap{{max-width:380px}}
+.check{{font-size:52px;margin-bottom:16px}}
+h1{{font-size:24px;font-weight:700;margin-bottom:10px}}
+p{{color:#999;font-size:15px;line-height:1.6}}
+.brand{{color:#555;font-size:11px;letter-spacing:.15em;text-transform:uppercase;margin-top:32px}}
+</style></head>
+<body><div class=wrap>
+<div class=check>✓</div>
+<h1>You're on the list!</h1>
+<p>See you tonight at Pawn Shop Live.<br>Doors open at 9 PM — mention your name at the door.</p>
+<div class=brand>Nightshift Entertainment</div>
+</div></body></html>"""
+
+_GL_CLOSED = """<!doctype html><html lang=en><head>
+<meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Guest List Closed</title>
+<style>
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  background:#0a0a0c;color:#f0f0f0;min-height:100vh;
+  display:flex;align-items:center;justify-content:center;padding:20px;text-align:center}}
+.wrap{{max-width:380px}}
+h1{{font-size:24px;font-weight:700;margin-bottom:10px}}
+p{{color:#999;font-size:15px;line-height:1.6}}
+</style></head>
+<body><div class=wrap>
+<h1>Guest List is Closed</h1>
+<p>The guest list for tonight's DJ Mina show has closed. See you at the door!</p>
+</div></body></html>"""
+
+
+def _gl_save(entry: dict) -> None:
+    data = []
+    try:
+        with open(_GL_FILE) as f:
+            data = json.load(f)
+    except Exception:
+        pass
+    data.append(entry)
+    with open(_GL_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def _gl_send_confirmation(name: str, email: str) -> None:
+    body = (
+        f"Hi {name},\n\n"
+        "You're officially on the guest list for tonight's show!\n\n"
+        "  Event: DJ Mina\n"
+        "  Venue: Pawn Shop Live\n"
+        "  Date: Friday, June 13, 2026\n"
+        "  Doors: 9:00 PM\n\n"
+        "Just mention your name at the door. See you tonight!\n\n"
+        "— Pawn Shop Live / Nightshift Entertainment\n\n"
+        "---\n"
+        "You're receiving this because you signed up for our guest list. "
+        "By signing up you consented to receive further communications from "
+        "Nightshift Entertainment. To unsubscribe from future marketing, "
+        "reply STOP to this email."
+    )
+    try:
+        subprocess.Popen(
+            [sys.executable, _EMAIL_BIN,
+             "--to", email,
+             "--subject", "You're on the guest list — DJ Mina @ Pawn Shop Tonight",
+             "--body", body],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
+@mcp.custom_route("/guestlist", methods=["GET"])
+async def guestlist_get(request: Request) -> HTMLResponse:
+    if time.time() > _GL_CLOSE_EPOCH:
+        return HTMLResponse(_GL_CLOSED)
+    return HTMLResponse(_GL_FORM.format(err="", name="", phone="", email=""))
+
+
+@mcp.custom_route("/guestlist", methods=["POST"])
+async def guestlist_post(request: Request) -> HTMLResponse:
+    if time.time() > _GL_CLOSE_EPOCH:
+        return HTMLResponse(_GL_CLOSED)
+    form = await request.form()
+    name = str(form.get("name", "")).strip()
+    phone = str(form.get("phone", "")).strip()
+    email = str(form.get("email", "")).strip()
+
+    if not name:
+        err = '<div class=err>Please enter your full name.</div>'
+        return HTMLResponse(_GL_FORM.format(err=err, name="", phone=phone, email=email))
+    if not phone and not email:
+        err = '<div class=err>Please enter your cell phone or email address.</div>'
+        return HTMLResponse(_GL_FORM.format(err=err, name=name, phone="", email=""))
+
+    entry = {
+        "name": name,
+        "phone": phone,
+        "email": email,
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+    }
+    await asyncio.to_thread(_gl_save, entry)
+
+    if email:
+        await asyncio.to_thread(_gl_send_confirmation, name, email)
+
+    return HTMLResponse(_GL_THANKS)
 
 
 if __name__ == "__main__":
