@@ -7,6 +7,9 @@ Usage:
     email_read.py --search 'FROM "venue"'           # raw IMAP search
     email_read.py --mailbox "[Gmail]/All Mail" --count 5
     email_read.py --save-attachments /tmp/att       # save attachments to dir, report paths in JSON
+    email_read.py --sent                            # last 10 messages from Sent folder
+    email_read.py --sent --search 'TO "Ben Hogan"' # search sent by recipient
+    email_read.py --sent --search 'SUBJECT "SR26"' # search sent by subject keyword
 
 Prints one JSON object per message to stdout, one per line — easy for Claude
 to parse without overflowing context (we cap the body preview).
@@ -95,9 +98,14 @@ def main() -> None:
     p.add_argument("--all", action="store_true", help="include read messages (default: unread only)")
     p.add_argument("--search", default=None, help="raw IMAP search criteria (overrides --all)")
     p.add_argument("--mailbox", default="INBOX")
+    p.add_argument("--sent", action="store_true", help="search Sent folder (sets mailbox to [Gmail]/Sent Mail and implies --all)")
     p.add_argument("--body-limit", type=int, default=1500, help="max chars of body preview")
     p.add_argument("--save-attachments", metavar="DIR", default=None, help="save attachments to this directory")
     args = p.parse_args()
+
+    if args.sent:
+        args.mailbox = "[Gmail]/Sent Mail"
+        args.all = True  # sent mail has no UNSEEN flag
 
     _load_env(os.path.expanduser("~/nightshift/.env"))
     host = os.environ.get("IMAP_HOST", "imap.gmail.com")
