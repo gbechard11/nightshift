@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """ROSTR (rostr.cc) client — read-only, for offer-creation data.
 
-WHY THIS IS COOKIE-SEEDED
-=========================
+AUTH: SELF-HEALING AUTO-LOGIN
+=============================
 ROSTR has no public API. The web app (www.rostr.cc) calls a private JSON API at
-api.rostr.cc/v1/* that is authed purely by the user's .rostr.cc session cookie
-(an unauthenticated call returns {"error":"UserNotLoggedInError"}). The VPS is a
-datacenter IP, so we DON'T automate the JS login — we seed the session ONCE with
-cookies exported from a real logged-in browser (see `login` / `/rostrlogin`) and
-replay them with httpx. Same pattern as envato.py. Cookies live in
-`rostr_cookies.json` (gitignored), last ~weeks; `status` reports validity and the
-bot pings Greg to re-seed via /rostrlogin when stale.
+api.rostr.cc/v1/* authed by the user's .rostr.cc session cookie (an unauthed call
+returns {"error":"UserNotLoggedInError"}). ROSTR uses Firebase email/password auth
+but exposes its own login endpoint POST /v1/auth/rostr {email,password} that sets
+the session cookie — callable directly from the VPS (it's Google/Cloudflare-clean).
+
+So the PRIMARY auth path is auto-login: set ROSTR_EMAIL + ROSTR_PASSWORD in .env
+once and the client logs itself in, caches the cookie in `rostr_cookies.json`
+(gitignored), and silently re-logs-in + retries whenever the session expires.
+No manual step ever. `status` / `autologin` drive it.
+
+FALLBACK: a manual cookie seed (`login --curl` / Telegram `/rostrlogin`) still
+works if you ever want to paste a browser session instead of storing a password.
 
 SEARCH is the exception: it runs on a public Typesense index (entities-current)
 with a client-side search key, so `search` works even without a seeded session.
@@ -43,6 +48,12 @@ import httpx
 
 API = os.environ.get("ROSTR_API", "https://api.rostr.cc")
 WEB = "https://www.rostr.cc"
+# Auto-login (self-healing): email+password posted to ROSTR's own login endpoint.
+# Set these once in .env and the client re-logs-in by itself whenever the session
+# expires — no manual /rostrlogin re-seed ever needed.
+ROSTR_EMAIL = os.environ.get("ROSTR_EMAIL", "")
+ROSTR_PASSWORD = os.environ.get("ROSTR_PASSWORD", "")
+LOGIN_ENDPOINT = os.environ.get("ROSTR_LOGIN_ENDPOINT", "/v1/auth/rostr")
 TS_URL = os.environ.get("ROSTR_TS_URL",
                         "https://8btzopr7xawl4qicp.a1.typesense.net/multi_search")
 TS_KEY = os.environ.get("ROSTR_TS_KEY", "rRowrliJLt6X7dGmNViU7jaWp4MQOKPz")
@@ -198,13 +209,55 @@ def seed_cookies(cookies: dict, user_agent: str = "") -> dict:
             "names": sorted(cookies)[:30]}
 
 
+# --- auto-login (email + password) --------------------------------------------
+
+def _have_creds() -> bool:
+    return bool(ROSTR_EMAIL and ROSTR_PASSWORD)
+
+
+def _safe_msg(r: httpx.Response):
+    try:
+        j = r.json()
+        return j.get("msg") or j.get("error")
+    except Exception:
+        return None
+
+
+def login_password(email: str = "", password: str = "") -> dict:
+    """Log in with email+password via ROSTR's own endpoint and persist the session
+    cookies. Credentials default to ROSTR_EMAIL/ROSTR_PASSWORD (.env). This is what
+    makes the client self-healing — no manual cookie paste needed."""
+    email = email or ROSTR_EMAIL
+    password = password or ROSTR_PASSWORD
+    if not (email and password):
+        raise RostrError("No ROSTR credentials — set ROSTR_EMAIL and ROSTR_PASSWORD in .env.")
+    headers = {"User-Agent": DEFAULT_UA, "Content-Type": "application/json",
+               "Accept": "application/json", "Origin": WEB, "Referer": WEB + "/"}
+    with httpx.Client(timeout=30, headers=headers, follow_redirects=True) as c:
+        r = c.post(API + LOGIN_ENDPOINT, json={"email": email, "password": password})
+        if r.status_code in (401, 403):
+            raise RostrError("ROSTR login failed: %s"
+                             % (_safe_msg(r) or "invalid email or password"))
+        r.raise_for_status()
+        jar = dict(c.cookies) or dict(r.cookies)
+    if not jar:
+        raise RostrError("Login succeeded but set no session cookie "
+                         "(endpoint may have changed).")
+    _save({"cookies": jar, "user_agent": DEFAULT_UA,
+           "saved_at": int(time.time()), "via": "password", "account": email})
+    return {"count": len(jar), "names": sorted(jar)[:20], "account": email}
+
+
 # --- http ---------------------------------------------------------------------
 
 def _client(timeout: float = 60.0) -> httpx.Client:
     if not configured():
-        raise RostrError(
-            "No ROSTR session seeded. Export cookies from a logged-in "
-            "www.rostr.cc browser and run:  rostr.py login  (or /rostrlogin).")
+        if _have_creds():
+            login_password()          # self-heal: log in on first use
+        else:
+            raise RostrError(
+                "No ROSTR session. Set ROSTR_EMAIL/ROSTR_PASSWORD in .env for "
+                "auto-login, or seed once via rostr.py login (/rostrlogin).")
     headers = {
         "User-Agent": _ua(),
         "Accept": "application/json, text/plain, */*",
@@ -215,15 +268,21 @@ def _client(timeout: float = 60.0) -> httpx.Client:
                         follow_redirects=True)
 
 
-def _api(path: str) -> dict | list:
-    """GET an api.rostr.cc/v1 path and return parsed JSON (raises on auth loss)."""
+def _api(path: str, _retry: bool = True) -> dict | list:
+    """GET an api.rostr.cc/v1 path and return parsed JSON. On auth loss, auto
+    re-logs-in (if creds are set) and retries once — so the session self-heals."""
     url = urljoin(API + "/", path.lstrip("/"))
     with _client() as c:
         r = c.get(url)
     if r.status_code in (401, 403) or '"UserNotLoggedInError"' in r.text:
+        if _retry and _have_creds():
+            login_password()
+            return _api(path, _retry=False)
         raise RostrError(
-            "ROSTR session expired/logged out (HTTP %s). Re-seed with "
-            "rostr.py login (or /rostrlogin)." % r.status_code)
+            "ROSTR session expired (HTTP %s). %s" % (r.status_code,
+            "Set ROSTR_EMAIL/ROSTR_PASSWORD in .env for auto-login, or re-seed "
+            "via /rostrlogin." if not _have_creds() else "Auto-login also failed — "
+            "check the credentials in .env."))
     if r.status_code == 404:
         raise RostrError("Not found: %s (check the slug)." % path)
     r.raise_for_status()
@@ -390,24 +449,37 @@ def brief(name: str) -> dict:
 
 # --- status -------------------------------------------------------------------
 
-def status() -> dict:
+def status(auto: bool = True) -> dict:
     blob = _load()
+    # self-heal: if there's no session but creds exist, log in
+    if not blob.get("cookies") and auto and _have_creds():
+        try:
+            login_password()
+            blob = _load()
+        except RostrError:
+            pass
     if not blob.get("cookies"):
-        return {"configured": False, "reason": "no cookies seeded"}
+        return {"configured": False, "creds_available": _have_creds(),
+                "reason": "no session and no .env credentials"}
     age_days = round((time.time() - blob.get("saved_at", 0)) / 86400, 1)
-    valid, who, detail = None, None, ""
+    valid, who, detail = None, blob.get("account"), ""
     try:
         with _client(30) as c:
             r = c.get(API + "/v1/auth/me")
         valid = r.status_code == 200 and "UserNotLoggedInError" not in r.text
+        if not valid and auto and _have_creds():     # expired -> re-login + re-probe
+            login_password()
+            with _client(30) as c:
+                r = c.get(API + "/v1/auth/me")
+            valid = r.status_code == 200 and "UserNotLoggedInError" not in r.text
         if valid:
             j = r.json()
-            who = " ".join(filter(None, [j.get("firstName"), j.get("lastName")])) \
-                or j.get("email")
+            who = " ".join(filter(None, [j.get("firstName"), j.get("lastName")])) or j.get("email")
         detail = "HTTP %s" % r.status_code
     except Exception as e:  # noqa: BLE001
         valid, detail = None, str(e)
     return {"configured": True, "valid": bool(valid), "account": who,
+            "auto_login": _have_creds(), "via": blob.get("via", "seed"),
             "age_days": age_days, "cookie_count": len(blob["cookies"]),
             "probe": detail}
 
@@ -419,7 +491,10 @@ def main() -> None:
     st = sub.add_parser("status", help="is the seeded session valid?")
     st.add_argument("--json", action="store_true")
 
-    lg = sub.add_parser("login", help="seed/refresh session from exported cookies")
+    al = sub.add_parser("autologin", help="log in with ROSTR_EMAIL/ROSTR_PASSWORD (.env) and cache the session")
+    al.add_argument("--json", action="store_true")
+
+    lg = sub.add_parser("login", help="seed/refresh session from exported cookies (manual fallback)")
     lg.add_argument("--auto", default="", help="auto-detect a pasted blob; path or '-' for stdin")
     lg.add_argument("--curl", default="", help="a 'Copy as cURL' command; path or '-' for stdin")
     lg.add_argument("--cookie-header", default="", help='"name=val; name2=val2"')
@@ -461,6 +536,11 @@ def main() -> None:
                 else "%s  account=%s  (cookies %sd old, %s)" % (
                     "VALID" if s.get("valid") else "INVALID/EXPIRED",
                     s.get("account") or "?", s.get("age_days"), s.get("probe"))))
+        elif args.cmd == "autologin":
+            info = login_password()
+            print(json.dumps({"ok": True, **info}, indent=1) if args.json
+                  else "Logged in as %s — session cached (%d cookies)."
+                  % (info["account"], info["count"]))
         elif args.cmd == "login":
             ua = args.user_agent
             if args.auto:
