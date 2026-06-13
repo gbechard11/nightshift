@@ -370,6 +370,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if ctx.user_data.get("awaiting_envato_cookie"):
         await _handle_envato_cookie(update, ctx, text)
         return
+    if ctx.user_data.get("awaiting_rostr_cookie"):
+        await _handle_rostr_cookie(update, ctx, text)
+        return
     if _is_owner(update):
         hit = _match_build_command(text)
         if hit:
@@ -1871,6 +1874,7 @@ _ENVATO_TYPE_ALIASES = {
     "graphics": "graphics", "3d": "3d", "presentation": "presentation-templates",
 }
 ENVATO_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "envato.py")
+ROSTR_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rostr.py")
 
 
 async def _run_envato(args, timeout=300, stdin_text=None):
@@ -2041,6 +2045,93 @@ async def _handle_envato_cookie(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
         + ".\n\nTry it: /envato neon city skyline")
 
 
+
+# --------------------------------------------------------------------------- #
+# ROSTR (rostr.cc) — music-industry intelligence for offer creation.
+# Cookie-seeded (no public API), read-only. Greg seeds via /rostrlogin; staff
+# pull data through the employee MCP. Same pattern as Envato.
+# --------------------------------------------------------------------------- #
+async def _run_rostr(args, timeout=120, stdin_text=None):
+    """Run the rostr.py CLI in a worker thread; return the CompletedProcess."""
+    cmd = [sys.executable, ROSTR_PY, *args]
+    return await asyncio.to_thread(
+        subprocess.run, cmd, capture_output=True, text=True, timeout=timeout,
+        input=stdin_text, cwd=os.path.dirname(ROSTR_PY),
+    )
+
+
+async def cmd_rostr(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_owner(update):
+        await update.message.reply_text("Staff pull ROSTR data via the Team Bot. Ask Pedro.")
+        return
+    q = " ".join(ctx.args).strip()
+    if not q:
+        await update.message.reply_text("Usage: /rostr <artist or company>")
+        return
+    proc = await _run_rostr(["search", q, "--json"])
+    if proc.returncode != 0:
+        await update.message.reply_text("\U0001F50E ROSTR: " + _envato_err(proc))
+        return
+    out = (proc.stdout or "").strip()
+    await update.message.reply_text("\U0001F50E " + (out[:3500] or "(no results)"))
+
+
+async def cmd_rostrstatus(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    proc = await _run_rostr(["status", "--json"])
+    try:
+        s = json.loads(proc.stdout or "{}")
+    except Exception:  # noqa: BLE001
+        s = {}
+    if not s.get("configured"):
+        await update.message.reply_text(
+            "\U0001F50E ROSTR isn't connected yet. Use /rostrlogin to seed the session.")
+        return
+    await update.message.reply_text(
+        "\U0001F50E ROSTR session %s (cookies %s days old).%s" % (
+            "valid" if s.get("valid") else "INVALID/expired",
+            s.get("age_days"),
+            "" if s.get("valid") else "\nRe-seed with /rostrlogin."))
+
+
+async def cmd_rostrlogin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_owner(update):
+        await update.message.reply_text("Only Greg can connect the ROSTR session.")
+        return
+    ctx.user_data["awaiting_rostr_cookie"] = True
+    await update.message.reply_text(
+        "\U0001F50E Connect ROSTR (one-time, ~2 min):\n\n"
+        "1. Log into hq.rostr.cc in Chrome.\n"
+        "2. Press F12 → Network tab.\n"
+        "3. Reload the page (Ctrl+R).\n"
+        "4. Click the top request (named hq.rostr.cc, type 'document').\n"
+        "5. Right-click → Copy → Copy as cURL (bash).\n"
+        "6. Paste it here as your next message.\n\n"
+        "Send /cancel to abort.")
+
+
+async def _handle_rostr_cookie(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text) -> None:
+    ctx.user_data.pop("awaiting_rostr_cookie", None)
+    if text.strip().lower() in ("/cancel", "cancel"):
+        await update.message.reply_text("Cancelled — ROSTR not changed.")
+        return
+    await update.message.reply_text("\U0001F50E Seeding the ROSTR session…")
+    proc = await _run_rostr(["login", "--auto", "-"], stdin_text=text)
+    if proc.returncode != 0:
+        await update.message.reply_text(
+            "Couldn't read those cookies: " + _envato_err(proc)
+            + "\n\nTry /rostrlogin again and paste the full 'Copy as cURL'.")
+        return
+    st = await _run_rostr(["status", "--json"])
+    try:
+        s = json.loads(st.stdout or "{}")
+    except Exception:  # noqa: BLE001
+        s = {}
+    await update.message.reply_text(
+        "✅ ROSTR connected — session "
+        + ("valid" if s.get("valid") else "seeded (validates on first search)")
+        + ".\n\nTry it: /rostr <artist name>")
+
+
 def main() -> None:
     app = (
         Application.builder()
@@ -2074,6 +2165,9 @@ def main() -> None:
     app.add_handler(CommandHandler("envato", cmd_envato))
     app.add_handler(CommandHandler("envatologin", cmd_envatologin))
     app.add_handler(CommandHandler("envatostatus", cmd_envatostatus))
+    app.add_handler(CommandHandler("rostr", cmd_rostr))
+    app.add_handler(CommandHandler("rostrlogin", cmd_rostrlogin))
+    app.add_handler(CommandHandler("rostrstatus", cmd_rostrstatus))
     app.add_handler(CallbackQueryHandler(on_call_button, pattern=r"^call:"))
     app.add_handler(CallbackQueryHandler(on_campaign_button, pattern=r"^camp:"))
     app.add_handler(CallbackQueryHandler(on_wire_button, pattern=r"^wire:"))
