@@ -10,6 +10,7 @@ CONTACTS = {
     "greg":   (6575459992, False),
     "seba":   (8722742818, True),
     "andrew": (8621126122, True),
+    "tyler":  (6818757964, True),
 }
 
 def main():
