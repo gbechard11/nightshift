@@ -34,6 +34,7 @@ import imap_email
 import employee_email
 from imap_email import get_unread_emails
 import employee_requests
+import skills_pipeline
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED_USERS = {
@@ -1856,6 +1857,69 @@ async def on_request_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         )
 
 
+async def on_skill_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner taps Approve/Reject on a proposed team skill. Approve PROMOTES it
+    into /data/greg/skills and rebuilds INDEX; Reject archives it. Either way the
+    submitter is notified via the employee bot token."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:  # noqa: BLE001 - stale query ("too old"); ignore
+        pass
+    if not authorized(update):
+        return
+    try:
+        _, action, skill_id = query.data.split(":", 2)
+    except ValueError:
+        return
+    rec = skills_pipeline.load(skill_id)
+    if not rec:
+        try:
+            await query.edit_message_text("This skill proposal expired or was already handled.")
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    if rec.get("status") != "pending":
+        try:
+            await query.edit_message_text(
+                f"Already {rec['status']}: skill '{rec.get('name', '')}'"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    submitter = rec.get("submitter_name", "the team")
+    sname = rec.get("name", "(unnamed skill)")
+    if action == "approve":
+        try:
+            skill_dir, _script = await asyncio.to_thread(skills_pipeline.promote, rec)
+        except Exception:  # noqa: BLE001 - install must fail safe, change nothing
+            log.exception("skill promote failed (%s)", skill_id)
+            try:
+                await query.edit_message_text(
+                    f"⚠️ Couldn't install '{sname}' — check the logs. Nothing changed."
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        owner_msg = (
+            f"✅ Installed skill '{sname}' → {skill_dir}. INDEX rebuilt; Pedro "
+            f"loads it next session. {submitter} notified."
+        )
+        emp_msg = (
+            f"✅ Greg approved your skill '{sname}' — it's installed and Pedro "
+            "can use it now."
+        )
+    else:
+        await asyncio.to_thread(skills_pipeline.reject, rec)
+        owner_msg = f"❌ Rejected skill '{sname}'. {submitter} notified."
+        emp_msg = f"❌ Greg declined your proposed skill '{sname}'."
+    try:
+        await query.edit_message_text(owner_msg)
+    except Exception:  # noqa: BLE001
+        pass
+    employee_requests.notify_employee(rec["submitter_id"], emp_msg)
+
+
 async def _post_shutdown(application: Application) -> None:
     runner = application.bot_data.get("_wh_runner")
     if runner is not None:
@@ -2172,6 +2236,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_campaign_button, pattern=r"^camp:"))
     app.add_handler(CallbackQueryHandler(on_wire_button, pattern=r"^wire:"))
     app.add_handler(CallbackQueryHandler(on_request_button, pattern=r"^req:"))
+    app.add_handler(CallbackQueryHandler(on_skill_button, pattern=r"^skill:"))
     app.add_handler(CallbackQueryHandler(on_envato_button, pattern=r"^env:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))

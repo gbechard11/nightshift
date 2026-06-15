@@ -81,6 +81,49 @@ def notify_owner_request(rec) -> None:
         log.warning("owner request notify failed: %s", exc)
 
 
+def notify_owner_skill(rec, flags=None) -> None:
+    """Ping owner about a proposed team skill with Approve/Reject buttons.
+
+    Shows the full playbook, a script preview, and any advisory risk flags so
+    Greg can decide at a glance. Approve installs it into /data/greg/skills."""
+    if not _TOKEN or not _OWNER:
+        return
+    import json as _json
+    sid = rec["id"]
+    submitter = rec.get("submitter_name", "an employee")
+    parts = [
+        f"\U0001F9E9 New skill proposed by {submitter}: {rec.get('name', '(unnamed)')}",
+        "",
+        rec.get("playbook", "") or "(no playbook text)",
+    ]
+    script = rec.get("script")
+    if script:
+        preview = script if len(script) <= 1500 else script[:1500] + "\n...(truncated)"
+        parts += ["", "Script:", preview]
+    if flags:
+        parts += ["", "⚠️ Heads-up - flagged patterns: " + ", ".join(flags)]
+    parts += ["", "Approve installs it into your skills toolbox. Reject declines."]
+    text = "\n".join(parts)
+    if len(text) > 4000:
+        text = text[:3990] + "..."
+    markup = {"inline_keyboard": [[
+        {"text": "✅ Approve & install", "callback_data": f"skill:approve:{sid}"},
+        {"text": "❌ Reject", "callback_data": f"skill:reject:{sid}"},
+    ]]}
+    try:
+        data = urllib.parse.urlencode(
+            {"chat_id": _OWNER, "text": text, "reply_markup": _json.dumps(markup),
+             "disable_web_page_preview": "true"}
+        ).encode()
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{_TOKEN}/sendMessage", data=data
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("owner skill notify failed: %s", exc)
+
+
 def notify_blast_approval(uid, bid, text) -> None:
     """DM the employee (via the NS Team Bot) their drafted blast with Approve/Cancel
     buttons. The Approve tap is what authorizes the real send (handled in employee_bot).

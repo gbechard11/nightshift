@@ -53,6 +53,7 @@ import mailer
 import meta_ads
 import employee_notify
 import employee_requests
+import skills_pipeline
 import employee_drive
 import employee_email
 import employee_notes
@@ -336,6 +337,44 @@ async def cmd_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     employee_notify.notify_owner_request(rec)
     await update.message.reply_text(
         "✅ Sent to Greg for approval. You'll hear back here when he decides."
+    )
+
+
+async def cmd_skill(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Propose a reusable skill/playbook for Pedro (Greg approves before install)."""
+    if not authorized(update):
+        await update.message.reply_text(
+            "Not authorized. Ask Greg to add your Telegram ID (use /whoami)."
+        )
+        return
+    raw = (update.message.text or "")
+    body = raw.partition(" ")[2].strip() if " " in raw else ""
+    if not body:
+        await update.message.reply_text(
+            "Teach Pedro a reusable skill. Format:\n"
+            "/skill <name> | <what Pedro should do>\n\n"
+            "Example:\n"
+            "/skill Morning inbox brief | Each morning, summarize my unread email "
+            "and post the 3 most important items to the team.\n\n"
+            "Got a script to go with it? Just tell me in chat - say 'save this as "
+            "a skill' and paste it, and I'll attach the script for Greg to approve."
+        )
+        return
+    if "|" in body:
+        name, _, playbook = body.partition("|")
+    else:
+        first, _, rest = body.partition("\n")
+        name, playbook = (first, rest) if rest.strip() else (first, first)
+    name, playbook = name.strip(), playbook.strip()
+    if not playbook:
+        playbook = name
+    sname = employee_notify.who(update.effective_user.id)
+    rec = skills_pipeline.submit(update.effective_user.id, sname, name, playbook)
+    flags = skills_pipeline.scan_script(rec.get("script") or "")
+    employee_notify.notify_owner_skill(rec, flags)
+    await update.message.reply_text(
+        "✅ Proposed the skill '%s' to Greg for approval. You'll hear back here "
+        "when he decides." % rec["name"]
     )
 
 
@@ -1350,6 +1389,7 @@ def main() -> None:
     app.add_handler(CommandHandler("get", employee_drive.cmd_get))
     app.add_handler(CommandHandler("mkdir", employee_drive.cmd_mkdir))
     app.add_handler(CommandHandler("request", cmd_request))
+    app.add_handler(CommandHandler("skill", cmd_skill))
     app.add_handler(CallbackQueryHandler(on_campaign_button, pattern=r"^camp:"))
     app.add_handler(CallbackQueryHandler(on_email_confirm, pattern=r"^emailsend:"))
     app.add_handler(CallbackQueryHandler(on_blast_button, pattern=r"^blast(send|cancel|arm):"))

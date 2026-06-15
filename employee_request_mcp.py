@@ -49,6 +49,7 @@ import imap_email  # noqa: E402
 import employee_notify  # noqa: E402
 import employee_notes  # noqa: E402
 import employee_requests  # noqa: E402
+import skills_pipeline  # noqa: E402
 import mailer  # noqa: E402
 import pending_email  # noqa: E402
 from mcp.server.fastmcp import FastMCP, Image  # noqa: E402
@@ -133,6 +134,46 @@ def submit_request(text: str, category: str = "") -> str:
     return (
         "Done -- sent to Greg for approval (request %s). "
         "You'll hear back here when he decides." % rec["id"]
+    )
+
+
+@mcp.tool()
+def submit_skill(name: str, instructions: str, script: str = "", language: str = "") -> str:
+    """Propose a reusable SKILL for Pedro's toolbox, sent to Greg for one-tap approval.
+
+    Use when an employee wants to teach Pedro a repeatable playbook or shortcut
+    -- "save this as a skill", "make a shortcut that...", "remember how to do X
+    for next time so you can reuse it". This is for ADDITIVE capabilities, not a
+    one-off task (use submit_request for a one-off, or just do it yourself).
+
+    - `name`: a short title for the skill.
+    - `instructions`: the full playbook in plain words -- the steps Pedro should
+      follow when using this skill.
+    - `script` (optional): runnable code (bash or python) if the skill ships a
+      script. Paste it verbatim.
+    - `language` (optional): "python" or "bash" when you include a script.
+
+    EVERY skill waits for Greg's Approve tap before it installs -- this is NOT
+    auto-approved, even for media specialists, because a skill changes what
+    Pedro can do. On approval it lands in Pedro's skills toolbox and the
+    submitter is notified.
+    """
+    rid = _uid()
+    if not rid:
+        return "I couldn't identify who's asking. Ask them to use the /skill command instead."
+    name = (name or "").strip()
+    instructions = (instructions or "").strip()
+    if not name or not instructions:
+        return ("I need both a short skill name and the instructions (the playbook) "
+                "before I can send it to Greg.")
+    sname = os.environ.get("NS_REQUESTER_NAME") or employee_notify.who(rid)
+    rec = skills_pipeline.submit(int(rid), sname, name, instructions, script, language)
+    flags = skills_pipeline.scan_script(rec.get("script") or "")
+    employee_notify.notify_owner_skill(rec, flags)
+    extra = " (I flagged a couple of patterns for Greg to eyeball)" if flags else ""
+    return (
+        "Done -- proposed the skill '%s' to Greg for approval%s. He'll tap "
+        "Approve to install it, and you'll hear back here." % (rec["name"], extra)
     )
 
 
