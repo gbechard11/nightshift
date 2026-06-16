@@ -99,6 +99,7 @@ class AdProfile:
     retarget_audiences: list = dataclasses.field(default_factory=list)
     lookalike_audiences: list = dataclasses.field(default_factory=list)
     default_countries: list = dataclasses.field(default_factory=lambda: ["CA"])
+    ig_actor_id: str = ""
 
     @property
     def has_token(self) -> bool:
@@ -150,6 +151,7 @@ def _load_profiles() -> dict[str, "AdProfile"]:
                 retarget_audiences=_csv(os.environ.get("META_NIGHTSHIFT_RETARGET_AUDIENCES")) or list(RETARGET_AUDIENCES),
                 lookalike_audiences=_csv(os.environ.get("META_NIGHTSHIFT_LOOKALIKE_AUDIENCES")) or list(LOOKALIKE_AUDIENCES),
                 default_countries=_csv(os.environ.get("META_NIGHTSHIFT_COUNTRIES")) or ["CA"],
+                ig_actor_id=os.environ.get("META_NIGHTSHIFT_IG_ACTOR_ID", ""),
             )
         else:
             profiles[key] = AdProfile(
@@ -163,6 +165,7 @@ def _load_profiles() -> dict[str, "AdProfile"]:
                 retarget_audiences=_csv(os.environ.get(f"META_{ku}_RETARGET_AUDIENCES")),
                 lookalike_audiences=_csv(os.environ.get(f"META_{ku}_LOOKALIKE_AUDIENCES")),
                 default_countries=_csv(os.environ.get(f"META_{ku}_COUNTRIES")) or ["CA"],
+                ig_actor_id=os.environ.get(f"META_{ku}_IG_ACTOR_ID", ""),
             )
     return profiles
 
@@ -533,24 +536,42 @@ async def create_adset(
     billing_event: str = "IMPRESSIONS",
     bid_strategy: str = "LOWEST_COST_WITHOUT_CAP",
     promoted_object: dict | None = None,
+    lifetime_budget_cents: int = 0,
+    start_time: str | None = None,
+    end_time: str | None = None,
     acct: "AdProfile | None" = None,
 ) -> dict:
-    """Create a PAUSED ad set. `daily_budget_cents` is in the account currency's
-    minor units (e.g. CAD cents)."""
+    """Create a PAUSED ad set.
+
+    Budget: pass `daily_budget_cents` for a daily budget, or `lifetime_budget_cents`
+    (with `end_time` required and `start_time` optional) for a lifetime budget. The
+    two are mutually exclusive — lifetime takes precedence when both are set.
+    Times are ISO8601 strings in local timezone, e.g. '2026-06-20T21:00:00-06:00'.
+    `daily_budget_cents` / `lifetime_budget_cents` are in the account currency's
+    minor units (e.g. CAD cents).
+    """
     a = _resolve(acct)
     _require_account(a)
     import json
 
-    data = {
+    data: dict = {
         "name": name,
         "campaign_id": campaign_id,
-        "daily_budget": int(daily_budget_cents),
         "billing_event": billing_event,
         "optimization_goal": optimization_goal,
         "bid_strategy": bid_strategy,
         "targeting": json.dumps(targeting),
         "status": "PAUSED",  # never ACTIVE here
     }
+    if lifetime_budget_cents:
+        if not end_time:
+            raise MetaError("end_time is required when using a lifetime budget.")
+        data["lifetime_budget"] = int(lifetime_budget_cents)
+        data["end_time"] = end_time
+        if start_time:
+            data["start_time"] = start_time
+    else:
+        data["daily_budget"] = int(daily_budget_cents)
     if promoted_object:
         data["promoted_object"] = json.dumps(promoted_object)
     return await _post(client, f"{a.ad_account_id}/adsets", data, token=a.token)
@@ -649,6 +670,83 @@ async def upload_ad_video(
 def is_video(filename: str) -> bool:
     """True if a filename looks like a video (so callers route to the video path)."""
     return str(filename).lower().rsplit(".", 1)[-1] in {"mp4", "mov", "m4v", "webm", "avi"}
+
+
+# --------------------------------------------------------------------------
+# Instagram existing-post creative helpers.
+# --------------------------------------------------------------------------
+_IG_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+
+def shortcode_to_id(shortcode: str) -> str:
+    """Decode an Instagram post shortcode (the /p/<code>/ part) to its numeric media ID."""
+    n = 0
+    for ch in shortcode:
+        n = n * 64 + _IG_ALPHABET.index(ch)
+    return str(n)
+
+
+def ig_post_url_to_media_id(url: str) -> str:
+    """Extract the numeric Instagram media ID from a post URL or bare shortcode.
+
+    Accepts full URLs (https://www.instagram.com/p/DZoDE8Ysrhj/) and bare shortcodes.
+    """
+    import re
+    m = re.search(r"/p/([A-Za-z0-9_-]+)", url)
+    if m:
+        return shortcode_to_id(m.group(1))
+    # Bare shortcode
+    if re.fullmatch(r"[A-Za-z0-9_-]{10,12}", url.strip()):
+        return shortcode_to_id(url.strip())
+    raise MetaError(f"Cannot parse Instagram post URL/shortcode: {url!r}")
+
+
+async def create_adcreative_from_ig_post(
+    client: httpx.AsyncClient,
+    name: str,
+    ig_media_id: str,
+    link: str,
+    call_to_action_type: str = "GET_EVENT_TICKETS",
+    url_tags: str | None = None,
+    acct: "AdProfile | None" = None,
+) -> dict:
+    """Create an ad creative that uses an existing Instagram post as its visual.
+
+    `ig_media_id` is the numeric post ID (use ig_post_url_to_media_id() to convert
+    a shortcode/URL). The profile MUST have ig_actor_id set. `link` is the destination
+    URL (e.g. a Showpass ticket page); it's added as a CTA button overlay on the post.
+    """
+    import json as _json
+    a = _resolve(acct)
+    _require_account(a)
+    _require_page(a)
+    if not a.ig_actor_id:
+        raise MetaError(
+            f"No Instagram actor id for @{a.key}. "
+            f"Add META_{a.key.upper()}_IG_ACTOR_ID to .env "
+            f"(find the numeric IG account id in Meta Business Suite → Accounts → Instagram accounts)."
+        )
+    story_spec: dict = {
+        "instagram_actor_id": a.ig_actor_id,
+        "source_instagram_media_id": ig_media_id,
+    }
+    if link:
+        story_spec["link_data"] = {
+            "link": link,
+            "call_to_action": {"type": call_to_action_type, "value": {"link": link}},
+        }
+    data: dict = {
+        "name": name,
+        "object_story_spec": _json.dumps(story_spec),
+    }
+    if url_tags is None:
+        url_tags = (
+            "utm_source=instagram&utm_medium=paid_social"
+            "&utm_campaign={{campaign.name}}&utm_term={{adset.name}}"
+            "&utm_content={{ad.name}}&utm_id={{ad.id}}"
+        )
+    data["url_tags"] = url_tags
+    return await _post(client, f"{a.ad_account_id}/adcreatives", data, token=a.token)
 
 
 async def wait_for_video(client, video_id, acct=None, timeout=180, interval=5):

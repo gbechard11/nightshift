@@ -1023,6 +1023,214 @@ async def draft_ad_campaign(name: str, daily_cad: float, interest_ids: str = "",
             "the user it is already live." % acct.key + extra)
 
 
+async def _resolve_cities_radius(client, city_list: list[str], radius_km: int, acct) -> tuple[list[dict], list[str]]:
+    """Search Meta's geo database for each city name and return (city_specs, labels).
+
+    city_specs is a list of dicts suitable for build_targeting(cities=...).
+    Returns the first hit per city (Canada-scoped); skips any city not found.
+    """
+    specs, labels = [], []
+    for city in city_list:
+        city = city.strip()
+        if not city:
+            continue
+        try:
+            results = await meta_ads.search_locations(client, city, country_codes=["CA"], location_types=["city"], acct=acct)
+        except Exception:
+            results = []
+        if not results:
+            continue
+        hit = results[0]
+        specs.append({"key": str(hit["key"]), "radius": radius_km, "distance_unit": "kilometer"})
+        labels.append(f"{hit.get('name')}, {hit.get('region', '')} (+{radius_km}km)")
+    return specs, labels
+
+
+@mcp.tool()
+async def draft_ig_post_ad(
+    name: str,
+    ig_post_url: str,
+    ticket_link: str,
+    lifetime_cad: float,
+    end_date: str,
+    interest_ids: str = "",
+    cities: str = "",
+    radius_miles: float = 25.0,
+    age_min: int = 18,
+    age_max: int = 40,
+    start_date: str = "",
+    account: str = "",
+) -> str:
+    """Build a Meta ad campaign using an EXISTING Instagram post as the creative.
+
+    Use this when an employee wants to "boost" or "run ads on" an existing Instagram
+    post rather than uploading new creative. The campaign is always created PAUSED;
+    spend starts only when the employee taps Launch in Telegram.
+
+    Args:
+      - name: short campaign name, e.g. "Block Party YEG".
+      - ig_post_url: full Instagram post URL (https://www.instagram.com/p/...) or shortcode.
+      - ticket_link: destination URL for the CTA button (e.g. showpass.com/event).
+      - lifetime_cad: TOTAL lifetime budget in CAD (e.g. 250 for $250 total).
+      - end_date: campaign end — ISO date "YYYY-MM-DD" or "YYYY-MM-DDTHH:MM:SS" local time
+        (Mountain Time unless another TZ suffix is given, e.g. "2026-06-20T21:00:00").
+      - interest_ids: comma-separated Meta interest ids (from research_audience). Empty = broad.
+      - cities: comma-separated Canadian city names for geo-targeting, e.g. "Edmonton,Red Deer,Calgary".
+        Leave blank to target the account's default countries instead.
+      - radius_miles: radius around each city in miles (default 25).
+      - age_min / age_max: audience age range (default 18–40).
+      - start_date: optional campaign start in the same format as end_date. Defaults to now.
+      - account: which ad account — '@nightshift' (default), '@pawnshop', etc.
+        Run list_ad_accounts to see options. If not sure, use '@nightshift' for Nightshift
+        events and '@pawnshop' for Pawn Shop events.
+    """
+    rid = _uid()
+    if not rid:
+        return "I couldn't identify who's asking. Ask them to message me in the NS Team Bot."
+    try:
+        acct = _ad_account(account)
+    except meta_ads.MetaError as e:
+        return str(e)
+    if not (acct.token and acct.ad_account_id):
+        return ("Ad account @%s (%s) isn't ready yet. Pick a ready account (call "
+                "list_ad_accounts), or tell Greg to finish setting it up." % (acct.key, acct.label))
+    if not acct.ig_actor_id:
+        return ("No Instagram actor id configured for @%s. Greg needs to set "
+                "META_%s_IG_ACTOR_ID in .env." % (acct.key, acct.key.upper()))
+    try:
+        lifetime = float(lifetime_cad)
+    except (TypeError, ValueError):
+        return "lifetime_cad must be a dollar amount (e.g. 250)."
+    if lifetime <= 0:
+        return "lifetime_cad must be greater than 0."
+    if not str(name).strip():
+        return "Give the campaign a short name."
+    if not str(ig_post_url).strip():
+        return "Provide the Instagram post URL (ig_post_url)."
+    if not str(end_date).strip():
+        return "end_date is required for a lifetime budget campaign."
+
+    # Resolve IG post media ID
+    try:
+        media_id = meta_ads.ig_post_url_to_media_id(str(ig_post_url).strip())
+    except meta_ads.MetaError as e:
+        return str(e)
+
+    # Normalise end_time — default to Mountain Time if no offset given
+    end_str = str(end_date).strip()
+    if "T" not in end_str:
+        end_str += "T23:59:59"
+    if "+" not in end_str and not end_str.endswith("Z") and "-0" not in end_str[-6:] and not (len(end_str) > 10 and end_str[-6] in "+-"):
+        end_str += "-06:00"  # MDT
+    start_str = str(start_date).strip() or None
+    if start_str:
+        if "T" not in start_str:
+            start_str += "T00:00:00"
+        if "+" not in start_str and not start_str.endswith("Z") and not (len(start_str) > 10 and start_str[-6] in "+-"):
+            start_str += "-06:00"
+
+    ids = [x.strip() for x in str(interest_ids).replace(";", ",").split(",") if x.strip()]
+    radius_km = int(round(float(radius_miles) * 1.60934))
+    city_list = [c.strip() for c in str(cities).replace(";", ",").split(",") if c.strip()]
+    lifetime_cents = int(round(lifetime * 100))
+
+    try:
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            # Resolve cities to Meta geo keys
+            city_specs, city_labels = [], []
+            if city_list:
+                city_specs, city_labels = await _resolve_cities_radius(client, city_list, radius_km, acct)
+            targeting = meta_ads.build_targeting(
+                interest_ids=ids,
+                cities=city_specs if city_specs else None,
+                countries=acct.default_countries if not city_specs else None,
+                age_min=int(age_min),
+                age_max=int(age_max),
+            )
+
+            camp = await meta_ads.create_campaign(
+                client, str(name).strip(), objective="OUTCOME_TRAFFIC", acct=acct
+            )
+            campaign_id = camp.get("id")
+            if not campaign_id:
+                raise ValueError("Meta returned no campaign id: %s" % camp)
+
+            aset = await meta_ads.create_adset(
+                client, campaign_id, f"{name} — ad set",
+                daily_budget_cents=0,
+                targeting=targeting,
+                optimization_goal="LINK_CLICKS",
+                lifetime_budget_cents=lifetime_cents,
+                start_time=start_str,
+                end_time=end_str,
+                acct=acct,
+            )
+            adset_id = aset.get("id")
+
+            creative_id = ad_id = creative_error = None
+            if adset_id:
+                try:
+                    creative = await meta_ads.create_adcreative_from_ig_post(
+                        client, f"{name} — creative",
+                        ig_media_id=media_id,
+                        link=str(ticket_link).strip(),
+                        acct=acct,
+                    )
+                    creative_id = creative.get("id")
+                    if creative_id:
+                        ad = await meta_ads.create_ad(
+                            client, adset_id, f"{name} — ad", creative_id, acct=acct
+                        )
+                        ad_id = ad.get("id")
+                except Exception as ce:  # noqa: BLE001
+                    creative_error = str(ce)
+
+            try:
+                est = await meta_ads.reach_estimate(client, targeting, acct=acct)
+            except Exception:  # noqa: BLE001
+                est = None
+    except Exception as e:  # noqa: BLE001
+        return "Draft failed (nothing was launched, no spend started): %s" % e
+
+    geo_label = ", ".join(city_labels) if city_labels else ", ".join(acct.default_countries)
+    lines = [
+        "\U0001F4CB Campaign drafted (existing IG post) — PAUSED, not spending:",
+        "",
+        "Account: %s (@%s)" % (acct.label, acct.key),
+        "Name: %s" % str(name).strip(),
+        "Campaign id: %s" % campaign_id,
+        "Creative: existing IG post %s" % media_id,
+        "Destination: %s" % str(ticket_link).strip(),
+        "Total budget: $%.2f %s (lifetime)" % (lifetime, acct.currency),
+        "Run: %s → %s" % (start_str or "now", end_str),
+        "Geo: %s" % geo_label,
+        "Ages: %d–%d" % (int(age_min), int(age_max)),
+        "Interests: %s" % (", ".join(ids) or "(none — broad)"),
+    ]
+    if creative_id:
+        lines.append("Ad id: %s" % ad_id)
+    elif creative_error:
+        lines.append("Creative: FAILED — %s (campaign + ad set still created)" % creative_error)
+    rl = _reach_line(est)
+    if rl:
+        lines.append(rl)
+    summary = "\n".join(lines)
+
+    token = pending_campaign.stage(
+        int(rid), campaign_id, str(name).strip(), lifetime / 4, summary, acct_key=acct.key
+    )
+    ok = pending_campaign.send_confirm_prompt(pending_campaign.load(token))
+    if not ok:
+        return ("Campaign %s is built and PAUSED on @%s, but I couldn't reach you on Telegram with "
+                "the Launch button. Open the NS Team Bot and ask me to show you the Launch button again."
+                % (campaign_id, acct.key))
+    extra = ""
+    if creative_error:
+        extra = (" The campaign + ad set were created, but the ad creative failed (%s) — "
+                 "mention that to the employee." % creative_error)
+    return ("Built and staged on @%s — PAUSED (no spend). Launch button sent to your Telegram."
+            % acct.key + extra)
+
 
 # ---------------------------------------------------------------------------
 # Showpass (ticketing) — read-only lookups against the public Discovery API.
