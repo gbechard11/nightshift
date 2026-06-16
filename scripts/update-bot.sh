@@ -36,48 +36,42 @@ wait_for_idle_runs() {
 
 cd /home/gregnightshift/nightshift
 
-# Install/refresh managed crons every run (idempotent) - must happen even
-# when there is nothing to deploy, since the early exit below skips the rest.
+# Write the complete desired crontab in one shot every run.
+# This avoids the append-then-lose race that caused duplicate social_brief entries.
+# Any stale managed entries (guestlist one-shot, old duplicates) are also cleaned up.
 ensure_crons() {
-    # Ensure seba daily briefing cron is installed (idempotent)
-    SEBA_CRON="0 14 * * * /home/gregnightshift/nightshift/scripts/seba_briefing.py >> /tmp/seba_briefing.log 2>&1"
-    if ! crontab -l 2>/dev/null | grep -qF "seba_briefing.py"; then
-        (crontab -l 2>/dev/null; echo "$SEBA_CRON") | crontab -
-        logger -t nightshift-update "Installed seba_briefing cron"
-    fi
+    local DESIRED
+    DESIRED="$(printf '%s\n' \
+        "0 14 * * * /home/gregnightshift/nightshift/scripts/seba_briefing.py >> /tmp/seba_briefing.log 2>&1" \
+        "* * * * * /home/gregnightshift/nightshift/.venv/bin/python /home/gregnightshift/nightshift/scripts/blast_queue.py fire-scheduled >> /data/greg/blast_queue/scheduled_fire.log 2>&1" \
+        "0 15 * * * /home/gregnightshift/nightshift/scripts/social_brief.sh >> /tmp/social-brief.log 2>&1" \
+        "30 * * * * /home/gregnightshift/nightshift/scripts/social_auto_post.sh >> /tmp/social-auto-post.log 2>&1" \
+    )"
 
-    # Ensure scheduled-blast fire cron is installed (idempotent)
-    FIRE_CRON="* * * * * /home/gregnightshift/nightshift/.venv/bin/python /home/gregnightshift/nightshift/scripts/blast_queue.py fire-scheduled >> /data/greg/blast_queue/scheduled_fire.log 2>&1"
-    if ! crontab -l 2>/dev/null | grep -qF "fire-scheduled"; then
-        (crontab -l 2>/dev/null; echo "$FIRE_CRON") | crontab -
-        logger -t nightshift-update "Installed blast fire-scheduled cron"
-    fi
+    # Strip all managed lines from current crontab, then append the desired set.
+    # Using grep -vF with each pattern prevents duplicates and removes stale entries.
+    local CURRENT
+    CURRENT="$(crontab -l 2>/dev/null \
+        | grep -vF "seba_briefing.py" \
+        | grep -vF "fire-scheduled" \
+        | grep -vF "social_brief.sh" \
+        | grep -vF "social_auto_post.sh" \
+        | grep -vF "guestlist_finalize_mina.py" \
+        || true)"
 
-    # Ensure social media daily brief cron is installed (idempotent)
-    # 9am MDT = 15:00 UTC (summer). Sends today's posts to Greg via Telegram.
-    SOCIAL_BRIEF_CRON="0 15 * * * /home/gregnightshift/nightshift/scripts/social_brief.sh >> /tmp/social-brief.log 2>&1"
-    if ! crontab -l 2>/dev/null | grep -qF "social_brief.sh"; then
-        (crontab -l 2>/dev/null; echo "$SOCIAL_BRIEF_CRON") | crontab -
-        logger -t nightshift-update "Installed social_brief cron"
-    fi
-
-    # Ensure social media auto-poster cron is installed (idempotent)
-    # Runs every hour at :30. Posts due calendar entries when token has posting perms.
-    SOCIAL_POST_CRON="30 * * * * /home/gregnightshift/nightshift/scripts/social_auto_post.sh >> /tmp/social-auto-post.log 2>&1"
-    if ! crontab -l 2>/dev/null | grep -qF "social_auto_post.sh"; then
-        (crontab -l 2>/dev/null; echo "$SOCIAL_POST_CRON") | crontab -
-        logger -t nightshift-update "Installed social_auto_post cron"
-    fi
-
-    # One-shot: email final DJ Mina guest list at 9:00 PM MDT = 03:00 UTC June 14
-    GL_CRON="0 3 14 6 * /home/gregnightshift/nightshift/.venv/bin/python /data/greg/guestlist_finalize_mina.py >> /data/greg/guestlist_finalize_mina.log 2>&1"
-    if crontab -l 2>/dev/null | grep -qF "guestlist_finalize_mina.py"; then
-        # Replace any existing entry (handles time changes)
-        (crontab -l 2>/dev/null | grep -vF "guestlist_finalize_mina.py"; echo "$GL_CRON") | crontab -
-        logger -t nightshift-update "Updated guestlist_finalize_mina cron to 03:00 UTC"
+    local NEW_CRONTAB
+    if [ -n "$CURRENT" ]; then
+        NEW_CRONTAB="$(printf '%s\n%s\n' "$CURRENT" "$DESIRED")"
     else
-        (crontab -l 2>/dev/null; echo "$GL_CRON") | crontab -
-        logger -t nightshift-update "Installed guestlist_finalize_mina cron"
+        NEW_CRONTAB="$DESIRED"
+    fi
+
+    # Only write if the crontab would actually change.
+    local EXISTING
+    EXISTING="$(crontab -l 2>/dev/null || true)"
+    if [ "$EXISTING" != "$NEW_CRONTAB" ]; then
+        echo "$NEW_CRONTAB" | crontab -
+        logger -t nightshift-update "ensure_crons: crontab updated"
     fi
 }
 
