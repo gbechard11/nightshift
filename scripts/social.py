@@ -679,12 +679,11 @@ def cmd_post_now(args):
 def cmd_briefing(args):
     """
     Generate today's social media brief — sent via Telegram cron each morning.
-    Outputs text suitable for posting to Telegram.
+    Outputs plain conversational prose for posting to Telegram.
     """
     calendar = load_calendar()
     now = datetime.now(tz=timezone.utc)
 
-    # Posts due today (within next 24h and overdue by up to 48h)
     window_start = now - timedelta(hours=48)
     window_end = now + timedelta(hours=24)
 
@@ -695,7 +694,6 @@ def cmd_briefing(args):
     ]
     due.sort(key=lambda p: p["scheduled_for"])
 
-    # Upcoming in next 7 days
     week_end = now + timedelta(days=7)
     upcoming = [
         p for p in calendar
@@ -703,43 +701,49 @@ def cmd_briefing(args):
         and window_end < datetime.fromisoformat(p["scheduled_for"]).replace(tzinfo=timezone.utc) <= week_end
     ]
 
-    lines = ["📱 *Social Media Brief*\n"]
-
     if not due and not upcoming:
-        lines.append("Nothing scheduled for today or this week.")
-        print("\n".join(lines))
+        print("📱 Social brief: nothing scheduled for today or this week.")
         return
 
+    paragraphs = []
+
     if due:
-        lines.append(f"*POST TODAY ({len(due)} posts):*")
+        count = len(due)
+        paragraphs.append(f"📱 You have {count} social post{'s' if count != 1 else ''} due today.")
         for p in due:
             dt = datetime.fromisoformat(p["scheduled_for"]).replace(tzinfo=timezone.utc)
-            past_marker = " ⚠️ overdue" if dt < now else ""
-            lines.append(
-                f"\n[{p['id']}] {p['event_name']} — {p['post_type'].replace('_',' ').title()}"
-                f" ({p['platform'].upper()}){past_marker}"
+            overdue_note = " This one is overdue." if dt < now else ""
+            post_label = p["post_type"].replace("_", " ").lower()
+            snippet = p["text"][:300] + ("…" if len(p["text"]) > 300 else "")
+            entry = (
+                f"[{p['id']}] {p['event_name']} — {post_label} on {p['platform'].upper()}, "
+                f"scheduled for {dt.strftime('%-I:%M %p UTC')}.{overdue_note} "
+                f'Copy: "{snippet}"'
             )
-            lines.append(f"Scheduled: {dt.strftime('%-I:%M %p UTC')}")
-            lines.append("```")
-            lines.append(p["text"][:400] + ("…" if len(p["text"]) > 400 else ""))
-            lines.append("```")
             if p.get("ticket_url"):
-                lines.append(f"🎟 {p['ticket_url']}")
+                entry += f" Ticket link: {p['ticket_url']}"
+            paragraphs.append(entry)
+    else:
+        paragraphs.append("📱 Nothing due today on social.")
 
     if upcoming:
-        lines.append(f"\n*COMING UP THIS WEEK ({len(upcoming)}):*")
+        items = []
         for p in upcoming:
             dt = datetime.fromisoformat(p["scheduled_for"]).replace(tzinfo=timezone.utc)
-            lines.append(
-                f"  • {dt.strftime('%a %-d')} — {p['event_name']} / {p['post_type'].replace('_',' ')} ({p['platform'].upper()})"
+            items.append(
+                f"{p['event_name']} {p['post_type'].replace('_', ' ')} on {p['platform'].upper()} ({dt.strftime('%a %-d')})"
             )
+        if len(items) == 1:
+            upcoming_str = items[0]
+        elif len(items) == 2:
+            upcoming_str = f"{items[0]} and {items[1]}"
+        else:
+            upcoming_str = ", ".join(items[:-1]) + f", and {items[-1]}"
+        paragraphs.append(f"Coming up this week: {upcoming_str}.")
 
-    lines.append(
-        "\n_To post now: `social.py post-now <id>`_"
-        "\n_To skip: `social.py skip <id>`_"
-    )
+    paragraphs.append("To post now, run social.py post-now <id>. To skip, use social.py skip <id>.")
 
-    print("\n".join(lines))
+    print("\n\n".join(paragraphs))
 
 
 # ── Main ───────────────────────────────────────────────────────────────────
