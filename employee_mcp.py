@@ -796,6 +796,7 @@ _GL_CLOSE_EPOCH = 1781920800  # 2026-06-19 20:00 MDT = 2026-06-20 02:00 UTC
 _GL_IMG = "/data/greg/neyo_promo/neyo_ps_9x16.png"
 _GL_MAX = 2  # max names per email/cell
 _GL_CODES = {"JEUNETAGS", "NSENT", "MAKORE"}  # valid access codes
+_GL_CODE_LIMIT = 25  # each code stops accepting once this many names are on the list
 _EMAIL_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "email_send.py")
 
 _GL_FORM = """<!doctype html><html lang=en><head>
@@ -898,6 +899,23 @@ p{{color:#999;font-size:15px;line-height:1.6}}
 <p>This email/cell already has its 2 guests on the Ne-Yo afterparty list. See you tonight at Pawn Shop Live!</p>
 </div></body></html>"""
 
+_GL_CODE_FULL = """<!doctype html><html lang=en><head>
+<meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Code limit reached</title>
+<style>
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  background:#0a0a0c;color:#f0f0f0;min-height:100vh;
+  display:flex;align-items:center;justify-content:center;padding:20px;text-align:center}}
+.wrap{{max-width:380px}}
+h1{{font-size:24px;font-weight:700;margin-bottom:10px}}
+p{{color:#999;font-size:15px;line-height:1.6}}
+</style></head>
+<body><div class=wrap>
+<h1>This code is full</h1>
+<p>This access code has reached its guest limit and can't take any more names.
+Check with your promoter for another code.</p>
+</div></body></html>"""
+
 _GL_CLOSED = """<!doctype html><html lang=en><head>
 <meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
 <title>Guest List Closed</title>
@@ -919,10 +937,18 @@ def _gl_digits(s: str) -> str:
     return "".join(c for c in s if c.isdigit())
 
 
-def _gl_save(phone: str, email: str, new_names: list, code: str) -> tuple:
-    """Merge names onto the record keyed by this email/phone, capped at _GL_MAX.
+def _gl_code_used(data: list, code: str) -> int:
+    """Total names already on the list under this code."""
+    return sum(len(r.get("names") or [])
+               for r in data if str(r.get("code", "")).upper() == code)
 
-    Returns (added_names, all_names_for_contact, was_already_full).
+
+def _gl_save(phone: str, email: str, new_names: list, code: str) -> tuple:
+    """Merge names onto the record keyed by this email/phone.
+
+    Caps at _GL_MAX names per contact and _GL_CODE_LIMIT names per code.
+    Returns (added_names, all_names_for_contact, status) where status is one of
+    'ok', 'contact_full', 'code_full'.
     """
     data = []
     try:
@@ -947,29 +973,36 @@ def _gl_save(phone: str, email: str, new_names: list, code: str) -> tuple:
 
     ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
 
-    if rec is None:
-        names = new_names[:_GL_MAX]
-        data.append({"names": names, "phone": phone, "email": email,
-                     "code": code, "ts": ts})
-        with open(_GL_FILE, "w") as f:
-            json.dump(data, f, indent=2)
-        return names, names, False
+    # Which code's quota this submission draws from: an existing record keeps its
+    # own code; a brand-new record uses the submitted code.
+    eff_code = (str(rec.get("code", "")).upper() if rec and rec.get("code") else code)
+    code_remaining = _GL_CODE_LIMIT - _gl_code_used(data, eff_code)
 
-    existing = rec.get("names") or []
-    if len(existing) >= _GL_MAX:
-        return [], existing, True
+    existing = rec.get("names") if rec else []
+    existing = existing or []
 
-    capacity = _GL_MAX - len(existing)
-    # de-dupe (case-insensitive) so the same name isn't listed twice
+    if rec is not None and len(existing) >= _GL_MAX:
+        return [], existing, "contact_full"
+    if code_remaining <= 0:
+        return [], existing, "code_full"
+
+    # How many names we can add: limited by per-contact room and per-code room.
+    contact_room = _GL_MAX - len(existing)
+    room = min(contact_room, code_remaining)
+
     have = {n.strip().lower() for n in existing}
     added = []
     for n in new_names:
-        if len(added) >= capacity:
+        if len(added) >= room:
             break
         if n.strip().lower() in have:
             continue
         added.append(n)
         have.add(n.strip().lower())
+
+    if rec is None:
+        rec = {"names": [], "phone": phone, "email": email, "code": code, "ts": ts}
+        data.append(rec)
 
     rec["names"] = existing + added
     if not rec.get("phone") and phone:
@@ -981,7 +1014,7 @@ def _gl_save(phone: str, email: str, new_names: list, code: str) -> tuple:
     rec["ts"] = ts
     with open(_GL_FILE, "w") as f:
         json.dump(data, f, indent=2)
-    return added, rec["names"], False
+    return added, rec["names"], "ok"
 
 
 def _gl_send_confirmation(names: list, email: str) -> None:
@@ -1051,13 +1084,15 @@ async def guestlist_post(request: Request) -> HTMLResponse:
         return _form("Please enter your cell phone or email address.")
 
     new_names = [n for n in (name1, name2) if n]
-    added, all_names, was_full = await asyncio.to_thread(
+    added, all_names, status = await asyncio.to_thread(
         _gl_save, phone, email, new_names, code.upper())
 
     names_html = "<br>".join(all_names) if all_names else "—"
 
-    if was_full:
+    if status == "contact_full":
         return HTMLResponse(_GL_FULL.format(names=names_html))
+    if status == "code_full":
+        return HTMLResponse(_GL_CODE_FULL)
 
     if email and added:
         await asyncio.to_thread(_gl_send_confirmation, added, email)
