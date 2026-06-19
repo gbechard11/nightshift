@@ -786,7 +786,7 @@ async def login_post(request: Request):
 
 
 # --------------------------------------------------------------------------- #
-# Guest List — Ne-Yo @ Pawn Shop Live, June 19 2026
+# Guest List — Ne-Yo Afterparty @ Pawn Shop Live, June 19 2026
 # Closes 8:00 PM MDT. Access-code gated. Up to 2 guest names per email/cell;
 # resubmitting the same email or cell tops you up to (never past) 2 names.
 # Submissions -> /data/greg/blast_queue/guestlist_neyo_20260619.json
@@ -800,7 +800,7 @@ _EMAIL_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts",
 
 _GL_FORM = """<!doctype html><html lang=en><head>
 <meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>Guest List — Ne-Yo @ Pawn Shop</title>
+<title>Afterparty Guest List — Ne-Yo @ Pawn Shop</title>
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
 body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
@@ -831,7 +831,7 @@ button:hover{{opacity:.85}}
 <body><div class=wrap>
 <img src=/guestlist/img alt="Ne-Yo" style="width:100%;border-radius:12px;margin-bottom:20px;display:block">
 <div class=brand>Pawn Shop Live · Edmonton</div>
-<h1>Ne-Yo<br>Guest List</h1>
+<h1>Ne-Yo Afterparty<br>Guest List</h1>
 <div class=sub>Tonight — Friday, June 19, 2026</div>
 {err}
 <form method=POST action=/guestlist>
@@ -875,7 +875,7 @@ p{{color:#999;font-size:15px;line-height:1.6}}
 <div class=check>✓</div>
 <h1>You're on the list!</h1>
 <div class=names>{names}</div>
-<p>See you tonight at Pawn Shop Live.<br>Just mention your name at the door.</p>
+<p>See you tonight at the Ne-Yo afterparty — Pawn Shop Live.<br>Just mention your name at the door.</p>
 <div class=brand>Nightshift Entertainment</div>
 </div></body></html>"""
 
@@ -895,7 +895,7 @@ p{{color:#999;font-size:15px;line-height:1.6}}
 <body><div class=wrap>
 <h1>You're already set</h1>
 <div class=names>{names}</div>
-<p>This email/cell already has its 2 guests on the Ne-Yo list. See you tonight at Pawn Shop Live!</p>
+<p>This email/cell already has its 2 guests on the Ne-Yo afterparty list. See you tonight at Pawn Shop Live!</p>
 </div></body></html>"""
 
 _GL_CLOSED = """<!doctype html><html lang=en><head>
@@ -911,7 +911,7 @@ p{{color:#999;font-size:15px;line-height:1.6}}
 </style></head>
 <body><div class=wrap>
 <h1>Guest List is Closed</h1>
-<p>The guest list for tonight's Ne-Yo show has closed. See you at the door!</p>
+<p>The guest list for tonight's Ne-Yo afterparty has closed. See you at the door!</p>
 </div></body></html>"""
 
 
@@ -989,8 +989,8 @@ def _gl_send_confirmation(names: list, email: str) -> None:
     body = (
         f"Hi {names[0] if names else 'there'},\n\n"
         f"{who} " + ("are" if len(names) > 1 else "is") + " officially on the guest list "
-        "for tonight's show!\n\n"
-        "  Event: Ne-Yo\n"
+        "for tonight's afterparty!\n\n"
+        "  Event: Ne-Yo Afterparty\n"
         "  Venue: Pawn Shop Live\n"
         "  Date: Friday, June 19, 2026\n\n"
         "Just mention your name at the door. See you tonight!\n\n"
@@ -1005,7 +1005,7 @@ def _gl_send_confirmation(names: list, email: str) -> None:
         subprocess.Popen(
             [sys.executable, _EMAIL_BIN,
              "--to", email,
-             "--subject", "You're on the guest list — Ne-Yo @ Pawn Shop Tonight",
+             "--subject", "You're on the list — Ne-Yo Afterparty @ Pawn Shop Tonight",
              "--body", body],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
