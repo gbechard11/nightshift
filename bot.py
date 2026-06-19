@@ -910,13 +910,17 @@ async def on_campaign_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 
 
 # ── New show → launch kit ──────────────────────────────────────────────────
-# One command that fans out a coordinated show launch. Increment 1: a PAUSED
-# Meta sales campaign (spend-gated, reusing build_show_campaign) + on-sale and
-# show-date calendar entries. Greg builds the event on Showpass/TicketWeb himself
-# and passes the ticket link; creative is OFF by default (used only if a
-# creative=<file|url> field is supplied). Email blast + social captions land in
-# later increments. Branches on the named platform (showpass|ticketweb).
+# One command that fans out a coordinated show launch:
+#   1. PAUSED Meta sales campaign (spend-gated, reuses build_show_campaign)
+#   2. on-sale + show-date Google Calendar entries
+#   3. queued email blast draft (owner Send button; brand sender + city segment)
+# Greg builds the event on Showpass/TicketWeb himself and passes the ticket link.
+# Creative is OFF by default (used only if a creative=<file|url> field is given).
+# Social captions land in a later increment. Branches on platform (showpass|ticketweb)
+# and on the optional @account selector (Nightshift default, @pawnshop = Pawn Shop Live).
 GCAL_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gcal.py")
+BLAST_QUEUE_PY = "/home/gregnightshift/nightshift/scripts/blast_queue.py"
+LAUNCH_CONTACTS = "/data/greg/contacts/ticketweb_customers.csv"
 LAUNCH_PLATFORMS = {"showpass", "ticketweb"}
 LAUNCH_TZ_BY_CITY = {
     "winnipeg": "America/Winnipeg",
@@ -925,11 +929,22 @@ LAUNCH_TZ_BY_CITY = {
     "hamilton": "America/Toronto",
     "toronto": "America/Toronto",
 }
+# Brand identity for the announce email, keyed by ad-account selector. Anything
+# not listed falls back to "default" (Nightshift).
+LAUNCH_BRANDS = {
+    "default": {"name": "NIGHTSHIFT ENTERTAINMENT", "from": "info@nightshiftent.ca",
+                "accent": "#e11d48", "signoff": "The Nightshift Team"},
+    "pawnshop": {"name": "PAWN SHOP LIVE", "from": "gm@pawnshop-live.ca",
+                 "accent": "#e11d48", "signoff": "The Pawn Shop Live Team"},
+}
+# Confirm-first blast sends from /launch: queued drafts awaiting a Send tap.
+PENDING_BLASTS: dict[str, dict] = {}
 LAUNCH_USAGE = (
     "Usage:\n/launch [@account] <name> | <showpass|ticketweb> | <city> | <venue> | "
     "<show date> | <ticket_link> | <daily $CAD> | <caption> | [onsale date] | [creative=flyer.jpg]\n\n"
-    "Builds a PAUSED, spend-gated ad campaign + adds on-sale & show-date calendar entries. "
-    "You create the event on the platform yourself and pass its ticket link here. Creative is "
+    "Builds: a PAUSED spend-gated ad campaign, on-sale & show-date calendar entries, "
+    "and a queued email blast draft (city-segmented, brand sender) with a Send button. "
+    "You create the event on the platform yourself and pass its ticket link. Creative is "
     "optional — omit it and the ad uses the link preview.\n\n"
     "Dates: YYYY-MM-DD or YYYY-MM-DD HH:MM (24h).\n\n"
     "Example:\n/launch Chris Webby | ticketweb | Hamilton | Bridgeworks | 2026-08-15 20:00 | "
@@ -983,6 +998,49 @@ def _parse_launch_spec(raw: str) -> dict:
     }
 
 
+def _launch_slug(name: str, city: str) -> str:
+    base = re.sub(r"[^a-z0-9]+", "", name.lower())[:16] or "show"
+    c = re.sub(r"[^a-z0-9]+", "", city.lower())[:10] or "all"
+    return f"launch-{base}-{c}-{secrets.token_hex(3)}"
+
+
+def _compose_launch_email(spec: dict, brand: dict) -> tuple[str, str]:
+    """Self-contained (image-free) announce email matching NS/Pawn Shop styling.
+    {first} stays literal so blast.py personalizes it per recipient; all other
+    fields are filled here. No inline images (blast_queue can't attach them and
+    creative is off by default)."""
+    name, venue, city = spec["name"], spec["venue"], spec["city"]
+    when = f"{spec['show_dt']:%A, %B %-d, %Y · %-I:%M %p}"
+    link, intro, accent = spec["ticket_link"], spec["caption"], brand["accent"]
+    subject = f"\U0001F39F️ {name} — live at {venue}, {city}"
+    html = (
+        '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1.0">'
+        f'<title>{name}</title></head>'
+        '<body style="margin:0;padding:0;background:#f4f4f6;">'
+        f'<span style="display:none!important;visibility:hidden;opacity:0;height:0;width:0;overflow:hidden;">{name} — {city}</span>'
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f4f6;">'
+        '<tr><td align="center" style="padding:24px 12px;">'
+        '<table role="presentation" width="600" cellpadding="0" cellspacing="0" style="width:600px;max-width:600px;background:#ffffff;border-radius:12px;overflow:hidden;font-family:Arial,Helvetica,sans-serif;">'
+        f'<tr><td style="background:#111111;padding:18px 28px;"><span style="color:#ffffff;font-size:20px;font-weight:bold;letter-spacing:1px;">{brand["name"]}</span></td></tr>'
+        f'<tr><td style="padding:28px 28px 6px 28px;"><h1 style="margin:0 0 10px 0;font-size:26px;line-height:1.25;color:#111111;">{name} — live in {city}</h1>'
+        f'<p style="margin:0;font-size:16px;line-height:1.55;color:#444444;">Hey {{first}}, {intro}</p></td></tr>'
+        '<tr><td style="padding:10px 28px 0 28px;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #eeeeee;border-radius:10px;">'
+        '<tr><td style="padding:16px 18px;">'
+        f'<div style="font-size:18px;font-weight:bold;color:#111111;">{name}</div>'
+        f'<div style="font-size:14px;color:#666666;margin:6px 0 2px 0;">\U0001F4CD {venue}, {city}</div>'
+        f'<div style="font-size:14px;color:#666666;">\U0001F5D3️ {when}</div>'
+        '</td></tr></table></td></tr>'
+        '<tr><td align="center" style="padding:26px;"><table role="presentation" cellpadding="0" cellspacing="0">'
+        f'<tr><td align="center" style="border-radius:8px;background:{accent};">'
+        f'<a href="{link}" style="display:inline-block;padding:14px 34px;font-size:16px;font-weight:bold;color:#ffffff;text-decoration:none;border-radius:8px;">Get Tickets</a>'
+        '</td></tr></table></td></tr>'
+        f'<tr><td style="padding:0 28px 28px 28px;"><p style="margin:0;font-size:14px;line-height:1.5;color:#777777;">See you at the show,<br>{brand["signoff"]}</p></td></tr>'
+        '</table></td></tr></table></body></html>'
+    )
+    return subject, html
+
+
 async def _gcal_create(summary, start_dt, end_dt, tz, location="", description=""):
     cmd = [
         sys.executable, GCAL_PY, "create",
@@ -1005,9 +1063,9 @@ async def _gcal_create(summary, start_dt, end_dt, tz, location="", description="
 
 
 async def cmd_launch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """New show -> launch kit. Fans out a coordinated show launch (paused ads +
-    calendar in increment 1; blast + social to follow). Confirm-first: the ad
-    campaign is built PAUSED and only the Launch button starts spend."""
+    """New show -> launch kit. Fans out a coordinated show launch: paused ads,
+    calendar entries, and a queued email blast. Confirm-first: the campaign is
+    PAUSED (Launch button starts spend) and the blast is queued (Send button fires)."""
     if not authorized(update):
         return
     raw = (update.message.text or "").partition(" ")[2].strip()
@@ -1102,22 +1160,124 @@ async def cmd_launch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if cal_errs:
         sections.append("\U0001F5D3️ Calendar issues: " + "; ".join(cal_errs))
 
-    # Consolidated reply -----------------------------------------------------
+    # 3) Queued email blast draft (owner Send button) ------------------------
+    blast_token = None
+    try:
+        brand = LAUNCH_BRANDS.get(acct.key, LAUNCH_BRANDS["default"])
+        subject, html = _compose_launch_email(spec, brand)
+        slug = _launch_slug(name, spec["city"])
+        html_path = f"/tmp/{slug}.html"
+        with open(html_path, "w", encoding="utf-8") as fh:
+            fh.write(html)
+        add_cmd = [
+            sys.executable, BLAST_QUEUE_PY, "add",
+            "--id", slug, "--city", spec["city"], "--subject", subject,
+            "--html-file", html_path, "--list", LAUNCH_CONTACTS,
+            "--from", brand["from"], "--created-by", "launch-kit",
+        ]
+        proc = await asyncio.to_thread(
+            subprocess.run, add_cmd, capture_output=True, text=True, timeout=60,
+            cwd=os.path.dirname(BLAST_QUEUE_PY),
+        )
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout or "queue add failed").strip()[:200])
+        info = json.loads(proc.stdout)
+        seg = info.get("segment_count", "?")
+        blast_token = secrets.token_urlsafe(8)
+        PENDING_BLASTS[blast_token] = {
+            "qid": slug, "subject": subject, "city": spec["city"],
+            "count": seg, "from": brand["from"],
+        }
+        warn = "  ⚠️ no contacts match this city" if seg in (0, -1) else ""
+        sections.append(
+            f"✉️ Email blast: queued '{slug}' from {brand['from']}\n"
+            f"   Segment: {spec['city']} (~{seg} contacts){warn}\n"
+            f"   Subject: {subject}"
+        )
+    except Exception as e:  # noqa: BLE001
+        log.exception("launch: blast draft failed")
+        sections.append(f"✉️ Email blast: FAILED — {str(e)[:200]} (nothing queued)")
+
+    # Consolidated summary (no buttons) --------------------------------------
     header = (
         f"\U0001F680 Launch kit — {name}\n"
         f"{spec['platform'].title()} · {location} · {spec['show_dt']:%a %b %-d, %Y · %-I:%M %p}\n"
         f"ℹ️ You build the event on {spec['platform'].title()}; this kit uses your ticket link."
     )
-    body = header + "\n\n" + "\n\n".join(sections)
-    body += "\n\n— Email blast + social captions arrive in the next update."
-    kb = None
+    summary = header + "\n\n" + "\n\n".join(sections)
+    summary += "\n\n— Social captions arrive in the next update."
+    await update.message.reply_text(summary)
+
+    # Separate confirm messages so tapping one button never wipes the other.
     if camp_token:
-        body += "\n\nLaunching the campaign starts real spend. Launch now?"
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("\U0001F680 Launch ads (start spend)", callback_data=f"camp:go:{camp_token}"),
-            InlineKeyboardButton("✖️ Keep paused", callback_data=f"camp:hold:{camp_token}"),
-        ]])
-    await update.message.reply_text(body, reply_markup=kb)
+        await update.message.reply_text(
+            f"\U0001F4E3 Campaign is PAUSED. Launching starts real spend on {acct.label}. Launch now?",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("\U0001F680 Launch ads", callback_data=f"camp:go:{camp_token}"),
+                InlineKeyboardButton("✖️ Keep paused", callback_data=f"camp:hold:{camp_token}"),
+            ]]),
+        )
+    if blast_token:
+        d = PENDING_BLASTS[blast_token]
+        await update.message.reply_text(
+            f"✉️ Email blast queued: \"{d['subject']}\"\n"
+            f"→ {d['city']} (~{d['count']} contacts) from {d['from']}.\nSend it now?",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(f"✉️ Send (~{d['count']})", callback_data=f"lblast:go:{blast_token}"),
+                InlineKeyboardButton("✖️ Hold", callback_data=f"lblast:hold:{blast_token}"),
+            ]]),
+        )
+
+
+async def on_blast_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """The send gate for /launch email blasts. 'go' fires the queued blast (real
+    mass-send); 'hold' leaves it queued. The token is popped on first tap, so a
+    double-tap can't double-send."""
+    query = update.callback_query
+    await query.answer()
+    if not authorized(update):
+        return
+    try:
+        _, action, token = query.data.split(":", 2)
+    except ValueError:
+        return
+    draft = PENDING_BLASTS.get(token)
+    if not draft:
+        await query.edit_message_text(
+            "This blast draft expired. It's still queued — re-run /launch or fire it from the queue."
+        )
+        return
+    if action == "hold":
+        PENDING_BLASTS.pop(token, None)
+        await query.edit_message_text(f"✋ Held. Blast '{draft['qid']}' stays queued, not sent.")
+        return
+    if action != "go":
+        return
+    PENDING_BLASTS.pop(token, None)  # claim it — guards against double-tap
+    await query.edit_message_text(
+        f"✉️ Sending blast '{draft['qid']}' → {draft['city']} (~{draft['count']})…"
+    )
+
+    async def _do_send():
+        cmd = [sys.executable, BLAST_QUEUE_PY, "send", draft["qid"], "--yes"]
+        try:
+            proc = await asyncio.to_thread(
+                subprocess.run, cmd, capture_output=True, text=True, timeout=1800,
+                cwd=os.path.dirname(BLAST_QUEUE_PY),
+            )
+        except Exception as e:  # noqa: BLE001
+            await query.message.reply_text(f"Blast send error: {e}")
+            return
+        if proc.returncode == 0:
+            await query.message.reply_text(
+                f"✅ Blast '{draft['qid']}' sent from {draft['from']} → "
+                f"{draft['city']} (~{draft['count']} contacts)."
+            )
+        else:
+            err = ((proc.stdout or "") + (proc.stderr or ""))[-300:]
+            await query.message.reply_text(f"⚠️ Blast send failed: {err}")
+
+    ctx.application.create_task(_do_send())
 
 
 async def cmd_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2430,6 +2590,7 @@ def main() -> None:
     app.add_handler(CommandHandler("show", cmd_show))
     app.add_handler(CommandHandler("settlement", cmd_settlement))
     app.add_handler(CommandHandler("launch", cmd_launch))
+    app.add_handler(CallbackQueryHandler(on_blast_button, pattern=r"^lblast:"))
     app.add_handler(CommandHandler("wire", cmd_wire))
     app.add_handler(CommandHandler("prismtoken", cmd_prismtoken))
     app.add_handler(CommandHandler("triage", cmd_triage))
