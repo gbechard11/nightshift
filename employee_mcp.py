@@ -786,16 +786,20 @@ async def login_post(request: Request):
 
 
 # --------------------------------------------------------------------------- #
-# Guest List — DJ Mina @ Pawn Shop, June 13 2026
-# Form closes at 9:00 PM MDT; submissions go to /data/greg/guestlist_mina_20260613.json
+# Guest List — Ne-Yo @ Pawn Shop Live, June 19 2026
+# Closes 8:00 PM MDT. Up to 2 guest names per email/cell; resubmitting the same
+# email or cell tops you up to (never past) 2 names. Submissions ->
+# /data/greg/blast_queue/guestlist_neyo_20260619.json
 # --------------------------------------------------------------------------- #
-_GL_FILE = "/data/greg/blast_queue/guestlist_mina_20260613.json"
-_GL_CLOSE_EPOCH = 1781406000  # 2026-06-13 21:00 MDT = 2026-06-14 03:00 UTC
+_GL_FILE = "/data/greg/blast_queue/guestlist_neyo_20260619.json"
+_GL_CLOSE_EPOCH = 1781920800  # 2026-06-19 20:00 MDT = 2026-06-20 02:00 UTC
+_GL_IMG = "/data/greg/neyo_promo/neyo_ps_9x16.png"
+_GL_MAX = 2  # max names per email/cell
 _EMAIL_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "email_send.py")
 
 _GL_FORM = """<!doctype html><html lang=en><head>
 <meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>Guest List — DJ Mina @ Pawn Shop</title>
+<title>Guest List — Ne-Yo @ Pawn Shop</title>
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
 body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
@@ -810,6 +814,7 @@ input{{width:100%;background:#1a1a1f;border:1px solid #333;border-radius:8px;
   color:#f0f0f0;font-size:16px;padding:14px 16px;outline:none;transition:border .15s}}
 input:focus{{border-color:#666}}
 .req{{color:#e05555;font-size:12px;margin-top:4px}}
+.hint{{color:#777;font-size:12px;margin-top:4px}}
 .opt-in{{font-size:12px;color:#666;margin-top:22px;line-height:1.6;
   padding:14px;background:#111;border-radius:8px;border:1px solid #222}}
 .opt-in a{{color:#888}}
@@ -822,14 +827,17 @@ button:hover{{opacity:.85}}
   background:#1a0a0a;border-radius:8px;border:1px solid #4a1a1a}}
 </style></head>
 <body><div class=wrap>
-<img src=/guestlist/img alt="DJ Mina" style="width:100%;border-radius:12px;margin-bottom:20px;display:block">
+<img src=/guestlist/img alt="Ne-Yo" style="width:100%;border-radius:12px;margin-bottom:20px;display:block">
 <div class=brand>Pawn Shop Live · Edmonton</div>
-<h1>DJ Mina<br>Guest List</h1>
-<div class=sub>Tonight — June 13, 2026</div>
+<h1>Ne-Yo<br>Guest List</h1>
+<div class=sub>Tonight — Friday, June 19, 2026</div>
 {err}
 <form method=POST action=/guestlist>
-  <label>Full Name <span style="color:#e05555">*</span></label>
-  <input name=name type=text placeholder="Your full name" required maxlength=120 value="{name}">
+  <label>Guest Name 1 <span style="color:#e05555">*</span></label>
+  <input name=name1 type=text placeholder="First &amp; last name" required maxlength=120 value="{name1}">
+  <label>Guest Name 2 <span style="color:#777">(optional)</span></label>
+  <input name=name2 type=text placeholder="Bringing someone? Add their name" maxlength=120 value="{name2}">
+  <div class=hint>Up to 2 names per email / cell.</div>
   <label>Cell Phone</label>
   <input name=phone type=tel placeholder="+1 (780) 555-0000" maxlength=30 value="{phone}">
   <label>Email Address</label>
@@ -838,9 +846,9 @@ button:hover{{opacity:.85}}
   <div class=opt-in>By submitting this form you consent to receive further communications
   and marketing from Nightshift Entertainment and Pawn Shop Live, including upcoming
   event announcements, promotions, and exclusive offers. You may unsubscribe at any time.</div>
-  <button type=submit>Add Me to the Guest List</button>
+  <button type=submit>Add Us to the Guest List</button>
 </form>
-<div class=note>Guest list closes at 9:00 PM · Doors at 9 PM</div>
+<div class=note>Guest list closes at 8:00 PM tonight</div>
 </div></body></html>"""
 
 _GL_THANKS = """<!doctype html><html lang=en><head>
@@ -854,13 +862,35 @@ body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
 .check{{font-size:52px;margin-bottom:16px}}
 h1{{font-size:24px;font-weight:700;margin-bottom:10px}}
 p{{color:#999;font-size:15px;line-height:1.6}}
+.names{{margin:18px 0;padding:14px;background:#111;border:1px solid #222;border-radius:8px;
+  color:#f0f0f0;font-size:16px;line-height:1.8}}
 .brand{{color:#555;font-size:11px;letter-spacing:.15em;text-transform:uppercase;margin-top:32px}}
 </style></head>
 <body><div class=wrap>
 <div class=check>✓</div>
 <h1>You're on the list!</h1>
-<p>See you tonight at Pawn Shop Live.<br>Doors open at 9 PM — mention your name at the door.</p>
+<div class=names>{names}</div>
+<p>See you tonight at Pawn Shop Live.<br>Just mention your name at the door.</p>
 <div class=brand>Nightshift Entertainment</div>
+</div></body></html>"""
+
+_GL_FULL = """<!doctype html><html lang=en><head>
+<meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Already on the list</title>
+<style>
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  background:#0a0a0c;color:#f0f0f0;min-height:100vh;
+  display:flex;align-items:center;justify-content:center;padding:20px;text-align:center}}
+.wrap{{max-width:380px}}
+h1{{font-size:24px;font-weight:700;margin-bottom:10px}}
+p{{color:#999;font-size:15px;line-height:1.6}}
+.names{{margin:18px 0;padding:14px;background:#111;border:1px solid #222;border-radius:8px;
+  color:#f0f0f0;font-size:16px;line-height:1.8}}
+</style></head>
+<body><div class=wrap>
+<h1>You're already set</h1>
+<div class=names>{names}</div>
+<p>This email/cell already has its 2 guests on the Ne-Yo list. See you tonight at Pawn Shop Live!</p>
 </div></body></html>"""
 
 _GL_CLOSED = """<!doctype html><html lang=en><head>
@@ -876,30 +906,85 @@ p{{color:#999;font-size:15px;line-height:1.6}}
 </style></head>
 <body><div class=wrap>
 <h1>Guest List is Closed</h1>
-<p>The guest list for tonight's DJ Mina show has closed. See you at the door!</p>
+<p>The guest list for tonight's Ne-Yo show has closed. See you at the door!</p>
 </div></body></html>"""
 
 
-def _gl_save(entry: dict) -> None:
+def _gl_digits(s: str) -> str:
+    return "".join(c for c in s if c.isdigit())
+
+
+def _gl_save(phone: str, email: str, new_names: list) -> tuple:
+    """Merge names onto the record keyed by this email/phone, capped at _GL_MAX.
+
+    Returns (added_names, all_names_for_contact, was_already_full).
+    """
     data = []
     try:
         with open(_GL_FILE) as f:
             data = json.load(f)
     except Exception:
         pass
-    data.append(entry)
+
+    email_k = email.strip().lower()
+    phone_k = _gl_digits(phone)
+
+    rec = None
+    for r in data:
+        r_email = str(r.get("email", "")).strip().lower()
+        r_phone = _gl_digits(str(r.get("phone", "")))
+        if email_k and r_email and r_email == email_k:
+            rec = r
+            break
+        if phone_k and r_phone and r_phone == phone_k:
+            rec = r
+            break
+
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+
+    if rec is None:
+        names = new_names[:_GL_MAX]
+        data.append({"names": names, "phone": phone, "email": email, "ts": ts})
+        with open(_GL_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+        return names, names, False
+
+    existing = rec.get("names") or []
+    if len(existing) >= _GL_MAX:
+        return [], existing, True
+
+    capacity = _GL_MAX - len(existing)
+    # de-dupe (case-insensitive) so the same name isn't listed twice
+    have = {n.strip().lower() for n in existing}
+    added = []
+    for n in new_names:
+        if len(added) >= capacity:
+            break
+        if n.strip().lower() in have:
+            continue
+        added.append(n)
+        have.add(n.strip().lower())
+
+    rec["names"] = existing + added
+    if not rec.get("phone") and phone:
+        rec["phone"] = phone
+    if not rec.get("email") and email:
+        rec["email"] = email
+    rec["ts"] = ts
     with open(_GL_FILE, "w") as f:
         json.dump(data, f, indent=2)
+    return added, rec["names"], False
 
 
-def _gl_send_confirmation(name: str, email: str) -> None:
+def _gl_send_confirmation(names: list, email: str) -> None:
+    who = " and ".join(names) if names else "You"
     body = (
-        f"Hi {name},\n\n"
-        "You're officially on the guest list for tonight's show!\n\n"
-        "  Event: DJ Mina\n"
+        f"Hi {names[0] if names else 'there'},\n\n"
+        f"{who} " + ("are" if len(names) > 1 else "is") + " officially on the guest list "
+        "for tonight's show!\n\n"
+        "  Event: Ne-Yo\n"
         "  Venue: Pawn Shop Live\n"
-        "  Date: Friday, June 13, 2026\n"
-        "  Doors: 9:00 PM\n\n"
+        "  Date: Friday, June 19, 2026\n\n"
         "Just mention your name at the door. See you tonight!\n\n"
         "— Pawn Shop Live / Nightshift Entertainment\n\n"
         "---\n"
@@ -912,7 +997,7 @@ def _gl_send_confirmation(name: str, email: str) -> None:
         subprocess.Popen(
             [sys.executable, _EMAIL_BIN,
              "--to", email,
-             "--subject", "You're on the guest list — DJ Mina @ Pawn Shop Tonight",
+             "--subject", "You're on the guest list — Ne-Yo @ Pawn Shop Tonight",
              "--body", body],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -923,7 +1008,7 @@ def _gl_send_confirmation(name: str, email: str) -> None:
 
 @mcp.custom_route("/guestlist/img", methods=["GET"])
 async def guestlist_img(request: Request) -> Response:
-    with open("/data/greg/mina_promo/mina_edmonton_9x16.png", "rb") as f:
+    with open(_GL_IMG, "rb") as f:
         return Response(f.read(), media_type="image/png")
 
 
@@ -931,7 +1016,7 @@ async def guestlist_img(request: Request) -> Response:
 async def guestlist_get(request: Request) -> HTMLResponse:
     if time.time() > _GL_CLOSE_EPOCH:
         return HTMLResponse(_GL_CLOSED)
-    return HTMLResponse(_GL_FORM.format(err="", name="", phone="", email=""))
+    return HTMLResponse(_GL_FORM.format(err="", name1="", name2="", phone="", email=""))
 
 
 @mcp.custom_route("/guestlist", methods=["POST"])
@@ -939,29 +1024,33 @@ async def guestlist_post(request: Request) -> HTMLResponse:
     if time.time() > _GL_CLOSE_EPOCH:
         return HTMLResponse(_GL_CLOSED)
     form = await request.form()
-    name = str(form.get("name", "")).strip()
+    name1 = str(form.get("name1", "")).strip()
+    name2 = str(form.get("name2", "")).strip()
     phone = str(form.get("phone", "")).strip()
     email = str(form.get("email", "")).strip()
 
-    if not name:
-        err = '<div class=err>Please enter your full name.</div>'
-        return HTMLResponse(_GL_FORM.format(err=err, name="", phone=phone, email=email))
+    def _form(err):
+        return HTMLResponse(_GL_FORM.format(
+            err=f'<div class=err>{err}</div>',
+            name1=name1, name2=name2, phone=phone, email=email))
+
+    if not name1:
+        return _form("Please enter at least one guest name.")
     if not phone and not email:
-        err = '<div class=err>Please enter your cell phone or email address.</div>'
-        return HTMLResponse(_GL_FORM.format(err=err, name=name, phone="", email=""))
+        return _form("Please enter your cell phone or email address.")
 
-    entry = {
-        "name": name,
-        "phone": phone,
-        "email": email,
-        "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
-    }
-    await asyncio.to_thread(_gl_save, entry)
+    new_names = [n for n in (name1, name2) if n]
+    added, all_names, was_full = await asyncio.to_thread(_gl_save, phone, email, new_names)
 
-    if email:
-        await asyncio.to_thread(_gl_send_confirmation, name, email)
+    names_html = "<br>".join(all_names) if all_names else "—"
 
-    return HTMLResponse(_GL_THANKS)
+    if was_full:
+        return HTMLResponse(_GL_FULL.format(names=names_html))
+
+    if email and added:
+        await asyncio.to_thread(_gl_send_confirmation, added, email)
+
+    return HTMLResponse(_GL_THANKS.format(names=names_html))
 
 
 if __name__ == "__main__":
