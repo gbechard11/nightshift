@@ -787,14 +787,15 @@ async def login_post(request: Request):
 
 # --------------------------------------------------------------------------- #
 # Guest List — Ne-Yo @ Pawn Shop Live, June 19 2026
-# Closes 8:00 PM MDT. Up to 2 guest names per email/cell; resubmitting the same
-# email or cell tops you up to (never past) 2 names. Submissions ->
-# /data/greg/blast_queue/guestlist_neyo_20260619.json
+# Closes 8:00 PM MDT. Access-code gated. Up to 2 guest names per email/cell;
+# resubmitting the same email or cell tops you up to (never past) 2 names.
+# Submissions -> /data/greg/blast_queue/guestlist_neyo_20260619.json
 # --------------------------------------------------------------------------- #
 _GL_FILE = "/data/greg/blast_queue/guestlist_neyo_20260619.json"
 _GL_CLOSE_EPOCH = 1781920800  # 2026-06-19 20:00 MDT = 2026-06-20 02:00 UTC
 _GL_IMG = "/data/greg/neyo_promo/neyo_ps_9x16.png"
 _GL_MAX = 2  # max names per email/cell
+_GL_CODES = {"JEUNETAGS", "NSENT", "MAKORE"}  # valid access codes
 _EMAIL_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "email_send.py")
 
 _GL_FORM = """<!doctype html><html lang=en><head>
@@ -813,6 +814,7 @@ label{{display:block;font-size:13px;color:#999;margin-bottom:6px;margin-top:18px
 input{{width:100%;background:#1a1a1f;border:1px solid #333;border-radius:8px;
   color:#f0f0f0;font-size:16px;padding:14px 16px;outline:none;transition:border .15s}}
 input:focus{{border-color:#666}}
+.code-in{{text-transform:uppercase;letter-spacing:.08em;font-weight:600}}
 .req{{color:#e05555;font-size:12px;margin-top:4px}}
 .hint{{color:#777;font-size:12px;margin-top:4px}}
 .opt-in{{font-size:12px;color:#666;margin-top:22px;line-height:1.6;
@@ -833,6 +835,9 @@ button:hover{{opacity:.85}}
 <div class=sub>Tonight — Friday, June 19, 2026</div>
 {err}
 <form method=POST action=/guestlist>
+  <label>Access Code <span style="color:#e05555">*</span></label>
+  <input name=code type=text class=code-in placeholder="Enter your access code" required maxlength=40 value="{code}">
+  <div class=hint>You need a valid code from your promoter to submit.</div>
   <label>Guest Name 1 <span style="color:#e05555">*</span></label>
   <input name=name1 type=text placeholder="First &amp; last name" required maxlength=120 value="{name1}">
   <label>Guest Name 2 <span style="color:#777">(optional)</span></label>
@@ -914,7 +919,7 @@ def _gl_digits(s: str) -> str:
     return "".join(c for c in s if c.isdigit())
 
 
-def _gl_save(phone: str, email: str, new_names: list) -> tuple:
+def _gl_save(phone: str, email: str, new_names: list, code: str) -> tuple:
     """Merge names onto the record keyed by this email/phone, capped at _GL_MAX.
 
     Returns (added_names, all_names_for_contact, was_already_full).
@@ -944,7 +949,8 @@ def _gl_save(phone: str, email: str, new_names: list) -> tuple:
 
     if rec is None:
         names = new_names[:_GL_MAX]
-        data.append({"names": names, "phone": phone, "email": email, "ts": ts})
+        data.append({"names": names, "phone": phone, "email": email,
+                     "code": code, "ts": ts})
         with open(_GL_FILE, "w") as f:
             json.dump(data, f, indent=2)
         return names, names, False
@@ -970,6 +976,8 @@ def _gl_save(phone: str, email: str, new_names: list) -> tuple:
         rec["phone"] = phone
     if not rec.get("email") and email:
         rec["email"] = email
+    if not rec.get("code") and code:
+        rec["code"] = code
     rec["ts"] = ts
     with open(_GL_FILE, "w") as f:
         json.dump(data, f, indent=2)
@@ -1016,7 +1024,7 @@ async def guestlist_img(request: Request) -> Response:
 async def guestlist_get(request: Request) -> HTMLResponse:
     if time.time() > _GL_CLOSE_EPOCH:
         return HTMLResponse(_GL_CLOSED)
-    return HTMLResponse(_GL_FORM.format(err="", name1="", name2="", phone="", email=""))
+    return HTMLResponse(_GL_FORM.format(err="", code="", name1="", name2="", phone="", email=""))
 
 
 @mcp.custom_route("/guestlist", methods=["POST"])
@@ -1024,6 +1032,7 @@ async def guestlist_post(request: Request) -> HTMLResponse:
     if time.time() > _GL_CLOSE_EPOCH:
         return HTMLResponse(_GL_CLOSED)
     form = await request.form()
+    code = str(form.get("code", "")).strip()
     name1 = str(form.get("name1", "")).strip()
     name2 = str(form.get("name2", "")).strip()
     phone = str(form.get("phone", "")).strip()
@@ -1032,15 +1041,18 @@ async def guestlist_post(request: Request) -> HTMLResponse:
     def _form(err):
         return HTMLResponse(_GL_FORM.format(
             err=f'<div class=err>{err}</div>',
-            name1=name1, name2=name2, phone=phone, email=email))
+            code=code, name1=name1, name2=name2, phone=phone, email=email))
 
+    if code.upper() not in _GL_CODES:
+        return _form("Invalid access code. Please check the code from your promoter and try again.")
     if not name1:
         return _form("Please enter at least one guest name.")
     if not phone and not email:
         return _form("Please enter your cell phone or email address.")
 
     new_names = [n for n in (name1, name2) if n]
-    added, all_names, was_full = await asyncio.to_thread(_gl_save, phone, email, new_names)
+    added, all_names, was_full = await asyncio.to_thread(
+        _gl_save, phone, email, new_names, code.upper())
 
     names_html = "<br>".join(all_names) if all_names else "—"
 
