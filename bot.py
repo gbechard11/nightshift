@@ -909,6 +909,217 @@ async def on_campaign_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+# ── New show → launch kit ──────────────────────────────────────────────────
+# One command that fans out a coordinated show launch. Increment 1: a PAUSED
+# Meta sales campaign (spend-gated, reusing build_show_campaign) + on-sale and
+# show-date calendar entries. Greg builds the event on Showpass/TicketWeb himself
+# and passes the ticket link; creative is OFF by default (used only if a
+# creative=<file|url> field is supplied). Email blast + social captions land in
+# later increments. Branches on the named platform (showpass|ticketweb).
+GCAL_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gcal.py")
+LAUNCH_PLATFORMS = {"showpass", "ticketweb"}
+LAUNCH_TZ_BY_CITY = {
+    "winnipeg": "America/Winnipeg",
+    "edmonton": "America/Edmonton",
+    "calgary": "America/Edmonton",
+    "hamilton": "America/Toronto",
+    "toronto": "America/Toronto",
+}
+LAUNCH_USAGE = (
+    "Usage:\n/launch [@account] <name> | <showpass|ticketweb> | <city> | <venue> | "
+    "<show date> | <ticket_link> | <daily $CAD> | <caption> | [onsale date] | [creative=flyer.jpg]\n\n"
+    "Builds a PAUSED, spend-gated ad campaign + adds on-sale & show-date calendar entries. "
+    "You create the event on the platform yourself and pass its ticket link here. Creative is "
+    "optional — omit it and the ad uses the link preview.\n\n"
+    "Dates: YYYY-MM-DD or YYYY-MM-DD HH:MM (24h).\n\n"
+    "Example:\n/launch Chris Webby | ticketweb | Hamilton | Bridgeworks | 2026-08-15 20:00 | "
+    "https://www.ticketweb.ca/event/x | 30 | Chris Webby live in Hamilton — tickets on sale now! | "
+    "2026-06-25 10:00"
+)
+
+
+def _parse_launch_dt(s: str, default_hour: int = 20) -> datetime:
+    raw = s.strip().replace("T", " ")
+    had_time = ":" in raw or len(raw.split()) > 1
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H%M", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(raw, fmt)
+            return dt if had_time else dt.replace(hour=default_hour)
+        except ValueError:
+            continue
+    raise ValueError(f"bad date/time {s!r} (use YYYY-MM-DD or YYYY-MM-DD HH:MM)")
+
+
+def _parse_launch_spec(raw: str) -> dict:
+    parts = [p.strip() for p in raw.split("|")]
+    if len(parts) < 8 or not all(parts[i] for i in range(8)):
+        raise ValueError("need 8 required fields separated by |")
+    name, platform, city, venue, show_s, ticket_link, daily_s, caption = parts[:8]
+    platform = platform.lower()
+    if platform not in LAUNCH_PLATFORMS:
+        raise ValueError(f"platform must be showpass or ticketweb (got {platform!r})")
+    if not ticket_link.startswith("http"):
+        raise ValueError(f"ticket_link must be a URL (got {ticket_link!r})")
+    try:
+        daily_cad = float(daily_s)
+    except ValueError:
+        raise ValueError(f"daily budget must be a number (got {daily_s!r})")
+    if daily_cad <= 0:
+        raise ValueError("daily budget must be > 0")
+    show_dt = _parse_launch_dt(show_s, default_hour=20)
+    onsale_dt = None
+    creative = None
+    for extra in parts[8:]:
+        if not extra:
+            continue
+        if extra.lower().startswith("creative="):
+            creative = extra.split("=", 1)[1].strip() or None
+        elif onsale_dt is None:
+            onsale_dt = _parse_launch_dt(extra, default_hour=10)
+    return {
+        "name": name, "platform": platform, "city": city, "venue": venue,
+        "show_dt": show_dt, "ticket_link": ticket_link, "daily_cad": daily_cad,
+        "caption": caption, "onsale_dt": onsale_dt, "creative": creative,
+    }
+
+
+async def _gcal_create(summary, start_dt, end_dt, tz, location="", description=""):
+    cmd = [
+        sys.executable, GCAL_PY, "create",
+        "--summary", summary,
+        "--start", start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+        "--end", end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+        "--tz", tz,
+    ]
+    if location:
+        cmd += ["--location", location]
+    if description:
+        cmd += ["--description", description]
+    proc = await asyncio.to_thread(
+        subprocess.run, cmd, capture_output=True, text=True, timeout=60,
+        cwd=os.path.dirname(GCAL_PY),
+    )
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or proc.stdout or "gcal failed").strip()[:300])
+    return json.loads(proc.stdout)
+
+
+async def cmd_launch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """New show -> launch kit. Fans out a coordinated show launch (paused ads +
+    calendar in increment 1; blast + social to follow). Confirm-first: the ad
+    campaign is built PAUSED and only the Launch button starts spend."""
+    if not authorized(update):
+        return
+    raw = (update.message.text or "").partition(" ")[2].strip()
+    try:
+        acct, raw = _pop_account(raw)
+    except meta_ads.MetaError as e:
+        await update.message.reply_text(str(e))
+        return
+    if not raw:
+        await update.message.reply_text(LAUNCH_USAGE)
+        return
+    try:
+        spec = _parse_launch_spec(raw)
+    except ValueError as e:
+        await update.message.reply_text(f"⚠️ {e}\n\n{LAUNCH_USAGE}")
+        return
+
+    await ctx.bot.send_chat_action(update.message.chat_id, ChatAction.TYPING)
+    name = spec["name"]
+    location = f"{spec['venue']}, {spec['city']}"
+    tz = LAUNCH_TZ_BY_CITY.get(spec["city"].lower(), os.environ.get("GCAL_TZ", "America/Edmonton"))
+    sections: list[str] = []
+
+    # 1) PAUSED Meta sales campaign (spend-gated) ----------------------------
+    camp_token = None
+    if not meta_ads.configured(acct):
+        sections.append(f"\U0001F4E3 Ads: skipped — {acct.label} Meta account not configured.")
+    else:
+        try:
+            async with httpx.AsyncClient(timeout=90.0) as client:
+                image_hash = image_url = video_id = image_label = None
+                cre = spec["creative"]
+                if cre:
+                    if cre.startswith("http"):
+                        image_url = image_label = cre
+                    else:
+                        fp = meta_ads.resolve_media_path(cre)
+                        if meta_ads.is_video(fp):
+                            video_id = await meta_ads.upload_ad_video(client, fp, acct=acct)
+                        else:
+                            image_hash = await meta_ads.upload_ad_image(client, fp, acct=acct)
+                        image_label = cre
+                res = await meta_ads.build_show_campaign(
+                    client, name, spec["daily_cad"], spec["ticket_link"], spec["caption"],
+                    image_hash=image_hash, image_url=image_url, video_id=video_id, acct=acct,
+                )
+            camp_token = secrets.token_urlsafe(8)
+            PENDING_CAMPAIGNS[camp_token] = {
+                "campaign_id": res["campaign_id"], "name": name,
+                "daily_cad": spec["daily_cad"], "acct_key": acct.key, "full": True,
+            }
+            adset_lines = "\n".join(
+                f"     • {a['layer']}: ${a['daily_cents'] / 100:.2f}/day" for a in res["adsets"]
+            )
+            sections.append(
+                f"\U0001F4E3 Ads: PAUSED sales campaign on {acct.label} (id {res['campaign_id']})\n"
+                f"   {res['objective']} ({res['platform']}), ${spec['daily_cad']:.2f} {acct.currency}/day:\n"
+                f"{adset_lines}\n"
+                f"   Creative: {image_label or '(link preview)'}"
+            )
+        except Exception as e:  # noqa: BLE001 - surface, never block the rest
+            log.exception("launch: campaign build failed")
+            sections.append(f"\U0001F4E3 Ads: FAILED — {str(e)[:200]} (nothing spent)")
+
+    # 2) Calendar entries (own calendar, safe -> created immediately) --------
+    cal_links, cal_errs = [], []
+    try:
+        show_end = spec["show_dt"] + timedelta(hours=3)
+        ev = await _gcal_create(
+            f"\U0001F3A4 {name} — {spec['city']}", spec["show_dt"], show_end, tz,
+            location=location,
+            description=f"Show date.\nTickets: {spec['ticket_link']}\nPlatform: {spec['platform']}",
+        )
+        if ev.get("htmlLink"):
+            cal_links.append(("Show", ev["htmlLink"]))
+    except Exception as e:  # noqa: BLE001
+        cal_errs.append(f"show-date ({str(e)[:120]})")
+    if spec["onsale_dt"]:
+        try:
+            os_end = spec["onsale_dt"] + timedelta(minutes=30)
+            ev = await _gcal_create(
+                f"\U0001F39F️ On-sale: {name}", spec["onsale_dt"], os_end, tz,
+                location=location,
+                description=f"Tickets go on sale.\nLink: {spec['ticket_link']}",
+            )
+            if ev.get("htmlLink"):
+                cal_links.append(("On-sale", ev["htmlLink"]))
+        except Exception as e:  # noqa: BLE001
+            cal_errs.append(f"on-sale ({str(e)[:120]})")
+    if cal_links:
+        sections.append("\U0001F5D3️ Calendar:\n" + "\n".join(f"   • {lbl}: {ln}" for lbl, ln in cal_links))
+    if cal_errs:
+        sections.append("\U0001F5D3️ Calendar issues: " + "; ".join(cal_errs))
+
+    # Consolidated reply -----------------------------------------------------
+    header = (
+        f"\U0001F680 Launch kit — {name}\n"
+        f"{spec['platform'].title()} · {location} · {spec['show_dt']:%a %b %-d, %Y · %-I:%M %p}\n"
+        f"ℹ️ You build the event on {spec['platform'].title()}; this kit uses your ticket link."
+    )
+    body = header + "\n\n" + "\n\n".join(sections)
+    body += "\n\n— Email blast + social captions arrive in the next update."
+    kb = None
+    if camp_token:
+        body += "\n\nLaunching the campaign starts real spend. Launch now?"
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("\U0001F680 Launch ads (start spend)", callback_data=f"camp:go:{camp_token}"),
+            InlineKeyboardButton("✖️ Keep paused", callback_data=f"camp:hold:{camp_token}"),
+        ]])
+    await update.message.reply_text(body, reply_markup=kb)
+
+
 async def cmd_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """List media files available in the local ads folder for use in /draft."""
     if not authorized(update):
@@ -2218,6 +2429,7 @@ def main() -> None:
     app.add_handler(CommandHandler("shows", cmd_shows))
     app.add_handler(CommandHandler("show", cmd_show))
     app.add_handler(CommandHandler("settlement", cmd_settlement))
+    app.add_handler(CommandHandler("launch", cmd_launch))
     app.add_handler(CommandHandler("wire", cmd_wire))
     app.add_handler(CommandHandler("prismtoken", cmd_prismtoken))
     app.add_handler(CommandHandler("triage", cmd_triage))
