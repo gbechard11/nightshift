@@ -76,6 +76,19 @@ def _looks_like_expired_auth(err: str) -> bool:
     ))
 
 
+def _should_reping() -> bool:
+    """Ping on the first expiry, then re-ping at most once per ~20h while the
+    token is STILL expired (a daily nudge), so a lapsed token can't sit dark
+    unnoticed for days. The sentinel stores the last-ping time; cleared on the
+    next healthy read."""
+    try:
+        with open(REAUTH_SENTINEL) as f:
+            last = datetime.fromisoformat(f.read().strip())
+        return (datetime.now() - last) >= timedelta(hours=20)
+    except (FileNotFoundError, ValueError):
+        return True
+
+
 def _load_state() -> dict:
     try:
         with open(STATE_FILE) as f:
@@ -139,10 +152,10 @@ async def main() -> int:
             shows = await prism.list_shows(client, today.isoformat(), end.isoformat())
         except prism.PrismError as e:
             print(f"prism_watch: lookup failed: {e}")
-            # If the failure is an expired/rejected token, ping the owner ONCE
-            # (sentinel-gated) with re-auth steps. This is the "queue me when
-            # needed" signal — fires ~monthly when the refresh token lapses.
-            if _looks_like_expired_auth(str(e)) and not os.path.exists(REAUTH_SENTINEL):
+            # If the failure is an expired/rejected token, ping the owner with
+            # re-auth steps: once on first expiry, then a daily nudge (~20h) while
+            # still expired so a lapsed access token can't sit dark for days.
+            if _looks_like_expired_auth(str(e)) and _should_reping():
                 await _notify(client, REAUTH_MSG)
                 try:
                     open(REAUTH_SENTINEL, "w").write(datetime.now().isoformat())
