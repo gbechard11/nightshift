@@ -61,6 +61,7 @@ import imap_email
 import mailer
 import pending_email
 import pending_campaign
+import agent_relay
 from pedro_brain import CLAUDE_TIMEOUT, PedroError, PedroTimeout, run_claude
 
 TOKEN = os.environ["EMPLOYEE_BOT_TOKEN"]
@@ -1360,6 +1361,51 @@ async def on_blast_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
             pass
 
 
+# --------------------------------------------------------------------------- #
+# Agent-to-agent relay: the owner answers a connected partner agent (e.g. Seba's
+# @TARSMEDIAFINA_BOT). The partner agent sends in via the MCP tool message_ns_team
+# and polls read_ns_team_messages; here Greg replies with /reply <uid> or /seba.
+# --------------------------------------------------------------------------- #
+OWNER_ID = int(os.environ.get("OWNER_TELEGRAM_ID", "6575459992"))
+SEBA_PARTNER_UID = int(os.environ.get("SEBA_PARTNER_UID", "8722742818"))
+
+
+async def _relay_send(update: Update, target: int, body: str) -> None:
+    await asyncio.to_thread(agent_relay.append, target, "Greg", "to_partner", body)
+    # Live heads-up to the partner-human via the NS Team Bot (best-effort); the
+    # authoritative channel is the relay file their agent polls.
+    await asyncio.to_thread(
+        employee_notify.send_plain, target,
+        "\U0001F4AC From Greg (NS Team Bot): " + body,
+    )
+    await update.message.reply_text(
+        "Sent to %s. Their agent will pick it up via read_ns_team_messages."
+        % employee_notify.who(target)
+    )
+
+
+async def cmd_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: reply to a connected partner agent's relay thread."""
+    if not update.effective_user or update.effective_user.id != OWNER_ID:
+        return
+    parts = (update.message.text or "").split(None, 2)
+    if len(parts) < 3 or not parts[1].isdigit():
+        await update.message.reply_text("Usage: /reply <uid> <message>")
+        return
+    await _relay_send(update, int(parts[1]), parts[2])
+
+
+async def cmd_seba(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only shortcut: reply straight to Seba's bot relay."""
+    if not update.effective_user or update.effective_user.id != OWNER_ID:
+        return
+    parts = (update.message.text or "").split(None, 1)
+    if len(parts) < 2:
+        await update.message.reply_text("Usage: /seba <message>")
+        return
+    await _relay_send(update, SEBA_PARTNER_UID, parts[1])
+
+
 def main() -> None:
     if not EMPLOYEE_USERS:
         log.warning(
@@ -1379,6 +1425,8 @@ def main() -> None:
     app.add_handler(CommandHandler("setupinbox", cmd_setupinbox))
     app.add_handler(CommandHandler("cancelinbox", cmd_cancelinbox))
     app.add_handler(CommandHandler("connect", cmd_connect))
+    app.add_handler(CommandHandler("reply", cmd_reply))
+    app.add_handler(CommandHandler("seba", cmd_seba))
     app.add_handler(CommandHandler("research", cmd_research))
     app.add_handler(CommandHandler("draft", cmd_draft))
     app.add_handler(CommandHandler("media", cmd_media))

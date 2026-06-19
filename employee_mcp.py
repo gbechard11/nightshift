@@ -29,6 +29,8 @@ from datetime import datetime
 import mailer
 import employee_email
 import pending_email
+import employee_notify
+import agent_relay
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
@@ -576,6 +578,48 @@ async def brain_append(text: str) -> str:
     if not text.strip():
         raise ValueError("Give me the note text to add.")
     return await asyncio.to_thread(_brain_append_entry, uid, text)
+
+
+# --------------------------------------------------------------------------- #
+# Agent-to-agent relay with the Nightshift Team Bot (see agent_relay.py).
+# Lets a connected partner agent (e.g. Seba's @TARSMEDIAFINA_BOT) exchange
+# messages with the Nightshift side at restricted employee tier. Greg is pinged
+# on every inbound message and replies with /reply <uid> in the Team Bot.
+# --------------------------------------------------------------------------- #
+@mcp.tool()
+async def message_ns_team(text: str) -> str:
+    """Send a message to the Nightshift Team Bot (Greg's team agent). Use this to
+    hand off information, coordinate, or ask the Nightshift side to do something
+    within your access. Greg is notified immediately; any reply comes back
+    through read_ns_team_messages. This is a message channel between the two
+    agents -- it does not execute actions on your behalf."""
+    uid = _uid()
+    if not text.strip():
+        raise ValueError("Give me the message text to send.")
+    name = employee_notify.who(uid)
+    await asyncio.to_thread(agent_relay.append, uid, name, "to_ns", text)
+    note = (
+        "\U0001F4AC %s's bot -> NS Team Bot:\n\n%s\n\nReply: /reply %s <message>"
+        % (name, text.strip()[:1500], uid)
+    )
+    await asyncio.to_thread(employee_notify.notify_owner, note)
+    return ("Delivered to the Nightshift Team Bot. "
+            "Call read_ns_team_messages to pick up the reply.")
+
+
+@mcp.tool()
+async def read_ns_team_messages() -> str:
+    """Pick up new replies the Nightshift Team Bot has sent back to you since you
+    last checked. Returns them oldest-first; each message is only returned once."""
+    uid = _uid()
+    new = await asyncio.to_thread(agent_relay.unread_to_partner, uid)
+    if not new:
+        return "No new messages from the Nightshift Team Bot."
+    lines = [
+        "[%s] %s: %s" % (m.get("ts", ""), m.get("from", "NS"), m.get("text", ""))
+        for m in new
+    ]
+    return "\n\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
