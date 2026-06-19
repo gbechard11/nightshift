@@ -796,7 +796,9 @@ _GL_CLOSE_EPOCH = 1781920800  # 2026-06-19 20:00 MDT = 2026-06-20 02:00 UTC
 _GL_IMG = "/data/greg/neyo_promo/neyo_ps_9x16.png"
 _GL_MAX = 2  # max names per email/cell
 _GL_CODES = {"JEUNETAGS", "NSENT", "MAKORE"}  # valid access codes
-_GL_CODE_LIMIT = 25  # each code stops accepting once this many names are on the list
+# Each code stops accepting once its name-limit is reached.
+_GL_CODE_LIMITS = {"JEUNETAGS": 25, "NSENT": 25, "MAKORE": 10}
+_GL_CODE_LIMIT_DEFAULT = 25
 _EMAIL_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "email_send.py")
 
 _GL_FORM = """<!doctype html><html lang=en><head>
@@ -976,7 +978,8 @@ def _gl_save(phone: str, email: str, new_names: list, code: str) -> tuple:
     # Which code's quota this submission draws from: an existing record keeps its
     # own code; a brand-new record uses the submitted code.
     eff_code = (str(rec.get("code", "")).upper() if rec and rec.get("code") else code)
-    code_remaining = _GL_CODE_LIMIT - _gl_code_used(data, eff_code)
+    code_limit = _GL_CODE_LIMITS.get(eff_code, _GL_CODE_LIMIT_DEFAULT)
+    code_remaining = code_limit - _gl_code_used(data, eff_code)
 
     existing = rec.get("names") if rec else []
     existing = existing or []
