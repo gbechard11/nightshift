@@ -952,6 +952,26 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"⚠️ Report shown above but email failed: {e}")
 
 
+async def cmd_accounts(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """List Meta ad accounts available and their readiness status."""
+    if not authorized(update):
+        return
+    profs = meta_ads.list_profiles()
+    if not profs:
+        await update.message.reply_text(
+            "No Meta ad accounts configured yet. Ask Greg to set up META_ACCESS_TOKEN."
+        )
+        return
+    lines = ["Meta ad accounts you can use:\n"]
+    for p in profs:
+        lines.append("• " + p.status_line())
+    lines.append(
+        "\nDefault: @%s. Only ✅ ready accounts can run campaigns."
+        % meta_ads.DEFAULT_PROFILE_KEY
+    )
+    await update.message.reply_text("\n".join(lines))
+
+
 _APP_PW_HELP = (
     "For Gmail / Workspace you need a Google *App Password* (not your normal password):\n"
     "1. Turn on 2-Step Verification at myaccount.google.com/security\n"
@@ -1429,6 +1449,7 @@ def main() -> None:
     app.add_handler(CommandHandler("seba", cmd_seba))
     app.add_handler(CommandHandler("research", cmd_research))
     app.add_handler(CommandHandler("draft", cmd_draft))
+    app.add_handler(CommandHandler("accounts", cmd_accounts))
     app.add_handler(CommandHandler("media", cmd_media))
     app.add_handler(CommandHandler("pause", cmd_pause))
     app.add_handler(CommandHandler("report", cmd_report))

@@ -1510,6 +1510,93 @@ async def fetch_url(url: str) -> str:
         return "Could not fetch %s: %s" % (url, e)
 
 
+# ---------------------------------------------------------------------------
+# ROSTR (rostr.cc) — music-industry intelligence for offer creation.
+# Read-only. Search is public (Typesense); profile/team/tours/company need the
+# rostr_cookies.json session Greg seeds via the bot's /rostrlogin. Same
+# subprocess pattern as employee_mcp.py.
+# ---------------------------------------------------------------------------
+ROSTR_BIN = os.path.join(HERE, "rostr.py")
+ROSTR_ALLOWED = {"search", "artist", "team", "tours", "company", "brief", "status"}
+
+
+async def _rostr(args, timeout=150):
+    if not args or args[0] not in ROSTR_ALLOWED:
+        return "rostr subcommand not allowed: %s" % args[:1]
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, ROSTR_BIN, *args, cwd=HERE,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return "ROSTR command timed out."
+    return out.decode("utf-8", errors="replace").strip() or "(no output)"
+
+
+@mcp.tool()
+async def rostr_offer_brief(artist: str) -> str:
+    """ROSTR one-stop brief for offer creation: booking AGENT + MANAGER (names,
+    emails, territories), audience metrics (Spotify/IG/YouTube/TikTok), touring
+    status, and recent show history. Use this first when preparing an offer for
+    an artist — it surfaces exactly who to email and what the draw looks like."""
+    if not artist.strip():
+        return "Provide an artist name."
+    return await _rostr(["brief", artist.strip()], timeout=150)
+
+
+@mcp.tool()
+async def rostr_search(query: str, kind: str = "") -> str:
+    """Search ROSTR for an artist, agency, label, or person. Returns names +
+    slugs to pass to the other rostr_ tools. `kind`: artist|company|person
+    (optional). Public data — works without a seeded session."""
+    if not query.strip():
+        return "Provide search terms."
+    args = ["search", query.strip()]
+    if kind.strip():
+        args += ["--type", kind.strip()]
+    return await _rostr(args)
+
+
+@mcp.tool()
+async def rostr_team(artist: str) -> str:
+    """ROSTR booking AGENT + MANAGER for an artist: company, the specific
+    people, their emails and territories — exactly who an offer goes to."""
+    if not artist.strip():
+        return "Provide an artist name or slug."
+    return await _rostr(["team", artist.strip()])
+
+
+@mcp.tool()
+async def rostr_artist(artist: str) -> str:
+    """ROSTR artist profile: audience metrics (Spotify/IG/YouTube/TikTok),
+    genres, origin, touring status. Good for gauging draw before making an
+    offer."""
+    if not artist.strip():
+        return "Provide an artist name or slug."
+    return await _rostr(["artist", artist.strip()])
+
+
+@mcp.tool()
+async def rostr_tours(artist: str) -> str:
+    """ROSTR tour / show history for an artist: dates, venues, cities —
+    useful for routing and gauging draw in our markets."""
+    if not artist.strip():
+        return "Provide an artist name or slug."
+    return await _rostr(["tours", artist.strip()])
+
+
+@mcp.tool()
+async def rostr_company(company: str) -> str:
+    """ROSTR company profile (agency / label / management): locations, website,
+    and staff roster. Useful for understanding who represents multiple artists
+    at the same agency."""
+    if not company.strip():
+        return "Provide a company name or slug."
+    return await _rostr(["company", company.strip()])
+
+
 # Server entry point — MUST stay at end of file so every @mcp.tool() above is
 # registered before the server starts (mcp.run() blocks). Do not move it up.
 if __name__ == "__main__":
