@@ -206,6 +206,171 @@ def delete_link(link_id: int) -> dict:
     return _private("DELETE", "/api/venue/%d/analytics/tracking/links/%d/" % (ORG_ID, int(link_id)))
 
 
+# --- Private Organizer API: events (UNDOCUMENTED, reverse-engineered) ----------
+# Event create/read/delete live under the same token-authed venue namespace as
+# discounts/links. Create is ASYNC: POST returns {"job_id": ...} and the event
+# appears shortly after under its slugified name. We force DRAFT status so
+# nothing goes live until an explicit publish. See reference_showpass_event_api.
+import re as _re
+import time as _time
+from datetime import datetime as _datetime, timezone as _tzc
+try:
+    from zoneinfo import ZoneInfo as _ZoneInfo
+except Exception:  # pragma: no cover
+    _ZoneInfo = None
+
+# region/province -> (IANA zone for UTC conversion, Showpass `timezone` string)
+_TZ_BY_REGION = {
+    "AB": ("America/Edmonton", "US/Mountain"), "ALBERTA": ("America/Edmonton", "US/Mountain"),
+    "BC": ("America/Vancouver", "US/Pacific"), "BRITISH COLUMBIA": ("America/Vancouver", "US/Pacific"),
+    "MB": ("America/Winnipeg", "US/Central"), "MANITOBA": ("America/Winnipeg", "US/Central"),
+    "SK": ("America/Regina", "US/Central"), "SASKATCHEWAN": ("America/Regina", "US/Central"),
+    "ON": ("America/Toronto", "US/Eastern"), "ONTARIO": ("America/Toronto", "US/Eastern"),
+    "QC": ("America/Toronto", "US/Eastern"), "QUEBEC": ("America/Toronto", "US/Eastern"),
+    "QUEBEC": ("America/Toronto", "US/Eastern"),
+}
+_DEFAULT_TZ = ("America/Edmonton", "US/Mountain")
+
+
+def slugify(name: str) -> str:
+    return _re.sub(r"-+", "-", _re.sub(r"[^a-z0-9]+", "-", name.lower())).strip("-")
+
+
+def _tz_for_region(region: str):
+    return _TZ_BY_REGION.get((region or "").strip().upper(), _DEFAULT_TZ)
+
+
+def _to_utc_iso(local, tz_iana: str) -> str:
+    """local: 'YYYY-MM-DD HH:MM' (or 'T') in tz_iana -> UTC ISO 'Z'."""
+    if isinstance(local, str):
+        s = local.strip().replace("T", " ")
+        fmt = "%Y-%m-%d %H:%M" if ":" in s else "%Y-%m-%d %H"
+        local = _datetime.strptime(s, fmt)
+    if _ZoneInfo is None:
+        raise ShowpassError("zoneinfo/tzdata unavailable on this host.")
+    return local.replace(tzinfo=_ZoneInfo(tz_iana)).astimezone(_tzc.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def list_locations() -> list:
+    data = _private("GET", "/api/venue/%d/events/locations/" % ORG_ID)
+    return data.get("results", data) if isinstance(data, dict) else data
+
+
+def resolve_location(location) -> dict:
+    """Accept an int id or a (fuzzy) venue name; return the location dict."""
+    locs = list_locations()
+    if isinstance(location, int) or (isinstance(location, str) and location.isdigit()):
+        lid = int(location)
+        for L in locs:
+            if L.get("id") == lid:
+                return L
+        raise ShowpassError("No Showpass location with id %s." % lid)
+    q = str(location).strip().lower()
+    exact = [L for L in locs if (L.get("name") or "").strip().lower() == q]
+    part = [L for L in locs if q in (L.get("name") or "").strip().lower()]
+    hit = exact or part
+    if not hit:
+        names = ", ".join(sorted((L.get("name") or "") for L in locs))[:600]
+        raise ShowpassError("No Showpass location matching '%s'. Known: %s" % (location, names))
+    return hit[0]
+
+
+def _get_event_private(slug: str):
+    """GET an org event (incl. drafts) by slug; None if 404/not found."""
+    try:
+        return _private("GET", "/api/venue/%d/events/%s/" % (ORG_ID, slug))
+    except ShowpassError:
+        return None
+
+
+def _norm_tier(t: dict) -> dict:
+    return {
+        "name": str(t.get("name") or "GA"),
+        "price": "%.2f" % float(t.get("price", 0) or 0),
+        "inventory": int(t.get("inventory") or t.get("quantity") or 0),
+        "visibility": 1,
+    }
+
+
+def create_event(name, location, starts_on, ends_on, tiers, *,
+                 tz_iana: str = "", sp_tz: str = "", visibility: int = 1,
+                 draft: bool = True, description: str = "") -> dict:
+    """Create a Showpass event (ASYNC -> returns {job_id}). DRAFT by default.
+    `location` is an id or venue name; tz derived from the location's region
+    unless tz_iana/sp_tz given. `tiers` = [{name, price, inventory}]. WRITE."""
+    loc = resolve_location(location)
+    if not (tz_iana and sp_tz):
+        tz_iana, sp_tz = _tz_for_region(loc.get("province") or loc.get("region") or "")
+    if not tiers:
+        raise ShowpassError("At least one ticket tier is required.")
+    payload = {
+        "name": name, "venue": ORG_ID, "location": loc["id"],
+        "starts_on": _to_utc_iso(starts_on, tz_iana),
+        "ends_on": _to_utc_iso(ends_on, tz_iana),
+        "timezone": sp_tz, "visibility": int(visibility),
+        "status": "sp_event_draft" if draft else "sp_event_active",
+        "tickettype_set": [_norm_tier(t) for t in tiers],
+    }
+    if description:
+        payload["description"] = description
+    return _private("POST", "/api/venue/%d/events/" % ORG_ID, payload)
+
+
+def _is_fresh(ev: dict) -> bool:
+    try:
+        c = (ev.get("created") or "").replace("Z", "+00:00")
+        return (_datetime.now(_tzc.utc) - _datetime.fromisoformat(c)).total_seconds() < 600
+    except Exception:
+        return True
+
+
+def create_event_and_wait(name, location, starts_on, ends_on, tiers, *,
+                          poll_timeout: int = 30, **kw) -> dict:
+    """create_event + poll until the event materializes; returns the event dict
+    (slug, id, status, frontend_details_url). Handles slug-collision suffixes."""
+    create_event(name, location, starts_on, ends_on, tiers, **kw)
+    base_slug = slugify(name)
+    cands = [base_slug] + ["%s-%d" % (base_slug, n) for n in range(2, 6)]
+    deadline = _time.time() + poll_timeout
+    while _time.time() < deadline:
+        for slug in cands:
+            ev = _get_event_private(slug)
+            if ev and _is_fresh(ev):
+                ev.setdefault("frontend_details_url", "%s/%s/" % (BASE, ev.get("slug") or slug))
+                return ev
+        _time.sleep(2)
+    raise ShowpassError(
+        "Event create job queued but it didn't appear within %ds - check the "
+        "Showpass dashboard (slug ~ '%s')." % (poll_timeout, base_slug))
+
+
+def publish_event(slug: str) -> dict:
+    """Flip a draft event live (status -> active). Showpass only honors this via
+    a FULL-object update (a sparse PATCH is a no-op), so we GET the event, flip
+    status, and PUT it back. The PUT is async; we poll public visibility briefly.
+    WRITE - confirm-first."""
+    ev = _get_event_private(slug)
+    if not ev:
+        raise ShowpassError("No event '%s' to publish." % slug)
+    if ev.get("status") == "sp_event_active":
+        return {"ok": True, "slug": slug, "status": "sp_event_active", "already": True}
+    ev["status"] = "sp_event_active"
+    _private("PUT", "/api/venue/%d/events/%s/" % (ORG_ID, slug), ev)
+    for _ in range(6):
+        _time.sleep(2)
+        cur = _get_event_private(slug)
+        if cur and cur.get("status") == "sp_event_active":
+            return {"ok": True, "slug": slug, "status": "sp_event_active",
+                    "url": cur.get("frontend_details_url") or "%s/%s/" % (BASE, slug)}
+    return {"ok": True, "slug": slug, "status": "submitted",
+            "note": "publish job queued; may take a moment to go live"}
+
+
+def delete_event(slug: str) -> dict:
+    """Delete an event by slug. WRITE - confirm-first."""
+    return _private("DELETE", "/api/venue/%d/events/%s/" % (ORG_ID, slug))
+
+
 # --- CLI ----------------------------------------------------------------------
 
 def _require_confirm(args):
@@ -259,6 +424,28 @@ def main() -> None:
     ld.add_argument("id", type=int)
     ld.add_argument("--confirm", action="store_true")
 
+    lo = sub.add_parser("locations", help="list saved event locations (read)")
+    lo.add_argument("--json", action="store_true")
+
+    ec = sub.add_parser("event-create", help="create an event, DRAFT by default (WRITE)")
+    ec.add_argument("--name", required=True)
+    ec.add_argument("--location", required=True, help="venue name or location id")
+    ec.add_argument("--starts", required=True, help="local 'YYYY-MM-DD HH:MM'")
+    ec.add_argument("--ends", required=True, help="local 'YYYY-MM-DD HH:MM'")
+    ec.add_argument("--tier", action="append", default=[], metavar="NAME:PRICE:QTY",
+                    help="repeatable, e.g. --tier GA:25:200 --tier VIP:50:50")
+    ec.add_argument("--description", default="")
+    ec.add_argument("--live", action="store_true", help="publish now (default: draft)")
+    ec.add_argument("--confirm", action="store_true")
+
+    ep = sub.add_parser("event-publish", help="flip a draft event live (WRITE)")
+    ep.add_argument("slug")
+    ep.add_argument("--confirm", action="store_true")
+
+    ex = sub.add_parser("event-delete", help="delete an event by slug (WRITE)")
+    ex.add_argument("slug")
+    ex.add_argument("--confirm", action="store_true")
+
     args = p.parse_args()
     try:
         if args.cmd == "events":
@@ -295,6 +482,39 @@ def main() -> None:
         elif args.cmd == "link-delete":
             _require_confirm(args)
             print(json.dumps(delete_link(args.id)))
+        elif args.cmd == "locations":
+            locs = list_locations()
+            print(json.dumps(locs, indent=1) if args.json else
+                  "\n".join("%s  %s - %s %s" % (L.get("id"), L.get("name"),
+                       L.get("city", ""), L.get("province") or L.get("region") or "")
+                       for L in locs) or "No locations.")
+        elif args.cmd == "event-create":
+            _require_confirm(args)
+            tiers = []
+            for spec in args.tier:
+                parts = spec.split(":")
+                if len(parts) != 3:
+                    raise ShowpassError("--tier must be NAME:PRICE:QTY (got %r)" % spec)
+                tiers.append({"name": parts[0], "price": parts[1], "inventory": parts[2]})
+            if not tiers:
+                raise ShowpassError("at least one --tier is required")
+            ev = create_event_and_wait(
+                args.name, args.location, args.starts, args.ends, tiers,
+                draft=not args.live, description=args.description)
+            print(json.dumps({"ok": True, "slug": ev.get("slug"), "id": ev.get("id"),
+                              "status": ev.get("status"),
+                              "url": ev.get("frontend_details_url"),
+                              "starts_on": ev.get("starts_on")}, indent=1))
+        elif args.cmd == "event-publish":
+            _require_confirm(args)
+            ev = publish_event(args.slug)
+            print(json.dumps({"ok": True, "slug": args.slug,
+                              "status": ev.get("status") if isinstance(ev, dict) else ev}))
+        elif args.cmd == "event-delete":
+            _require_confirm(args)
+            print(json.dumps({"ok": True, "deleted": args.slug, "resp": delete_event(args.slug)}))
+        elif args.cmd == "__never__":
+            pass
     except ShowpassError as e:
         print(json.dumps({"ok": False, "error": str(e)}), file=sys.stderr)
         sys.exit(1)

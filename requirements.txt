@@ -2,3 +2,4 @@ python-telegram-bot==21.6
 aiohttp
 httpx
 mcp==1.27.2
+tzdata
