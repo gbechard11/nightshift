@@ -373,6 +373,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if ctx.user_data.get("awaiting_rostr_cookie"):
         await _handle_rostr_cookie(update, ctx, text)
         return
+    if ctx.user_data.get("announce"):
+        await _announce_step(update, ctx, text)
+        return
     if _is_owner(update):
         hit = _match_build_command(text)
         if hit:
@@ -1082,7 +1085,13 @@ async def cmd_launch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"⚠️ {e}\n\n{LAUNCH_USAGE}")
         return
 
-    await ctx.bot.send_chat_action(update.message.chat_id, ChatAction.TYPING)
+    await _launch_kit_run(update.message, ctx, acct, spec)
+
+
+async def _launch_kit_run(msg, ctx: ContextTypes.DEFAULT_TYPE, acct, spec: dict) -> None:
+    """Execute the launch kit for a parsed show spec: paused ads + calendar +
+    queued blast, each with its own confirm. Shared by /launch and /announce."""
+    await ctx.bot.send_chat_action(msg.chat_id, ChatAction.TYPING)
     name = spec["name"]
     location = f"{spec['venue']}, {spec['city']}"
     tz = LAUNCH_TZ_BY_CITY.get(spec["city"].lower(), os.environ.get("GCAL_TZ", "America/Edmonton"))
@@ -1205,11 +1214,11 @@ async def cmd_launch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
     summary = header + "\n\n" + "\n\n".join(sections)
     summary += "\n\n— Social captions arrive in the next update."
-    await update.message.reply_text(summary)
+    await msg.reply_text(summary)
 
     # Separate confirm messages so tapping one button never wipes the other.
     if camp_token:
-        await update.message.reply_text(
+        await msg.reply_text(
             f"\U0001F4E3 Campaign is PAUSED. Launching starts real spend on {acct.label}. Launch now?",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("\U0001F680 Launch ads", callback_data=f"camp:go:{camp_token}"),
@@ -1218,7 +1227,7 @@ async def cmd_launch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
     if blast_token:
         d = PENDING_BLASTS[blast_token]
-        await update.message.reply_text(
+        await msg.reply_text(
             f"✉️ Email blast queued: \"{d['subject']}\"\n"
             f"→ {d['city']} (~{d['count']} contacts) from {d['from']}.\nSend it now?",
             reply_markup=InlineKeyboardMarkup([[
@@ -1226,6 +1235,271 @@ async def cmd_launch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 InlineKeyboardButton("✖️ Hold", callback_data=f"lblast:hold:{blast_token}"),
             ]]),
         )
+
+
+# ── /announce — conversational show announce (Showpass, draft-first) ─────────
+# A short Q&A collects the show details, then (on confirm) creates the Showpass
+# event as a HIDDEN DRAFT via showpass.py and chains into the launch kit
+# (paused ads + queued blast + calendar). Greg publishes the event himself in
+# the Showpass dashboard when ready. State lives in ctx.user_data["announce"];
+# on_text routes to _announce_step while a session is active. See
+# project_pedro_announce / reference_showpass_event_api.
+SHOWPASS_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "showpass.py")
+PENDING_ANNOUNCES: dict[str, dict] = {}
+
+ANNOUNCE_QUESTIONS = [
+    ("platform", "1/10 — Platform? Reply *showpass*. (TicketWeb announce is coming in the next update.)"),
+    ("name", "2/10 — Artist / show name?"),
+    ("city", "3/10 — City? (e.g. Edmonton, Winnipeg)"),
+    ("venue", "4/10 — Venue? (must be a saved Showpass location — I'll check it)"),
+    ("date", "5/10 — Show date? (YYYY-MM-DD)"),
+    ("showtime", "6/10 — Show start time? (e.g. 9:00 PM or 21:00)"),
+    ("tiers", "7/10 — Ticket tiers? NAME PRICE QTY, comma-separated.\ne.g. GA 25 200, VIP 50 50"),
+    ("onsale", "8/10 — On-sale date & time? (YYYY-MM-DD HH:MM, or 'now')"),
+    ("budget", "9/10 — Daily ad budget in CAD? (e.g. 30)"),
+    ("caption", "10/10 — One-line caption for the ad + email (the hook)?"),
+]
+
+
+def _parse_clock(s: str):
+    s = s.strip().lower().replace(".", "")
+    m = re.match(r"^(\d{1,2})(?::(\d{2}))?\s*(am|pm)$", s)
+    if m:
+        h = int(m.group(1)); mi = int(m.group(2) or 0); ap = m.group(3)
+        if ap == "pm" and h != 12:
+            h += 12
+        if ap == "am" and h == 12:
+            h = 0
+        return h, mi
+    m = re.match(r"^(\d{1,2}):(\d{2})$", s)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    raise ValueError("time like '9:00 PM' or '21:00'")
+
+
+def _parse_tiers(s: str):
+    tiers = []
+    for chunk in s.split(","):
+        parts = chunk.split()
+        if len(parts) < 3:
+            raise ValueError("each tier = NAME PRICE QTY, e.g. 'GA 25 200'")
+        nm = " ".join(parts[:-2])
+        tiers.append({"name": nm, "price": float(parts[-2].replace("$", "")),
+                      "inventory": int(parts[-1])})
+    return tiers
+
+
+def _announce_validate(field: str, text: str, sess: dict):
+    t = text.strip()
+    if field == "platform":
+        p = t.lower()
+        if p == "showpass":
+            return True, "showpass"
+        if p in ("ticketweb", "ticket web", "tw"):
+            return False, "TicketWeb announce is coming in the next update. Reply 'showpass' for now (or /cancel)."
+        return False, "Reply 'showpass'."
+    if field in ("name", "city", "caption"):
+        return (True, t) if t else (False, "Can't be blank.")
+    if field == "venue":
+        locs = sess.get("locs") or []
+        if not locs:
+            return True, {"id": None, "name": t}  # couldn't preload; resolve at create
+        q = t.lower()
+        exact = [L for L in locs if L["name"].lower() == q]
+        part = [L for L in locs if q in L["name"].lower()]
+        if exact:
+            return True, exact[0]
+        if len(part) == 1:
+            return True, part[0]
+        if len(part) > 1:
+            return False, "Multiple matches: " + ", ".join(L["name"] for L in part[:8]) + ". Be more specific."
+        sample = ", ".join(L["name"] for L in locs[:12])
+        return False, f"No Showpass location matches '{t}'. Examples: {sample}"
+    if field == "date":
+        try:
+            return True, datetime.strptime(t, "%Y-%m-%d")
+        except ValueError:
+            return False, "Date as YYYY-MM-DD."
+    if field == "showtime":
+        try:
+            return True, _parse_clock(t)
+        except ValueError as e:
+            return False, str(e)
+    if field == "tiers":
+        try:
+            return True, _parse_tiers(t)
+        except ValueError as e:
+            return False, str(e)
+    if field == "onsale":
+        if t.lower() in ("now", "asap", "today", "immediately"):
+            return True, None
+        try:
+            return True, _parse_launch_dt(t, default_hour=10)
+        except ValueError as e:
+            return False, str(e)
+    if field == "budget":
+        try:
+            b = float(t.replace("$", ""))
+            return (True, b) if b > 0 else (False, "Must be greater than 0.")
+        except ValueError:
+            return False, "A number like 30."
+    return True, t
+
+
+async def _showpass_locations():
+    """Best-effort list of saved Showpass locations [{id,name}] for venue validation."""
+    try:
+        proc = await asyncio.to_thread(
+            subprocess.run, [sys.executable, SHOWPASS_PY, "locations"],
+            capture_output=True, text=True, timeout=40, cwd=os.path.dirname(SHOWPASS_PY))
+        out = []
+        for line in (proc.stdout or "").splitlines():
+            m = re.match(r"^\s*(\d+)\s+(.*?)\s+-\s+", line)
+            if m:
+                out.append({"id": int(m.group(1)), "name": m.group(2).strip()})
+        return out
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _announce_summary(a: dict) -> str:
+    h, mi = a["showtime"]
+    show_dt = a["date"].replace(hour=h, minute=mi)
+    tiers = ", ".join(f"{t['name']} ${t['price']:.0f}x{t['inventory']}" for t in a["tiers"])
+    onsale = a["onsale"].strftime("%b %-d, %Y %-I:%M %p") if a["onsale"] else "immediately"
+    return (
+        "\U0001F39F️ Ready to announce — review:\n\n"
+        f"Show: {a['name']}\n"
+        f"Where: {a['venue']['name']}, {a['city']}\n"
+        f"When: {show_dt:%a %b %-d, %Y · %-I:%M %p}\n"
+        f"Tiers: {tiers}\n"
+        f"On-sale: {onsale}\n"
+        f"Ad budget: ${a['budget']:.2f} CAD/day\n"
+        f"Caption: {a['caption']}\n\n"
+        "I'll create the Showpass event as a HIDDEN DRAFT and stage the launch kit "
+        "(paused ads + queued blast + calendar). You publish the event in the Showpass "
+        "dashboard when ready. Go?"
+    )
+
+
+async def cmd_announce(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Start the conversational show-announce flow (Showpass)."""
+    if not authorized(update):
+        return
+    await ctx.bot.send_chat_action(update.message.chat_id, ChatAction.TYPING)
+    locs = await _showpass_locations()
+    ctx.user_data["announce"] = {"i": 0, "answers": {}, "locs": locs}
+    note = "" if locs else "\n(heads up: couldn't preload venues — I'll validate the venue when creating)"
+    await update.message.reply_text(
+        "\U0001F39F️ New show announce. A few quick questions — reply /cancel anytime."
+        + note + "\n\n" + ANNOUNCE_QUESTIONS[0][1]
+    )
+
+
+async def _announce_step(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    sess = ctx.user_data.get("announce")
+    if not sess:
+        return
+    if text.strip().lower() in ("/cancel", "cancel"):
+        ctx.user_data.pop("announce", None)
+        await update.message.reply_text("✖️ Announce cancelled.")
+        return
+    field = ANNOUNCE_QUESTIONS[sess["i"]][0]
+    ok, val = _announce_validate(field, text, sess)
+    if not ok:
+        await update.message.reply_text("⚠️ " + val + "\n\n" + ANNOUNCE_QUESTIONS[sess["i"]][1])
+        return
+    sess["answers"][field] = val
+    sess["i"] += 1
+    if sess["i"] < len(ANNOUNCE_QUESTIONS):
+        await update.message.reply_text(ANNOUNCE_QUESTIONS[sess["i"]][1])
+        return
+    a = sess["answers"]
+    ctx.user_data.pop("announce", None)
+    token = secrets.token_urlsafe(8)
+    PENDING_ANNOUNCES[token] = a
+    await update.message.reply_text(
+        _announce_summary(a),
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Create draft + stage launch", callback_data=f"anns:go:{token}"),
+            InlineKeyboardButton("✖️ Cancel", callback_data=f"anns:cancel:{token}"),
+        ]]),
+    )
+
+
+async def on_announce_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Confirm gate for /announce: create the Showpass DRAFT, then stage the launch kit."""
+    query = update.callback_query
+    await query.answer()
+    if not authorized(update):
+        return
+    try:
+        _, action, token = query.data.split(":", 2)
+    except ValueError:
+        return
+    a = PENDING_ANNOUNCES.get(token)
+    if not a:
+        await query.edit_message_text("This announce expired. Run /announce again.")
+        return
+    if action == "cancel":
+        PENDING_ANNOUNCES.pop(token, None)
+        await query.edit_message_text("✖️ Announce cancelled. Nothing was created.")
+        return
+    if action != "go":
+        return
+    PENDING_ANNOUNCES.pop(token, None)
+    await query.edit_message_text("\U0001F39F️ Creating the Showpass draft…")
+
+    h, mi = a["showtime"]
+    show_dt = a["date"].replace(hour=h, minute=mi)
+    end_dt = show_dt + timedelta(hours=5)
+    cmd = [
+        sys.executable, SHOWPASS_PY, "event-create",
+        "--name", a["name"], "--location", str(a["venue"]["id"] or a["venue"]["name"]),
+        "--starts", show_dt.strftime("%Y-%m-%d %H:%M"),
+        "--ends", end_dt.strftime("%Y-%m-%d %H:%M"),
+        "--description", a["caption"], "--confirm",
+    ]
+    for t in a["tiers"]:
+        cmd += ["--tier", f"{t['name']}:{t['price']:.2f}:{t['inventory']}"]
+    try:
+        proc = await asyncio.to_thread(
+            subprocess.run, cmd, capture_output=True, text=True, timeout=120,
+            cwd=os.path.dirname(SHOWPASS_PY))
+    except Exception as e:  # noqa: BLE001
+        await query.message.reply_text(f"Showpass create error: {e}")
+        return
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "create failed").strip()[:400]
+        await query.message.reply_text(f"⚠️ Showpass create failed: {err}\nNothing was staged.")
+        return
+    try:
+        ev = json.loads(proc.stdout)
+    except Exception:  # noqa: BLE001
+        await query.message.reply_text(f"Showpass returned unexpected output:\n{(proc.stdout or '')[:300]}")
+        return
+    slug = ev.get("slug")
+    url = ev.get("url") or (f"https://www.showpass.com/{slug}/" if slug else "")
+    manage = f"https://www.showpass.com/dashboard/events/{slug}/manage/" if slug else "(dashboard)"
+    await query.message.reply_text(
+        f"✅ Showpass DRAFT created (hidden): {a['name']}\n"
+        f"Public ticket link (goes live once you publish): {url}\n"
+        f"Publish it here when ready: {manage}\n\n"
+        "Staging the launch kit now (everything below stays confirm-first)…"
+    )
+
+    acct_key = "pawnshop" if "pawn" in (a["venue"]["name"] or "").lower() else None
+    try:
+        acct = meta_ads.get_profile(acct_key) if acct_key else meta_ads.get_profile()
+    except Exception:  # noqa: BLE001
+        acct = meta_ads.get_profile()
+    spec = {
+        "name": a["name"], "platform": "showpass", "city": a["city"],
+        "venue": a["venue"]["name"], "show_dt": show_dt, "ticket_link": url,
+        "daily_cad": a["budget"], "caption": a["caption"],
+        "onsale_dt": a["onsale"], "creative": None,
+    }
+    await _launch_kit_run(query.message, ctx, acct, spec)
 
 
 async def on_blast_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2587,7 +2861,9 @@ def main() -> None:
     app.add_handler(CommandHandler("show", cmd_show))
     app.add_handler(CommandHandler("settlement", cmd_settlement))
     app.add_handler(CommandHandler("launch", cmd_launch))
+    app.add_handler(CommandHandler("announce", cmd_announce))
     app.add_handler(CallbackQueryHandler(on_blast_button, pattern=r"^lblast:"))
+    app.add_handler(CallbackQueryHandler(on_announce_button, pattern=r"^anns:"))
     app.add_handler(CommandHandler("wire", cmd_wire))
     app.add_handler(CommandHandler("prismtoken", cmd_prismtoken))
     app.add_handler(CommandHandler("triage", cmd_triage))
