@@ -63,6 +63,7 @@ import pending_email
 import pending_campaign
 import agent_relay
 from pedro_brain import CLAUDE_TIMEOUT, PedroError, PedroTimeout, run_claude
+import tg_files
 
 TOKEN = os.environ["EMPLOYEE_BOT_TOKEN"]
 EMPLOYEE_USERS = {
@@ -273,11 +274,10 @@ async def _ask_run(update: Update, uid: int, lock: asyncio.Lock, prompt: str) ->
     finally:
         _inflight.discard(uid)
     _log_chat("out", uid, out)
-    for i in range(0, len(out), TELEGRAM_MAX_MSG):
-        try:
-            await update.message.reply_text(out[i:i + TELEGRAM_MAX_MSG])
-        except Exception:  # noqa: BLE001
-            log.exception("failed to deliver employee reply chunk (uid %s)", uid)
+    try:
+        await tg_files.deliver(update.message, out, allow_root=WORKDIR)
+    except Exception:  # noqa: BLE001
+        log.exception("failed to deliver employee reply (uid %s)", uid)
 
 
 async def _ingest_attachment(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:

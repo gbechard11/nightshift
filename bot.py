@@ -30,6 +30,7 @@ import vapi_call
 import whatsapp
 import wire
 from pedro_brain import CLAUDE_TIMEOUT, PedroError, PedroTimeout, run_claude
+import tg_files
 import imap_email
 import employee_email
 from imap_email import get_unread_emails
@@ -303,8 +304,7 @@ async def _call_claude(
         except PedroError as e:
             await update.message.reply_text(str(e))
             return
-        for i in range(0, len(out), TELEGRAM_MAX_MSG):
-            await update.message.reply_text(out[i:i + TELEGRAM_MAX_MSG])
+        await tg_files.deliver(update.message, out)
         return
 
     # Stateful runs go to the background so a long task never blocks the
@@ -340,11 +340,10 @@ async def _chat_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE, prompt: str)
         out = "⚠️ Something broke mid-run — check the service logs."
     finally:
         _owner_run_active = False
-    for i in range(0, len(out), TELEGRAM_MAX_MSG):
-        try:
-            await update.message.reply_text(out[i:i + TELEGRAM_MAX_MSG])
-        except Exception:  # noqa: BLE001
-            log.exception("failed to deliver chat reply chunk")
+    try:
+        await tg_files.deliver(update.message, out)
+    except Exception:  # noqa: BLE001
+        log.exception("failed to deliver chat reply")
 
 
 async def cmd_ask(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2034,11 +2033,10 @@ async def _continue_build(bot, chat_id, req_id, name, session_file, prompt) -> N
     finally:
         employee_requests.mark_build_done(req_id)
         _active_builds.discard(req_id)
-    for i in range(0, len(reply), TELEGRAM_MAX_MSG):
-        try:
-            await bot.send_message(chat_id, reply[i:i + TELEGRAM_MAX_MSG])
-        except Exception:  # noqa: BLE001
-            log.exception("failed to deliver build reply chunk")
+    try:
+        await tg_files.deliver_chat(bot, chat_id, reply)
+    except Exception:  # noqa: BLE001
+        log.exception("failed to deliver build reply")
 
 
 MEDIA_IMPL_PROMPT = (
@@ -2096,11 +2094,10 @@ async def _run_media_build(bot, rec: dict) -> None:
         rec["requester_id"], ("✅ Your media request is done:\n\n" + reply)[:4000]
     )
     fyi = f"🎨 [auto-approved media] {name}'s request {req_id} finished:\n\n{reply}"
-    for i in range(0, len(fyi), TELEGRAM_MAX_MSG):
-        try:
-            await bot.send_message(OWNER_ID, fyi[i:i + TELEGRAM_MAX_MSG])
-        except Exception:  # noqa: BLE001
-            log.exception("failed to deliver media build FYI chunk")
+    try:
+        await tg_files.deliver_chat(bot, OWNER_ID, fyi)
+    except Exception:  # noqa: BLE001
+        log.exception("failed to deliver media build FYI")
 
 
 AUTO_BUILD_POLL_SECONDS = int(os.environ.get("PEDRO_AUTO_BUILD_POLL_SECONDS", "20"))
