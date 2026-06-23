@@ -229,6 +229,8 @@ def send(subject: str, body: str, recipients: list[str], sender: dict | None = N
     msg["To"] = ", ".join(recipients)
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid(domain=from_addr.split("@")[-1] or None)
+    if sender and sender.get("bcc_self") and from_addr not in recipients:
+        msg["Bcc"] = from_addr  # drop a copy in the sender mailbox (Outlook-visible)
 
     # Decide plain vs HTML. Explicit html= wins; otherwise auto-detect an HTML body
     # (the common case: an agent-built mailer handed in as `body`). Either way the
