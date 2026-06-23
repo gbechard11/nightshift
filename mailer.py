@@ -28,6 +28,7 @@ import smtplib
 import ssl
 import time
 from email.generator import BytesGenerator
+from email.utils import formatdate, make_msgid
 from email.message import EmailMessage
 from io import BytesIO
 
@@ -226,6 +227,8 @@ def send(subject: str, body: str, recipients: list[str], sender: dict | None = N
     msg["Subject"] = subject
     msg["From"] = from_addr
     msg["To"] = ", ".join(recipients)
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain=from_addr.split("@")[-1] or None)
 
     # Decide plain vs HTML. Explicit html= wins; otherwise auto-detect an HTML body
     # (the common case: an agent-built mailer handed in as `body`). Either way the
