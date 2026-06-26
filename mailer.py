@@ -199,7 +199,8 @@ def _smtp_send(msg: EmailMessage, host: str, port: int, user: str, password: str
 
 
 def send(subject: str, body: str, recipients: list[str], sender: dict | None = None,
-         attachments: list[str] | None = None, html: str | None = None) -> None:
+         attachments: list[str] | None = None, html: str | None = None,
+         cc: list[str] | None = None, bcc: list[str] | None = None) -> None:
     """Send an email. Blocking - call via asyncio.to_thread() from async code.
 
     If `html` is given (or `body` is itself HTML), the message is sent as a proper
@@ -229,8 +230,13 @@ def send(subject: str, body: str, recipients: list[str], sender: dict | None = N
     msg["To"] = ", ".join(recipients)
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid(domain=from_addr.split("@")[-1] or None)
+    if cc:
+        msg["Cc"] = ", ".join(r.strip() for r in cc if r and r.strip())
+    bcc_addrs = [r.strip() for r in (bcc or []) if r and r.strip()]
     if sender and sender.get("bcc_self") and from_addr not in recipients:
-        msg["Bcc"] = from_addr  # drop a copy in the sender mailbox (Outlook-visible)
+        bcc_addrs.append(from_addr)
+    if bcc_addrs:
+        msg["Bcc"] = ", ".join(bcc_addrs)
 
     # Decide plain vs HTML. Explicit html= wins; otherwise auto-detect an HTML body
     # (the common case: an agent-built mailer handed in as `body`). Either way the

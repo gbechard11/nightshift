@@ -312,6 +312,12 @@ async def _call_claude(
     # second message gets the busy reply. On a time-capped round the task
     # auto-continues instead of dying — see _run_with_continues.
     _owner_run_active = True
+    # Immediate ack so the owner knows the request landed and Pedro is working,
+    # not just the typing indicator. Never block the run if the ack fails.
+    try:
+        await update.message.reply_text("👍 Got it — on it now. I’ll post the result here when it’s ready.")
+    except Exception:  # noqa: BLE001
+        pass
     ctx.application.create_task(_chat_run(update, ctx, prompt))
 
 

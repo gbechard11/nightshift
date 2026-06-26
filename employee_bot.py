@@ -221,6 +221,10 @@ async def _ask(update: Update, ctx: ContextTypes.DEFAULT_TYPE, prompt: str) -> N
         return
     _inflight.add(uid)
     await ctx.bot.send_chat_action(update.message.chat_id, ChatAction.TYPING)
+    try:
+        await update.message.reply_text("👍 Got it — on it now. I’ll reply here when it’s done.")
+    except Exception:  # noqa: BLE001
+        pass
     log.info("claude from %s: %s", uid, prompt[:200])
     ctx.application.create_task(_ask_run(update, uid, lock, prompt))
 
@@ -462,10 +466,13 @@ async def on_email_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
             pass
         return
     to_list = rec.get("to") or []
+    cc_list = rec.get("cc") or []
+    bcc_list = rec.get("bcc") or []
     try:
         await asyncio.to_thread(
             mailer.send, rec.get("subject", ""), rec.get("body", ""),
-            to_list, sender, rec.get("attachments") or None,
+            to_list, sender, rec.get("attachments") or None, None,
+            cc_list or None, bcc_list or None,
         )
     except Exception as e:  # noqa: BLE001
         try:
@@ -475,13 +482,15 @@ async def on_email_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         return
     pending_email.discard(token)
     to_str = ", ".join(to_list) if isinstance(to_list, list) else str(to_list)
+    cc_str = (", ".join(cc_list) + " (cc)") if cc_list else ""
+    sent_summary = ", ".join(filter(None, [to_str, cc_str]))
     try:
-        await query.edit_message_text(f"\u2705 Sent to {to_str}.")
+        await query.edit_message_text(f"\u2705 Sent to {sent_summary}.")
     except Exception:  # noqa: BLE001
         pass
     try:
         employee_notify.notify_owner(
-            f"\U0001F4E7 {employee_notify.who(rec['uid'])} sent an email to {to_str} "
+            f"\U0001F4E7 {employee_notify.who(rec['uid'])} sent an email to {sent_summary} "
             f"(subj: {rec.get('subject','')[:80]})."
         )
     except Exception:  # noqa: BLE001

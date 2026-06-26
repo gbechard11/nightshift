@@ -499,9 +499,11 @@ async def drive_create_text_file(name: str, content: str, parent_id: str = "") -
 
 
 @mcp.tool()
-async def email_send(to: str, subject: str, body: str) -> str:
+async def email_send(to: str, subject: str, body: str, cc: str = "", bcc: str = "") -> str:
     """Send a plain-text email FROM your own configured Nightshift address.
-    If you haven't set up your email yet, run /setupemail in the Telegram bot."""
+    If you haven't set up your email yet, run /setupemail in the Telegram bot.
+    cc: comma-separated addresses to CC (optional).
+    bcc: comma-separated addresses to BCC (optional)."""
     uid = _uid()
     sender = employee_email.sender_for(uid)
     if not sender:
@@ -509,7 +511,9 @@ async def email_send(to: str, subject: str, body: str) -> str:
     recipients = [r.strip() for r in to.replace(";", ",").split(",") if r.strip()]
     if not recipients:
         raise ValueError("No recipient address given.")
-    token = pending_email.stage(uid, sender.get("from"), recipients, [], subject, body)
+    cc_list = [r.strip() for r in cc.replace(";", ",").split(",") if r.strip()] if cc else []
+    bcc_list = [r.strip() for r in bcc.replace(";", ",").split(",") if r.strip()] if bcc else []
+    token = pending_email.stage(uid, sender.get("from"), recipients, cc_list, subject, body, bcc=bcc_list)
     ok = await asyncio.to_thread(pending_email.send_confirm_prompt, pending_email.load(token))
     if not ok:
         pending_email.discard(token)

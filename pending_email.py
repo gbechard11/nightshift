@@ -49,7 +49,7 @@ def _att_dir(token: str) -> str:
     return os.path.join(PENDING_DIR, f"{token}_att")
 
 
-def stage(uid, sender, to, cc, subject, body, attachments=None) -> str:
+def stage(uid, sender, to, cc, subject, body, attachments=None, bcc=None) -> str:
     """Persist a pending send and return its token. Attachment file paths are
     COPIED into a per-token dir so they survive until the user confirms (the
     caller is free to clean up its own temp copies)."""
@@ -57,6 +57,7 @@ def stage(uid, sender, to, cc, subject, body, attachments=None) -> str:
     token = secrets.token_hex(8)
     to = to if isinstance(to, list) else [a.strip() for a in str(to).split(",") if a.strip()]
     cc = cc if isinstance(cc, list) else [a.strip() for a in str(cc or "").split(",") if a.strip()]
+    bcc = bcc if isinstance(bcc, list) else [a.strip() for a in str(bcc or "").split(",") if a.strip()]
     saved = []
     if attachments:
         os.makedirs(_att_dir(token), exist_ok=True)
@@ -69,7 +70,7 @@ def stage(uid, sender, to, cc, subject, body, attachments=None) -> str:
                 pass
     rec = {
         "token": token, "uid": int(uid), "sender": sender,
-        "to": to, "cc": cc, "subject": subject, "body": body,
+        "to": to, "cc": cc, "bcc": bcc, "subject": subject, "body": body,
         "attachments": saved, "ts": int(time.time()),
     }
     tmp = _path(token) + ".tmp"
@@ -114,6 +115,8 @@ def preview_text(rec) -> str:
     ]
     if rec.get("cc"):
         lines.append(f"Cc: {_fmt(rec.get('cc'))}")
+    if rec.get("bcc"):
+        lines.append(f"Bcc: {_fmt(rec.get('bcc'))}")
     lines.append(f"Subject: {rec.get('subject', '')}")
     if rec.get("attachments"):
         lines.append("Attachments: " + ", ".join(os.path.basename(a) for a in rec["attachments"]))
