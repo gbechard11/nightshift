@@ -26,6 +26,7 @@ import mimetypes
 import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 from google.oauth2.credentials import Credentials
@@ -52,7 +53,10 @@ def get_service():
     if not creds.valid:
         if creds.expired and creds.refresh_token:
             creds.refresh(Request())
-            TOKEN_PATH.write_text(creds.to_json(), encoding="utf-8")
+            with tempfile.NamedTemporaryFile("w", dir=TOKEN_PATH.parent, delete=False,
+                                            suffix=".tmp", encoding="utf-8") as tf:
+                tf.write(creds.to_json())
+            Path(tf.name).replace(TOKEN_PATH)
         else:
             sys.exit("token invalid and not refreshable; re-run the consent flow")
     return build("drive", "v3", credentials=creds, cache_discovery=False)

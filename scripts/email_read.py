@@ -60,8 +60,9 @@ def _attachments(msg: email.message.EmailMessage, save_dir: str | None = None) -
         filename = str(make_header(decode_header(filename)))
         entry: dict = {"filename": filename, "content_type": part.get_content_type()}
         if save_dir:
-            save_path = Path(save_dir) / filename
-            save_path.parent.mkdir(parents=True, exist_ok=True)
+            safe_name = Path(filename).name or "attachment"
+            save_path = Path(save_dir) / safe_name
+            Path(save_dir).mkdir(parents=True, exist_ok=True)
             payload = part.get_payload(decode=True)
             if payload:
                 save_path.write_bytes(payload)

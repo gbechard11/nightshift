@@ -236,7 +236,8 @@ def _resolve_sender(from_addr: str) -> dict:
 
     if os.path.exists(SENDERS_PATH):
         try:
-            cfg = json.load(open(SENDERS_PATH))
+            with open(SENDERS_PATH) as _f:
+                cfg = json.load(_f)
         except Exception as e:
             _die(f"blast-senders.json is invalid JSON: {e}")
         prof = cfg.get(from_addr) or cfg.get(domain)

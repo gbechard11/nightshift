@@ -96,11 +96,11 @@ def list_events(query: str = "", days: int | None = None, page_size: int = 50,
         "page_size": page_size,
         "ordering": "starts_on",
     }
-    now = _dt.datetime.now(_dt.UTC).replace(microsecond=0, tzinfo=None)
+    now = _dt.datetime.now(_dt.UTC).replace(microsecond=0)
     if upcoming:
-        params["starts_on__gte"] = now.isoformat()
+        params["starts_on__gte"] = now.isoformat().replace("+00:00", "Z")
     if days:
-        params["starts_on__lte"] = (now + _dt.timedelta(days=days)).isoformat()
+        params["starts_on__lte"] = (now + _dt.timedelta(days=days)).isoformat().replace("+00:00", "Z")
     if query:
         params["search_string"] = query
     data = _public_get("/api/public/discovery/", params)
