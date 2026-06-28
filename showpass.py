@@ -371,6 +371,57 @@ def delete_event(slug: str) -> dict:
     return _private("DELETE", "/api/venue/%d/events/%s/" % (ORG_ID, slug))
 
 
+# --- Private Organizer API: event sales stats ---------------------------------
+
+def list_events_private(days: int = 180, slug: str | None = None) -> list[dict]:
+    """Upcoming org events with per-ticket-type sales stats via the private API."""
+    if slug:
+        ev = _private("GET", "/api/venue/%d/events/%s/" % (ORG_ID, slug.strip().strip("/")))
+        return [ev] if ev else []
+    now = _dt.datetime.now(_dt.UTC)
+    until = (now + _dt.timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    now_s = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    params = {"page_size": 100, "starts_on__gte": now_s, "starts_on__lte": until,
+              "ordering": "starts_on"}
+    data = _private("GET", "/api/venue/%d/events/" % ORG_ID, None)
+    # Use httpx directly to pass query params
+    import httpx as _hx
+    headers = {"Authorization": "Token " + API_TOKEN}
+    with _hx.Client(timeout=30.0) as c:
+        r = c.get("%s/api/venue/%d/events/" % (BASE, ORG_ID), headers=headers, params=params)
+    if r.status_code >= 400:
+        raise ShowpassError("Showpass %d: %s" % (r.status_code, r.text[:200]))
+    return r.json().get("results", [])
+
+
+def format_sales(events: list[dict]) -> str:
+    if not events:
+        return "No upcoming events found."
+    lines = []
+    for ev in events:
+        date = (ev.get("starts_on") or "")[:10]
+        lines.append("\n%s  %s  (id=%s)" % (date, ev.get("name"), ev.get("id")))
+        tts = ev.get("tickettype_set") or []
+        if not tts:
+            lines.append("  (no ticket types)")
+            continue
+        total_sold = total_rev = total_inv = 0
+        for tt in tts:
+            s = (tt.get("stats") or {}).get("tickets") or {}
+            sold = s.get("included_in_total_count") or 0
+            rev = s.get("included_in_total_revenue") or 0
+            inv = tt.get("inventory") or 0
+            scanned = s.get("used_count") or 0
+            total_sold += sold
+            total_rev += rev
+            total_inv += inv
+            pct = "%.0f%%" % (100 * sold / inv) if inv else "—"
+            lines.append("  %-36s  %3d/%-3d (%s)  $%-7.0f  scanned=%d" % (
+                tt.get("name", "")[:36], sold, inv, pct, rev, scanned))
+        lines.append("  TOTAL: %d/%d sold  $%.0f revenue" % (total_sold, total_inv, total_rev))
+    return "\n".join(lines)
+
+
 # --- CLI ----------------------------------------------------------------------
 
 def _require_confirm(args):
@@ -446,6 +497,11 @@ def main() -> None:
     ex.add_argument("slug")
     ex.add_argument("--confirm", action="store_true")
 
+    sa = sub.add_parser("sales", help="ticket sales & revenue for upcoming events (token required)")
+    sa.add_argument("--slug", default=None, help="single event slug; omit for all upcoming")
+    sa.add_argument("--days", type=int, default=180, help="how many days ahead (default 180)")
+    sa.add_argument("--json", action="store_true")
+
     args = p.parse_args()
     try:
         if args.cmd == "events":
@@ -513,6 +569,9 @@ def main() -> None:
         elif args.cmd == "event-delete":
             _require_confirm(args)
             print(json.dumps({"ok": True, "deleted": args.slug, "resp": delete_event(args.slug)}))
+        elif args.cmd == "sales":
+            evs = list_events_private(days=args.days, slug=args.slug)
+            print(json.dumps(evs, indent=1) if args.json else format_sales(evs))
         elif args.cmd == "__never__":
             pass
     except ShowpassError as e:
