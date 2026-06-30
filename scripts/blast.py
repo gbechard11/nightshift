@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Mass broadcaster for Nightshift — email + WhatsApp from one CSV list.
+"""Mass broadcaster for Nightshift — email + WhatsApp + SMS from one CSV list.
 
 Sends a personalized message to every row of a CSV over email (own SMTP,
-free) and/or WhatsApp (Twilio). Built for promo blasts to an existing
+free), WhatsApp (Twilio), and/or SMS (Twilio). Built for promo blasts to an existing
 opted-in contact list — NOT cold outreach.
 
 Key properties:
@@ -67,6 +67,7 @@ ENV_PATH = os.path.expanduser("~/nightshift/.env")
 LEDGER_DIR = os.path.expanduser("~/nightshift/blast-ledger")
 OPTOUT_EMAIL = os.path.expanduser("~/nightshift/blast-optout-email.txt")
 OPTOUT_WA = os.path.expanduser("~/nightshift/blast-optout-wa.txt")
+OPTOUT_SMS = os.path.expanduser("~/nightshift/blast-optout-sms.txt")
 SENDERS_PATH = os.path.expanduser("~/nightshift/blast-senders.json")
 DEFAULT_FROM = "greg@nightshiftent.ca"
 
@@ -436,13 +437,57 @@ def _wa_send(to_e164: str, body: str) -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
+# SMS (Twilio REST, stdlib only)
+# ---------------------------------------------------------------------------
+
+def _sms_send(to_e164: str, body: str) -> tuple[bool, str]:
+    """Send a real SMS via Twilio. Requires an SMS-capable Twilio number in
+    TWILIO_SMS_FROM (E.164, e.g. +12045551234) OR a Messaging Service SID in
+    TWILIO_MESSAGING_SID. Until one of those is set this returns a clear error
+    so the rest of the pipeline (drop capture, segmentation) works unchanged."""
+    sid = os.environ.get("TWILIO_ACCOUNT_SID")
+    token = os.environ.get("TWILIO_AUTH_TOKEN")
+    sms_from = os.environ.get("TWILIO_SMS_FROM", "")
+    msg_sid = os.environ.get("TWILIO_MESSAGING_SID", "")
+    if not (sid and token):
+        return False, "TWILIO_ACCOUNT_SID/AUTH_TOKEN not set"
+    if not (sms_from or msg_sid):
+        return False, ("no SMS sender configured — set TWILIO_SMS_FROM (a purchased "
+                       "SMS number) or TWILIO_MESSAGING_SID in .env")
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json"
+    fields = {"To": to_e164, "Body": body}
+    if msg_sid:
+        fields["MessagingServiceSid"] = msg_sid
+    else:
+        fields["From"] = sms_from
+    data = urllib.parse.urlencode(fields).encode()
+    req = urllib.request.Request(url, data=data, method="POST")
+    auth = base64.b64encode(f"{sid}:{token}".encode()).decode()
+    req.add_header("Authorization", "Basic " + auth)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            payload = json.loads(resp.read().decode())
+            return True, payload.get("sid", "")
+    except urllib.error.HTTPError as e:
+        try:
+            err = json.loads(e.read().decode())
+            return False, f"{err.get('code')}: {err.get('message')}"
+        except Exception:
+            return False, f"HTTP {e.code}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Mass email + WhatsApp broadcaster")
     p.add_argument("--list", required=True, help="CSV contact list")
-    p.add_argument("--channel", required=True, choices=["email", "whatsapp", "both"])
+    p.add_argument("--channel", required=True,
+                   choices=["email", "whatsapp", "sms", "both", "all"],
+                   help="'both'=email+whatsapp; 'all'=email+whatsapp+sms")
     p.add_argument("--campaign", required=True, help="campaign id (for resumable ledger)")
     p.add_argument("--subject", help="email subject (templated)")
     p.add_argument("--body-file", help="plain-text email body template file")
@@ -452,6 +497,7 @@ def main() -> None:
                    help="embed an image by Content-ID for HTML mail; reference as cid:NAME. "
                         "Repeatable. 'NAME=path' or just 'path' (NAME defaults to the filename stem).")
     p.add_argument("--wa-body-file", help="WhatsApp body template file")
+    p.add_argument("--sms-body-file", help="SMS body template file (keep it short)")
     p.add_argument("--city", default="", help="segment filter: only send to rows whose 'city' column matches (case-insensitive)")
     p.add_argument("--from", dest="from_addr", default=DEFAULT_FROM,
                    help=f"email From address (default {DEFAULT_FROM}); must have SMTP creds "
@@ -471,8 +517,9 @@ def main() -> None:
 
     _load_env(ENV_PATH)
 
-    want_email = args.channel in ("email", "both")
-    want_wa = args.channel in ("whatsapp", "both")
+    want_email = args.channel in ("email", "both", "all")
+    want_wa = args.channel in ("whatsapp", "both", "all")
+    want_sms = args.channel in ("sms", "all")
 
     if want_email and not args.subject:
         _die("email channel needs --subject")
@@ -480,6 +527,8 @@ def main() -> None:
         _die("email channel needs --body-file and/or --html-file")
     if want_wa and not args.wa_body_file:
         _die("whatsapp channel needs --wa-body-file")
+    if want_sms and not args.sms_body_file:
+        _die("sms channel needs --sms-body-file")
 
     sender = _resolve_sender(args.from_addr) if want_email else None
     if sender:
@@ -495,6 +544,7 @@ def main() -> None:
     else:
         email_tmpl = ""
     wa_tmpl = Path(args.wa_body_file).read_text() if want_wa else ""
+    sms_tmpl = Path(args.sms_body_file).read_text() if want_sms else ""
 
     # Pre-load inline images once (shared across all recipients)
     inline_images = []  # (cid, maintype, subtype, data)
@@ -519,6 +569,7 @@ def main() -> None:
 
     optout_email = _load_optout(OPTOUT_EMAIL)
     optout_wa = _load_optout(OPTOUT_WA)
+    optout_sms = _load_optout(OPTOUT_SMS)
     done = _load_ledger(args.campaign)
 
     delay = 60.0 / args.rate if args.rate > 0 else 0.0
@@ -561,9 +612,25 @@ def main() -> None:
                 planned.add(wkey)
                 body = wa_tmpl.format_map(_Safe(row))
                 plan.append(("whatsapp", num, None, body, row, ""))
+        if want_sms:
+            num = _norm_wa(row.get("whatsapp", ""))
+            skey = f"sms:{num.lower()}" if num else None
+            if not row.get("whatsapp"):
+                skipped["no_addr"] += 1
+            elif num is None:
+                skipped["bad_number"] += 1
+            elif num.lower() in optout_sms:
+                skipped["optout"] += 1
+            elif skey in done or skey in planned:
+                skipped["already_sent"] += 1
+            else:
+                planned.add(skey)
+                body = sms_tmpl.format_map(_Safe(row))
+                plan.append(("sms", num, None, body, row, ""))
 
     n_email = sum(1 for x in plan if x[0] == "email")
     n_wa = sum(1 for x in plan if x[0] == "whatsapp")
+    n_sms = sum(1 for x in plan if x[0] == "sms")
 
     # ----- Preview -----
     if not args.yes:
@@ -583,7 +650,10 @@ def main() -> None:
             if extras:
                 print("Email:      " + " | ".join(extras))
         print(f"List:       {args.list}  ({len(rows)} rows)")
-        print(f"To send:    {n_email} emails, {n_wa} WhatsApp")
+        print(f"To send:    {n_email} emails, {n_wa} WhatsApp, {n_sms} SMS")
+        if want_sms and not (os.environ.get("TWILIO_SMS_FROM") or os.environ.get("TWILIO_MESSAGING_SID")):
+            print("  ! SMS sender NOT configured — set TWILIO_SMS_FROM or "
+                  "TWILIO_MESSAGING_SID in .env (every SMS will fail until then)")
         print(f"Skipped:    {skipped}")
         print(f"Rate:       {args.rate}/min  (~{delay:.1f}s between sends)")
         eta = (len(plan) * delay) / 60.0
@@ -604,19 +674,21 @@ def main() -> None:
         return
 
     # ----- Real send -----
-    sent = {"email": 0, "whatsapp": 0}
-    failed = {"email": 0, "whatsapp": 0}
+    sent = {"email": 0, "whatsapp": 0, "sms": 0}
+    failed = {"email": 0, "whatsapp": 0, "sms": 0}
     skipped["optout_midrun"] = 0
     # Live opt-out re-check: someone who unsubscribes during a multi-hour run
     # must be skipped for the rest of it, not just at plan time.
     live_optout_email = _OptOutWatcher(OPTOUT_EMAIL)
     live_optout_wa = _OptOutWatcher(OPTOUT_WA)
+    live_optout_sms = _OptOutWatcher(OPTOUT_SMS)
     smtp = None
     last = 0.0
     for ch, rcpt, subj, body, row, html_body in plan:
         rl = rcpt.lower()
         if (ch == "email" and rl in live_optout_email) or \
-           (ch == "whatsapp" and rl in live_optout_wa):
+           (ch == "whatsapp" and rl in live_optout_wa) or \
+           (ch == "sms" and rl in live_optout_sms):
             skipped["optout_midrun"] += 1
             continue
         if delay:
@@ -646,7 +718,7 @@ def main() -> None:
                 except Exception:
                     pass
                 smtp = None  # force reconnect next time
-        else:
+        elif ch == "whatsapp":
             ok, info = _wa_send(rcpt, body)
             if ok:
                 sent["whatsapp"] += 1
@@ -654,6 +726,14 @@ def main() -> None:
             else:
                 failed["whatsapp"] += 1
                 _ledger_append(args.campaign, {"ok": False, "channel": "whatsapp", "recipient": rcpt, "error": info})
+        else:  # sms
+            ok, info = _sms_send(rcpt, body)
+            if ok:
+                sent["sms"] += 1
+                _ledger_append(args.campaign, {"ok": True, "channel": "sms", "recipient": rcpt, "sid": info})
+            else:
+                failed["sms"] += 1
+                _ledger_append(args.campaign, {"ok": False, "channel": "sms", "recipient": rcpt, "error": info})
 
     if smtp:
         try:

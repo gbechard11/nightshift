@@ -1,0 +1,16 @@
+[Unit]
+Description=Nightshift Drops public page + signup capture (Funnel /d -> 8783)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gregnightshift
+WorkingDirectory=/home/gregnightshift/nightshift
+ExecStart=/home/gregnightshift/nightshift/.venv/bin/python /home/gregnightshift/nightshift/drop_server.py
+Restart=always
+RestartSec=3
+Environment=DROP_PORT=8783
+
+[Install]
+WantedBy=multi-user.target

@@ -116,8 +116,15 @@ if echo "$CHANGED" | grep -q '^nightshift-mcp.service$'; then
     sudo systemctl daemon-reload
 fi
 
+# If drops unit file changed, reinstall + daemon-reload
+if echo "$CHANGED" | grep -q '^nightshift-drops.service$'; then
+    sudo cp nightshift-drops.service /etc/systemd/system/nightshift-drops.service
+    sudo systemctl daemon-reload
+fi
+
 sudo systemctl restart nightshift
 sudo systemctl restart nightshift-employees 2>/dev/null || true
 sudo systemctl restart nightshift-mcp 2>/dev/null || true
+sudo systemctl restart nightshift-drops 2>/dev/null || true
 
 logger -t nightshift-update "Deployed $LOCAL -> $REMOTE. Changed: $(echo "$CHANGED" | tr '\n' ' ')"
