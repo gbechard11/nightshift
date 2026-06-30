@@ -338,10 +338,13 @@ def render_page(drop: dict) -> str:
     ogdesc = html.escape(" · ".join(x for x in [sub, venue] if x) or brand)
 
     if buy and status == "live":
-        # Tickets are live: lead with the buy button, still capture alerts.
+        # Live: lead with the primary action button (tickets, Instagram follow,
+        # presave, whatever buy_url points to), still capture the list below.
+        primary = html.escape(drop.get("cta") or "Get Tickets")
+        alt = html.escape(drop.get("alt_cta") or "Get Drop Alerts")
         action = (
-            f'<a class=btn href="{html.escape(buy)}" target=_blank rel=noopener>Get Tickets</a>'
-            + _FORM.format(cta="Get Drop Alerts").replace("<button", '<button class=btn-ghost')
+            f'<a class=btn href="{html.escape(buy)}" target=_blank rel=noopener>{primary}</a>'
+            + _FORM.format(cta=alt).replace("<button", '<button class=btn-ghost')
             .replace("<form id=signupform>", '<form id=signupform style="margin-top:11px">')
         )
         legal = ("By signing up you agree to receive email and text updates from "

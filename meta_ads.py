@@ -572,6 +572,12 @@ async def create_adset(
             data["start_time"] = start_time
     else:
         data["daily_budget"] = int(daily_budget_cents)
+        # end_time is valid on daily-budget ad sets too (auto-stop). Apply it so
+        # every campaign honours the stop-at-show-end rule, not just lifetime ones.
+        if end_time:
+            data["end_time"] = end_time
+        if start_time:
+            data["start_time"] = start_time
     if promoted_object:
         data["promoted_object"] = json.dumps(promoted_object)
     return await _post(client, f"{a.ad_account_id}/adsets", data, token=a.token)

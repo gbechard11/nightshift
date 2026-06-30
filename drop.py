@@ -43,6 +43,7 @@ def _apply_fields(drop: dict, args) -> dict:
         "title": "title", "subtitle": "subtitle", "venue": "venue_line",
         "art": "art_url", "buy": "buy_url", "city": "city", "brand": "brand",
         "blurb": "blurb", "kicker": "kicker", "cta": "cta", "status": "status",
+        "alt_cta": "alt_cta",
     }
     for argname, key in field_map.items():
         val = getattr(args, argname, None)
@@ -176,7 +177,8 @@ def main():
         sp.add_argument("--buy", help="ticket URL (set + --status live to show Get Tickets)")
         sp.add_argument("--city"); sp.add_argument("--brand")
         sp.add_argument("--blurb"); sp.add_argument("--kicker")
-        sp.add_argument("--cta", help="button label in notify mode (default 'Notify Me')")
+        sp.add_argument("--cta", help="primary button label (notify mode default 'Notify Me'; live mode default 'Get Tickets')")
+        sp.add_argument("--alt-cta", dest="alt_cta", help="secondary form button label in live mode (default 'Get Drop Alerts')")
         sp.add_argument("--status", choices=["teaser", "live", "closed"])
 
     sc = sub.add_parser("create"); sc.add_argument("--id"); sc.add_argument("--force", action="store_true")

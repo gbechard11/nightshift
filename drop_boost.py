@@ -59,15 +59,41 @@ async def _run(args) -> dict:
     if not end_time:
         return {"ok": False, "error": "end date required (auto-stop rule)"}
 
-    interest_ids = [x.strip() for x in (args.interests or "").split(",") if x.strip()]
-    targeting = meta_ads.build_targeting(interest_ids, countries=acct.default_countries)
-
     cta = ("GET_EVENT_TICKETS" if (drop.get("buy_url") and drop.get("status") == "live")
            else "LEARN_MORE")
 
     result = {"ok": True, "drop": args.id, "account": acct.key, "link": link,
               "status": "PAUSED", "end_time": end_time}
     async with httpx.AsyncClient(timeout=60.0) as client:
+        # Geo: target a specific city (radius km) when --city is given, so an
+        # Edmonton brand never pays to reach all of Canada.
+        cities = None
+        if args.city:
+            locs = await meta_ads.search_locations(
+                client, args.city, country_codes=["CA"], location_types=["city"], acct=acct)
+            if locs:
+                key = locs[0].get("key")
+                cities = [{"key": key, "radius": int(args.radius), "distance_unit": "kilometer"}]
+                result["geo"] = f'{locs[0].get("name")}, {locs[0].get("region","")} +{args.radius}km'
+            else:
+                result["geo_warning"] = f"no city match for '{args.city}', fell back to CA-wide"
+
+        # Interests: explicit --interests ids, else auto-resolve a music/nightlife set.
+        interest_ids = [x.strip() for x in (args.interests or "").split(",") if x.strip()]
+        if not interest_ids:
+            terms = ["House music", "Electronic dance music", "Nightclub", "Music festival"]
+            for t in terms:
+                try:
+                    hits = await meta_ads.search_interests(client, t, limit=1, acct=acct)
+                    if hits:
+                        interest_ids.append(str(hits[0]["id"]))
+                except Exception:
+                    pass
+            result["interests"] = interest_ids
+
+        targeting = (meta_ads.build_targeting(interest_ids, cities=cities) if cities
+                     else meta_ads.build_targeting(interest_ids, countries=acct.default_countries))
+
         camp = await meta_ads.create_campaign(client, name, objective=args.objective, acct=acct)
         cid = camp.get("id")
         if not cid:
@@ -80,9 +106,9 @@ async def _run(args) -> dict:
         asid = adset.get("id")
         result["adset_id"] = asid
 
-        # Creative: prefer the drop's uploaded artwork; else fall back to the
-        # link's OG preview (the drop page already carries og:image).
-        art = dc.art_file(args.id)
+        # Creative: explicit --image override, else the drop's uploaded artwork,
+        # else the link's OG preview (the drop page already carries og:image).
+        art = args.image if args.image else dc.art_file(args.id)
         image_hash = None
         try:
             if art:
@@ -117,6 +143,9 @@ def main():
     p.add_argument("--objective", default="OUTCOME_TRAFFIC")
     p.add_argument("--caption", default="")
     p.add_argument("--interests", default="")
+    p.add_argument("--city", default="", help="target a city (e.g. Edmonton); CA-wide if omitted")
+    p.add_argument("--radius", default="25", help="city radius in km (default 25)")
+    p.add_argument("--image", default="", help="ad creative image path (overrides drop artwork)")
     args = p.parse_args()
     _load_env()
     try:
