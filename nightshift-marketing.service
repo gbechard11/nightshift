@@ -1,0 +1,16 @@
+[Unit]
+Description=Nightshift Marketing dashboard (staff Drops UI; /marketingteam -> 8784)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gregnightshift
+WorkingDirectory=/home/gregnightshift/nightshift
+ExecStart=/home/gregnightshift/nightshift/.venv/bin/python /home/gregnightshift/nightshift/dashboard.py
+Restart=always
+RestartSec=3
+Environment=DASHBOARD_PORT=8784
+
+[Install]
+WantedBy=multi-user.target

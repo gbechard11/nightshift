@@ -58,7 +58,22 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         if u.path.rstrip("/").endswith("health"):
             return self._send(200, b"ok", "text/plain; charset=utf-8")
-        drop = dc.load_drop(self._drop_id(u)) if self._drop_id(u) else None
+        q = parse_qs(u.query)
+        drop_id = self._drop_id(u)
+        # Serve uploaded artwork for the drop page <img>.
+        if drop_id and (q.get("asset") or [""])[0] == "art":
+            path = dc.art_file(drop_id)
+            if not path or not os.path.exists(path):
+                return self._send(404, b"", "text/plain")
+            with open(path, "rb") as f:
+                data = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", dc.art_content_type(path))
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "public, max-age=300")
+            self.end_headers()
+            return self.wfile.write(data)
+        drop = dc.load_drop(drop_id) if drop_id else None
         if not drop or drop.get("status") == "closed":
             return self._send(404, _NOTFOUND)
         return self._send(200, dc.render_page(drop))

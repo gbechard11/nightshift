@@ -23,6 +23,7 @@ import time
 
 NIGHTSHIFT = os.path.dirname(os.path.abspath(__file__))
 DROPS_DIR = os.path.join(NIGHTSHIFT, "drops")
+ART_DIR = os.path.join(DROPS_DIR, "art")
 CONTACTS_DIR = os.path.join(os.path.dirname(NIGHTSHIFT), "..", "data", "greg", "contacts")
 # Resolve the real contacts dir (VPS layout: /data/greg/contacts).
 _CANON_CONTACTS = "/data/greg/contacts"
@@ -175,6 +176,55 @@ def add_signup(drop_id: str, email: str, phone: str = "", name: str = "",
                     w.writerow(MASTER_HEADER)
                 w.writerow([email, name, first, phone, city, drop_id, ts])
     return True, "added"
+
+
+# --- artwork ---------------------------------------------------------------
+
+_ART_EXT = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp",
+            "image/gif": "gif"}
+_EXT_CT = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+           "webp": "image/webp", "gif": "image/gif"}
+
+
+def art_file(drop_id: str) -> str | None:
+    """Path to the uploaded artwork for a drop, or None."""
+    drop_id = slugify(drop_id)
+    if not os.path.isdir(ART_DIR):
+        return None
+    for fn in os.listdir(ART_DIR):
+        if fn.rsplit(".", 1)[0] == drop_id:
+            return os.path.join(ART_DIR, fn)
+    return None
+
+
+def art_content_type(path: str) -> str:
+    return _EXT_CT.get(path.rsplit(".", 1)[-1].lower(), "application/octet-stream")
+
+
+def art_public_url(drop_id: str) -> str:
+    return f"{BASE_URL}/d?id={slugify(drop_id)}&asset=art"
+
+
+def save_art(drop_id: str, data: bytes, content_type: str = "",
+             filename: str = "") -> str:
+    """Store uploaded artwork as drops/art/<id>.<ext>. Returns the public URL.
+    Replaces any existing art for that drop."""
+    drop_id = slugify(drop_id)
+    ext = _ART_EXT.get((content_type or "").lower())
+    if not ext and filename and "." in filename:
+        ext = filename.rsplit(".", 1)[-1].lower()
+    ext = ext or "jpg"
+    os.makedirs(ART_DIR, exist_ok=True)
+    for existing in (art_file(drop_id),):
+        if existing:
+            try:
+                os.remove(existing)
+            except OSError:
+                pass
+    path = os.path.join(ART_DIR, f"{drop_id}.{ext}")
+    with open(path, "wb") as f:
+        f.write(data)
+    return art_public_url(drop_id)
 
 
 def signup_count(drop_id: str) -> int:

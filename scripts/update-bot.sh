@@ -122,9 +122,16 @@ if echo "$CHANGED" | grep -q '^nightshift-drops.service$'; then
     sudo systemctl daemon-reload
 fi
 
+# If marketing dashboard unit changed, reinstall + daemon-reload
+if echo "$CHANGED" | grep -q '^nightshift-marketing.service$'; then
+    sudo cp nightshift-marketing.service /etc/systemd/system/nightshift-marketing.service
+    sudo systemctl daemon-reload
+fi
+
 sudo systemctl restart nightshift
 sudo systemctl restart nightshift-employees 2>/dev/null || true
 sudo systemctl restart nightshift-mcp 2>/dev/null || true
 sudo systemctl restart nightshift-drops 2>/dev/null || true
+sudo systemctl restart nightshift-marketing 2>/dev/null || true
 
 logger -t nightshift-update "Deployed $LOCAL -> $REMOTE. Changed: $(echo "$CHANGED" | tr '\n' ' ')"
