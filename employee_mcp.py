@@ -834,24 +834,21 @@ async def login_post(request: Request):
 
 
 # --------------------------------------------------------------------------- #
-# Guest List — Ne-Yo Afterparty @ Pawn Shop Live, June 19 2026
-# Closes 8:00 PM MDT. Access-code gated. Up to 2 guest names per email/cell;
-# resubmitting the same email or cell tops you up to (never past) 2 names.
-# Submissions -> /data/greg/blast_queue/guestlist_neyo_20260619.json
+# Guest List — Canada Day Cookout @ Pawn Shop Live, July 1 2026
+# Closes at event end (10:00 PM MDT). Cell phone required (SMS-required
+# signup); email optional. Up to 2 guest names per phone/email; resubmitting
+# the same phone or email tops you up to (never past) 2 names.
+# Submissions -> /data/greg/blast_queue/guestlist_canadaday_20260701.json
 # --------------------------------------------------------------------------- #
-_GL_FILE = "/data/greg/blast_queue/guestlist_neyo_20260619.json"
-_GL_CLOSE_EPOCH = 1781920800  # 2026-06-19 20:00 MDT = 2026-06-20 02:00 UTC
-_GL_IMG = "/data/greg/neyo_promo/neyo_ps_9x16.png"
-_GL_MAX = 2  # max names per email/cell
-_GL_CODES = {"JEUNETAGS", "NSENT", "MAKORE"}  # valid access codes
-# Each code stops accepting once its name-limit is reached.
-_GL_CODE_LIMITS = {"JEUNETAGS": 25, "NSENT": 25, "MAKORE": 10}
-_GL_CODE_LIMIT_DEFAULT = 25
+_GL_FILE = "/data/greg/blast_queue/guestlist_canadaday_20260701.json"
+_GL_CLOSE_EPOCH = 1782964800  # 2026-07-01 22:00 MDT = 2026-07-02 04:00 UTC (event end)
+_GL_IMG = "/data/greg/canadaday_promo/canada_day_ps.png"
+_GL_MAX = 2  # max names per phone/email
 _EMAIL_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "email_send.py")
 
 _GL_FORM = """<!doctype html><html lang=en><head>
 <meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>Afterparty Guest List — Ne-Yo @ Pawn Shop</title>
+<title>Guest List — Canada Day Cookout</title>
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
 body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
@@ -862,15 +859,16 @@ body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
 h1{{font-size:26px;font-weight:700;line-height:1.2;margin-bottom:6px}}
 .sub{{color:#aaa;font-size:15px;margin-bottom:28px}}
 label{{display:block;font-size:13px;color:#999;margin-bottom:6px;margin-top:18px}}
-input{{width:100%;background:#1a1a1f;border:1px solid #333;border-radius:8px;
+input[type=text],input[type=tel],input[type=email]{{width:100%;background:#1a1a1f;border:1px solid #333;border-radius:8px;
   color:#f0f0f0;font-size:16px;padding:14px 16px;outline:none;transition:border .15s}}
 input:focus{{border-color:#666}}
-.code-in{{text-transform:uppercase;letter-spacing:.08em;font-weight:600}}
 .req{{color:#e05555;font-size:12px;margin-top:4px}}
 .hint{{color:#777;font-size:12px;margin-top:4px}}
-.opt-in{{font-size:12px;color:#666;margin-top:22px;line-height:1.6;
-  padding:14px;background:#111;border-radius:8px;border:1px solid #222}}
-.opt-in a{{color:#888}}
+.opt-in{{font-size:12px;color:#999;margin-top:22px;line-height:1.6;
+  padding:14px;background:#111;border-radius:8px;border:1px solid #222;
+  display:flex;gap:10px;align-items:flex-start}}
+.opt-in input{{flex:0 0 auto;width:18px;height:18px;margin-top:2px;accent-color:#fff}}
+.opt-in span a{{color:#aaa}}
 button{{width:100%;margin-top:24px;background:#fff;color:#000;border:none;
   border-radius:8px;font-size:16px;font-weight:700;padding:16px;cursor:pointer;
   letter-spacing:.02em;transition:opacity .15s}}
@@ -880,31 +878,33 @@ button:hover{{opacity:.85}}
   background:#1a0a0a;border-radius:8px;border:1px solid #4a1a1a}}
 </style></head>
 <body><div class=wrap>
-<img src=/guestlist/img alt="Ne-Yo" style="width:100%;border-radius:12px;margin-bottom:20px;display:block">
+<img src=/guestlist/img alt="Canada Day Cookout" style="width:100%;border-radius:12px;margin-bottom:20px;display:block">
 <div class=brand>Pawn Shop Live · Edmonton</div>
-<h1>Ne-Yo Afterparty<br>Guest List</h1>
-<div class=sub>Tonight — Friday, June 19, 2026</div>
+<h1>Canada Day Cookout<br>Guest List</h1>
+<div class=sub>Wednesday, July 1, 2026 — Doors at 5:00 PM</div>
 {err}
 <form method=POST action=/guestlist>
-  <label>Access Code <span style="color:#e05555">*</span></label>
-  <input name=code type=text class=code-in placeholder="Enter your access code" required maxlength=40 value="{code}">
-  <div class=hint>You need a valid code from your promoter to submit.</div>
   <label>Guest Name 1 <span style="color:#e05555">*</span></label>
   <input name=name1 type=text placeholder="First &amp; last name" required maxlength=120 value="{name1}">
   <label>Guest Name 2 <span style="color:#777">(optional)</span></label>
   <input name=name2 type=text placeholder="Bringing someone? Add their name" maxlength=120 value="{name2}">
-  <div class=hint>Up to 2 names per email / cell.</div>
-  <label>Cell Phone</label>
-  <input name=phone type=tel placeholder="+1 (780) 555-0000" maxlength=30 value="{phone}">
-  <label>Email Address</label>
+  <div class=hint>Up to 2 names per phone.</div>
+  <label>Cell Phone <span style="color:#e05555">*</span></label>
+  <input name=phone type=tel placeholder="+1 (780) 555-0000" required maxlength=30 value="{phone}">
+  <div class=req>Cell phone required — we text your confirmation</div>
+  <label>Email Address <span style="color:#777">(optional)</span></label>
   <input name=email type=email placeholder="you@example.com" maxlength=200 value="{email}">
-  <div class=req>Cell phone or email required</div>
-  <div class=opt-in>By submitting this form you consent to receive further communications
-  and marketing from Nightshift Entertainment and Pawn Shop Live, including upcoming
-  event announcements, promotions, and exclusive offers. You may unsubscribe at any time.</div>
+  <label class=opt-in style="cursor:pointer">
+    <input name=optin type=checkbox value=yes required {optin_checked}>
+    <span>I agree to receive SMS text messages and email communications from
+    Nightshift Entertainment and Pawn Shop Live at the number/email provided,
+    including event reminders, promotions and offers. Message and data rates
+    may apply, message frequency varies. Reply STOP to opt out of texts at
+    any time or unsubscribe from emails. Consent is not a condition of entry.</span>
+  </label>
   <button type=submit>Add Us to the Guest List</button>
 </form>
-<div class=note>Guest list closes at 8:00 PM tonight</div>
+<div class=note>Guest list closes at 10:00 PM tonight</div>
 </div></body></html>"""
 
 _GL_THANKS = """<!doctype html><html lang=en><head>
@@ -926,7 +926,7 @@ p{{color:#999;font-size:15px;line-height:1.6}}
 <div class=check>✓</div>
 <h1>You're on the list!</h1>
 <div class=names>{names}</div>
-<p>See you tonight at the Ne-Yo afterparty — Pawn Shop Live.<br>Just mention your name at the door.</p>
+<p>See you today at the Canada Day Cookout — Pawn Shop Live.<br>Just mention your name at the door.</p>
 <div class=brand>Nightshift Entertainment</div>
 </div></body></html>"""
 
@@ -946,24 +946,7 @@ p{{color:#999;font-size:15px;line-height:1.6}}
 <body><div class=wrap>
 <h1>You're already set</h1>
 <div class=names>{names}</div>
-<p>This email/cell already has its 2 guests on the Ne-Yo afterparty list. See you tonight at Pawn Shop Live!</p>
-</div></body></html>"""
-
-_GL_CODE_FULL = """<!doctype html><html lang=en><head>
-<meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>Code limit reached</title>
-<style>
-body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
-  background:#0a0a0c;color:#f0f0f0;min-height:100vh;
-  display:flex;align-items:center;justify-content:center;padding:20px;text-align:center}}
-.wrap{{max-width:380px}}
-h1{{font-size:24px;font-weight:700;margin-bottom:10px}}
-p{{color:#999;font-size:15px;line-height:1.6}}
-</style></head>
-<body><div class=wrap>
-<h1>This code is full</h1>
-<p>This access code has reached its guest limit and can't take any more names.
-Check with your promoter for another code.</p>
+<p>This phone/email already has its 2 guests on the Canada Day Cookout list. See you today at Pawn Shop Live!</p>
 </div></body></html>"""
 
 _GL_CLOSED = """<!doctype html><html lang=en><head>
@@ -979,7 +962,7 @@ p{{color:#999;font-size:15px;line-height:1.6}}
 </style></head>
 <body><div class=wrap>
 <h1>Guest List is Closed</h1>
-<p>The guest list for tonight's Ne-Yo afterparty has closed. See you at the door!</p>
+<p>The guest list for today's Canada Day Cookout has closed. See you at the door!</p>
 </div></body></html>"""
 
 
@@ -987,18 +970,11 @@ def _gl_digits(s: str) -> str:
     return "".join(c for c in s if c.isdigit())
 
 
-def _gl_code_used(data: list, code: str) -> int:
-    """Total names already on the list under this code."""
-    return sum(len(r.get("names") or [])
-               for r in data if str(r.get("code", "")).upper() == code)
+def _gl_save(phone: str, email: str, new_names: list) -> tuple:
+    """Merge names onto the record keyed by this phone/email.
 
-
-def _gl_save(phone: str, email: str, new_names: list, code: str) -> tuple:
-    """Merge names onto the record keyed by this email/phone.
-
-    Caps at _GL_MAX names per contact and _GL_CODE_LIMIT names per code.
-    Returns (added_names, all_names_for_contact, status) where status is one of
-    'ok', 'contact_full', 'code_full'.
+    Caps at _GL_MAX names per contact. Returns (added_names, all_names_for_contact,
+    status) where status is one of 'ok', 'contact_full'.
     """
     data = []
     try:
@@ -1012,35 +988,23 @@ def _gl_save(phone: str, email: str, new_names: list, code: str) -> tuple:
 
     rec = None
     for r in data:
-        r_email = str(r.get("email", "")).strip().lower()
         r_phone = _gl_digits(str(r.get("phone", "")))
-        if email_k and r_email and r_email == email_k:
+        r_email = str(r.get("email", "")).strip().lower()
+        if phone_k and r_phone and r_phone == phone_k:
             rec = r
             break
-        if phone_k and r_phone and r_phone == phone_k:
+        if email_k and r_email and r_email == email_k:
             rec = r
             break
 
     ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
-
-    # Which code's quota this submission draws from: an existing record keeps its
-    # own code; a brand-new record uses the submitted code.
-    eff_code = (str(rec.get("code", "")).upper() if rec and rec.get("code") else code)
-    code_limit = _GL_CODE_LIMITS.get(eff_code, _GL_CODE_LIMIT_DEFAULT)
-    code_remaining = code_limit - _gl_code_used(data, eff_code)
-
     existing = rec.get("names") if rec else []
     existing = existing or []
 
     if rec is not None and len(existing) >= _GL_MAX:
         return [], existing, "contact_full"
-    if code_remaining <= 0:
-        return [], existing, "code_full"
 
-    # How many names we can add: limited by per-contact room and per-code room.
-    contact_room = _GL_MAX - len(existing)
-    room = min(contact_room, code_remaining)
-
+    room = _GL_MAX - len(existing)
     have = {n.strip().lower() for n in existing}
     added = []
     for n in new_names:
@@ -1052,7 +1016,7 @@ def _gl_save(phone: str, email: str, new_names: list, code: str) -> tuple:
         have.add(n.strip().lower())
 
     if rec is None:
-        rec = {"names": [], "phone": phone, "email": email, "code": code, "ts": ts}
+        rec = {"names": [], "phone": phone, "email": email, "ts": ts}
         data.append(rec)
 
     rec["names"] = existing + added
@@ -1060,8 +1024,6 @@ def _gl_save(phone: str, email: str, new_names: list, code: str) -> tuple:
         rec["phone"] = phone
     if not rec.get("email") and email:
         rec["email"] = email
-    if not rec.get("code") and code:
-        rec["code"] = code
     rec["ts"] = ts
     with open(_GL_FILE, "w") as f:
         json.dump(data, f, indent=2)
@@ -1073,23 +1035,23 @@ def _gl_send_confirmation(names: list, email: str) -> None:
     body = (
         f"Hi {names[0] if names else 'there'},\n\n"
         f"{who} " + ("are" if len(names) > 1 else "is") + " officially on the guest list "
-        "for tonight's afterparty!\n\n"
-        "  Event: Ne-Yo Afterparty\n"
+        "for the Canada Day Cookout!\n\n"
+        "  Event: Canada Day Cookout\n"
         "  Venue: Pawn Shop Live\n"
-        "  Date: Friday, June 19, 2026\n\n"
-        "Just mention your name at the door. See you tonight!\n\n"
+        "  Date: Wednesday, July 1, 2026\n"
+        "  Doors: 5:00 PM\n\n"
+        "Just mention your name at the door. See you there!\n\n"
         "— Pawn Shop Live / Nightshift Entertainment\n\n"
         "---\n"
-        "You're receiving this because you signed up for our guest list. "
-        "By signing up you consented to receive further communications from "
-        "Nightshift Entertainment. To unsubscribe from future marketing, "
-        "reply STOP to this email."
+        "You're receiving this because you signed up for our guest list and opted in "
+        "to communications from Nightshift Entertainment. To unsubscribe from future "
+        "marketing, reply STOP to this email."
     )
     try:
         subprocess.Popen(
             [sys.executable, _EMAIL_BIN,
              "--to", email,
-             "--subject", "You're on the list — Ne-Yo Afterparty @ Pawn Shop Tonight",
+             "--subject", "You're on the list — Canada Day Cookout @ Pawn Shop",
              "--body", body],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -1108,7 +1070,8 @@ async def guestlist_img(request: Request) -> Response:
 async def guestlist_get(request: Request) -> HTMLResponse:
     if time.time() > _GL_CLOSE_EPOCH:
         return HTMLResponse(_GL_CLOSED)
-    return HTMLResponse(_GL_FORM.format(err="", code="", name1="", name2="", phone="", email=""))
+    return HTMLResponse(_GL_FORM.format(
+        err="", name1="", name2="", phone="", email="", optin_checked=""))
 
 
 @mcp.custom_route("/guestlist", methods=["POST"])
@@ -1116,39 +1079,38 @@ async def guestlist_post(request: Request) -> HTMLResponse:
     if time.time() > _GL_CLOSE_EPOCH:
         return HTMLResponse(_GL_CLOSED)
     form = await request.form()
-    code = str(form.get("code", "")).strip()
     name1 = str(form.get("name1", "")).strip()
     name2 = str(form.get("name2", "")).strip()
     phone = str(form.get("phone", "")).strip()
     email = str(form.get("email", "")).strip()
+    optin = str(form.get("optin", "")).strip()
 
     def _form(err):
         return HTMLResponse(_GL_FORM.format(
             err=f'<div class=err>{err}</div>',
-            code=code, name1=name1, name2=name2, phone=phone, email=email))
+            name1=name1, name2=name2, phone=phone, email=email,
+            optin_checked="checked" if optin else ""))
 
-    if code.upper() not in _GL_CODES:
-        return _form("Invalid access code. Please check the code from your promoter and try again.")
     if not name1:
         return _form("Please enter at least one guest name.")
-    if not phone and not email:
-        return _form("Please enter your cell phone or email address.")
+    if not phone:
+        return _form("Please enter your cell phone number.")
+    if not optin:
+        return _form("Please check the box to opt in — it's required to join the guest list.")
 
     new_names = [n for n in (name1, name2) if n]
-    added, all_names, status = await asyncio.to_thread(
-        _gl_save, phone, email, new_names, code.upper())
+    added, all_names, status = await asyncio.to_thread(_gl_save, phone, email, new_names)
 
     names_html = "<br>".join(all_names) if all_names else "—"
 
     if status == "contact_full":
         return HTMLResponse(_GL_FULL.format(names=names_html))
-    if status == "code_full":
-        return HTMLResponse(_GL_CODE_FULL)
 
     if email and added:
         await asyncio.to_thread(_gl_send_confirmation, added, email)
 
     return HTMLResponse(_GL_THANKS.format(names=names_html))
+
 
 
 if __name__ == "__main__":
