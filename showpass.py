@@ -284,32 +284,48 @@ def _get_event_private(slug: str):
 
 
 def _norm_tier(t: dict) -> dict:
-    return {
+    """Tier -> Showpass payload. Optional promoter bump (an extra organizer fee added
+    per ticket on top of face value) via `promoter_fee`/`bump` -> custom_commission_amount_added_*."""
+    d = {
         "name": str(t.get("name") or "GA"),
         "price": "%.2f" % float(t.get("price", 0) or 0),
         "inventory": int(t.get("inventory") or t.get("quantity") or 0),
         "visibility": 1,
     }
+    bump = t.get("promoter_fee", t.get("bump"))
+    if bump not in (None, "", 0, "0", "0.00"):
+        b = "%.2f" % float(bump)
+        d["commission_amount_added_cash"] = b
+        d["commission_amount_added_credit"] = b
+        d["custom_commission_amount_added_cash"] = b
+        d["custom_commission_amount_added_credit"] = b
+    return d
 
 
 def create_event(name, location, starts_on, ends_on, tiers, *,
                  tz_iana: str = "", sp_tz: str = "", visibility: int = 1,
-                 draft: bool = True, description: str = "") -> dict:
+                 draft: bool = True, description: str = "", promoter_fee=None) -> dict:
     """Create a Showpass event (ASYNC -> returns {job_id}). DRAFT by default.
     `location` is an id or venue name; tz derived from the location's region
-    unless tz_iana/sp_tz given. `tiers` = [{name, price, inventory}]. WRITE."""
+    unless tz_iana/sp_tz given. `tiers` = [{name, price, inventory, promoter_fee?}].
+    `promoter_fee` = event-wide organizer bump ($/ticket) applied to tiers lacking one. WRITE."""
     loc = resolve_location(location)
     if not (tz_iana and sp_tz):
         tz_iana, sp_tz = _tz_for_region(loc.get("province") or loc.get("region") or "")
     if not tiers:
         raise ShowpassError("At least one ticket tier is required.")
+    tt = []
+    for t in tiers:
+        if promoter_fee not in (None, "", 0, "0", "0.00") and t.get("promoter_fee", t.get("bump")) in (None, "", 0, "0", "0.00"):
+            t = dict(t); t["promoter_fee"] = promoter_fee
+        tt.append(_norm_tier(t))
     payload = {
         "name": name, "venue": ORG_ID, "location": loc["id"],
         "starts_on": _to_utc_iso(starts_on, tz_iana),
         "ends_on": _to_utc_iso(ends_on, tz_iana),
         "timezone": sp_tz, "visibility": int(visibility),
         "status": "sp_event_draft" if draft else "sp_event_active",
-        "tickettype_set": [_norm_tier(t) for t in tiers],
+        "tickettype_set": tt,
     }
     if description:
         payload["description"] = description
